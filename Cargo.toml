@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["bird", "shq"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/yourorg/magic"
+
+[workspace.dependencies]
+# Shared dependencies across workspace
+duckdb = { version = "1.1", features = ["bundled"] }
+thiserror = "2.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.11", features = ["v7", "serde"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+directories = "5.0"
+gethostname = "0.5"
+rand = "0.8"
+blake3 = "1.5"
+base64 = "0.22"
+flate2 = "1.0"
+tempfile = "3.14"
