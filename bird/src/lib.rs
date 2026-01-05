@@ -11,4 +11,4 @@ pub mod store;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use schema::{InvocationRecord, OutputRecord, SessionRecord};
-pub use store::{InvocationSummary, OutputInfo, Store};
+pub use store::{ArchiveStats, AutoCompactOptions, CompactStats, InvocationSummary, OutputInfo, Store};

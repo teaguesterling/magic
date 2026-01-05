@@ -3,6 +3,7 @@
 //! Uses DuckDB to write Parquet files and query across them.
 
 mod atomic;
+mod compact;
 mod invocations;
 mod outputs;
 mod sessions;
@@ -16,6 +17,7 @@ use duckdb::{
 use crate::{Config, Error, Result};
 
 // Re-export types from submodules
+pub use compact::{ArchiveStats, AutoCompactOptions, CompactStats};
 pub use invocations::InvocationSummary;
 pub use outputs::OutputInfo;
 

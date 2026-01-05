@@ -139,6 +139,48 @@ enum Commands {
     /// Show statistics
     Stats,
 
+    /// Move old data from recent to archive
+    Archive {
+        /// Archive data older than this many days
+        #[arg(short = 'd', long = "days", default_value = "14")]
+        days: u32,
+
+        /// Show what would be done without making changes
+        #[arg(short = 'n', long = "dry-run")]
+        dry_run: bool,
+    },
+
+    /// Compact parquet files to reduce storage and improve query performance
+    Compact {
+        /// Compact when a session has more than this many files (keeps this many recent)
+        #[arg(short = 't', long = "threshold", default_value = "50")]
+        file_threshold: usize,
+
+        /// Only compact files for this specific session (used by shell hooks)
+        #[arg(short = 's', long = "session")]
+        session: Option<String>,
+
+        /// Only check today's partition (fast check for shell hooks)
+        #[arg(long = "today")]
+        today_only: bool,
+
+        /// Suppress output unless compaction occurs
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
+
+        /// Only compact recent data (skip archive tier)
+        #[arg(long = "recent-only")]
+        recent_only: bool,
+
+        /// Only compact archive tier (skip recent)
+        #[arg(long = "archive-only")]
+        archive_only: bool,
+
+        /// Show what would be done without making changes
+        #[arg(short = 'n', long = "dry-run")]
+        dry_run: bool,
+    },
+
     /// Shell hook integration
     Hook {
         #[command(subcommand)]
@@ -199,6 +241,10 @@ fn main() {
         Commands::History { limit } => commands::history(limit),
         Commands::Sql { query } => commands::sql(&query),
         Commands::Stats => commands::stats(),
+        Commands::Archive { days, dry_run } => commands::archive(days, dry_run),
+        Commands::Compact { file_threshold, session, today_only, quiet, recent_only, archive_only, dry_run } => {
+            commands::compact(file_threshold, session.as_deref(), today_only, quiet, recent_only, archive_only, dry_run)
+        }
         Commands::Hook { action } => match action {
             HookAction::Init { shell } => commands::hook_init(shell.as_deref()),
         },

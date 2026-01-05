@@ -193,19 +193,16 @@ pub fn save(
 
     store.write_invocation(&inv_record)?;
 
-    let mut total_bytes = 0usize;
     let cmd_hint = inv_record.executable.as_deref();
 
     // Handle --stdout/--stderr mode (separate files for each stream)
     if stdout_file.is_some() || stderr_file.is_some() {
         if let Some(path) = stdout_file {
             let content = std::fs::read(path)?;
-            total_bytes += content.len();
             store.store_output(inv_id, "stdout", &content, date, cmd_hint)?;
         }
         if let Some(path) = stderr_file {
             let content = std::fs::read(path)?;
-            total_bytes += content.len();
             store.store_output(inv_id, "stderr", &content, date, cmd_hint)?;
         }
     } else {
@@ -218,16 +215,8 @@ pub fn save(
                 buf
             }
         };
-        total_bytes = content.len();
         store.store_output(inv_id, stream, &content, date, cmd_hint)?;
     }
-
-    eprintln!(
-        "Saved {} bytes for: {} (exit {})",
-        total_bytes,
-        command,
-        exit_code
-    );
 
     Ok(())
 }
@@ -541,6 +530,137 @@ pub fn stats() -> bird::Result<()> {
     Ok(())
 }
 
+/// Move old data from recent to archive.
+pub fn archive(days: u32, dry_run: bool) -> bird::Result<()> {
+    let config = Config::load()?;
+    let store = Store::open(config)?;
+
+    if dry_run {
+        println!("Dry run - no changes will be made\n");
+    }
+
+    let stats = store.archive_old_data(days, dry_run)?;
+
+    if stats.partitions_archived > 0 {
+        println!(
+            "Archived {} partitions ({} files, {})",
+            stats.partitions_archived,
+            stats.files_moved,
+            format_bytes(stats.bytes_moved)
+        );
+    } else {
+        println!("Nothing to archive.");
+    }
+
+    Ok(())
+}
+
+/// Compact parquet files to reduce storage and improve performance.
+pub fn compact(
+    file_threshold: usize,
+    session: Option<&str>,
+    today_only: bool,
+    quiet: bool,
+    recent_only: bool,
+    archive_only: bool,
+    dry_run: bool,
+) -> bird::Result<()> {
+    let config = Config::load()?;
+    let store = Store::open(config)?;
+
+    if dry_run && !quiet {
+        println!("Dry run - no changes will be made\n");
+    }
+
+    // Session-specific compaction (lightweight, used by shell hooks)
+    if let Some(session_id) = session {
+        let stats = if today_only {
+            store.compact_session_today(session_id, file_threshold, dry_run)?
+        } else {
+            store.compact_for_session(session_id, file_threshold, dry_run)?
+        };
+
+        if stats.sessions_compacted > 0 {
+            println!("Compacted session '{}':", session_id);
+            println!("  {} files -> {} files", stats.files_before, stats.files_after);
+            println!(
+                "  {} -> {} ({})",
+                format_bytes(stats.bytes_before),
+                format_bytes(stats.bytes_after),
+                format_reduction(stats.bytes_before, stats.bytes_after)
+            );
+        } else if !quiet {
+            println!("Nothing to compact for session '{}'.", session_id);
+        }
+        return Ok(());
+    }
+
+    // Global compaction
+    let mut total_stats = bird::CompactStats::default();
+
+    if !archive_only {
+        let stats = store.compact_recent(file_threshold, dry_run)?;
+        total_stats.add(&stats);
+    }
+
+    if !recent_only {
+        let stats = store.compact_archive(file_threshold, dry_run)?;
+        total_stats.add(&stats);
+    }
+
+    if total_stats.sessions_compacted > 0 {
+        println!(
+            "Compacted {} sessions across {} partitions",
+            total_stats.sessions_compacted, total_stats.partitions_compacted
+        );
+        println!(
+            "  {} files -> {} files",
+            total_stats.files_before, total_stats.files_after
+        );
+        println!(
+            "  {} -> {} ({})",
+            format_bytes(total_stats.bytes_before),
+            format_bytes(total_stats.bytes_after),
+            format_reduction(total_stats.bytes_before, total_stats.bytes_after)
+        );
+    } else if !quiet {
+        println!("Nothing to compact.");
+    }
+
+    Ok(())
+}
+
+/// Format bytes for display.
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
+/// Format byte reduction as percentage.
+fn format_reduction(before: u64, after: u64) -> String {
+    if before == 0 {
+        return "0%".to_string();
+    }
+    if after >= before {
+        let increase = ((after - before) as f64 / before as f64) * 100.0;
+        format!("+{:.1}%", increase)
+    } else {
+        let reduction = ((before - after) as f64 / before as f64) * 100.0;
+        format!("-{:.1}%", reduction)
+    }
+}
+
 /// Output shell integration code.
 pub fn hook_init(shell: Option<&str>) -> bird::Result<()> {
     // Auto-detect shell from $SHELL if not specified
@@ -604,13 +724,16 @@ __shq_precmd() {
     fi
     __shq_start_time=""
 
-    # Save to BIRD (async, non-blocking)
+    # Save to BIRD and check compaction (async, non-blocking)
     (
         shq save -c "$cmd" -x "$exit_code" -d "$duration" \
             --session-id "$__shq_session_id" \
             --invoker-pid $$ \
             --invoker zsh \
             </dev/null \
+            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
+        # Quick compaction check for this session (today only, quiet)
+        shq compact -s "$__shq_session_id" --today -q \
             2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
     ) &!
 }
@@ -645,6 +768,11 @@ shqr() {
 
     # Cleanup
     rm -rf "$tmpdir"
+
+    # Quick compaction check (background, quiet)
+    (shq compact -s "$__shq_session_id" --today -q \
+        2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log") &!
+
     return $exit_code
 }
 
@@ -692,13 +820,16 @@ __shq_prompt() {
     fi
     __shq_start_time=""
 
-    # Save to BIRD (async, background)
+    # Save to BIRD and check compaction (async, background)
     (
         shq save -c "$cmd" -x "$exit_code" -d "$duration" \
             --session-id "$__shq_session_id" \
             --invoker-pid $$ \
             --invoker bash \
             </dev/null \
+            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
+        # Quick compaction check for this session (today only, quiet)
+        shq compact -s "$__shq_session_id" --today -q \
             2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
     ) &
     disown 2>/dev/null
@@ -734,6 +865,12 @@ shqr() {
 
     # Cleanup
     rm -rf "$tmpdir"
+
+    # Quick compaction check (background, quiet)
+    (shq compact -s "$__shq_session_id" --today -q \
+        2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log") &
+    disown 2>/dev/null
+
     return $exit_code
 }
 
