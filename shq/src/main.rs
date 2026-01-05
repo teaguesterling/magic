@@ -97,6 +97,30 @@ enum Commands {
         /// Shortcut for -s all (combined to stdout)
         #[arg(short = 'A', long = "all", conflicts_with = "stream")]
         all_combined: bool,
+
+        /// Pipe output through pager ($PAGER or less -R)
+        #[arg(short = 'P', long = "pager")]
+        pager: bool,
+
+        /// Raw output - preserve ANSI escape codes (default)
+        #[arg(short = 'R', long = "raw", conflicts_with = "strip")]
+        raw: bool,
+
+        /// Strip ANSI escape codes from output
+        #[arg(long = "strip")]
+        strip: bool,
+
+        /// Show first N lines
+        #[arg(long = "head", value_name = "N")]
+        head: Option<usize>,
+
+        /// Show last N lines
+        #[arg(short = 't', long = "tail", value_name = "N")]
+        tail: Option<usize>,
+
+        /// Limit output to N lines (same as --head)
+        #[arg(short = 'n', long = "lines", value_name = "N", conflicts_with = "head")]
+        lines: Option<usize>,
     },
 
     /// Show recent command history
@@ -153,7 +177,7 @@ fn main() {
                 &invoker_type,
             )
         }
-        Commands::Show { selector, stream, stdout_only, stderr_only, all_combined } => {
+        Commands::Show { selector, stream, stdout_only, stderr_only, all_combined, pager, raw: _, strip, head, tail, lines } => {
             // Resolve stream from flags or -s value
             let resolved_stream = if stdout_only {
                 Some("stdout")
@@ -164,7 +188,13 @@ fn main() {
             } else {
                 stream.as_deref()
             };
-            commands::show(&selector, resolved_stream)
+            let opts = commands::ShowOptions {
+                pager,
+                strip_ansi: strip,
+                head: head.or(lines),
+                tail,
+            };
+            commands::show(&selector, resolved_stream, &opts)
         }
         Commands::History { limit } => commands::history(limit),
         Commands::Sql { query } => commands::sql(&query),

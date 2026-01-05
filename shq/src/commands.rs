@@ -232,9 +232,19 @@ pub fn save(
     Ok(())
 }
 
+/// Options for the show command.
+#[derive(Default)]
+pub struct ShowOptions {
+    pub pager: bool,
+    pub strip_ansi: bool,
+    pub head: Option<usize>,
+    pub tail: Option<usize>,
+}
+
 /// Show output from a previous invocation.
-pub fn show(selector: &str, stream_filter: Option<&str>) -> bird::Result<()> {
+pub fn show(selector: &str, stream_filter: Option<&str>, opts: &ShowOptions) -> bird::Result<()> {
     use std::io::Write;
+    use std::process::{Command, Stdio};
 
     let config = Config::load()?;
     let store = Store::open(config)?;
@@ -276,15 +286,16 @@ pub fn show(selector: &str, stream_filter: Option<&str>) -> bird::Result<()> {
         return Ok(());
     }
 
-    // Read and display each output via DuckDB (handles both inline and blob)
-    for output_info in outputs {
-        match store.read_output_content(&output_info) {
+    // Collect content per stream
+    let mut stdout_content = Vec::new();
+    let mut stderr_content = Vec::new();
+    for output_info in &outputs {
+        match store.read_output_content(output_info) {
             Ok(content) => {
-                // Write to stdout if combining, otherwise route to original stream
-                if combine_to_stdout || output_info.stream != "stderr" {
-                    io::stdout().write_all(&content)?;
+                if output_info.stream == "stderr" {
+                    stderr_content.extend_from_slice(&content);
                 } else {
-                    io::stderr().write_all(&content)?;
+                    stdout_content.extend_from_slice(&content);
                 }
             }
             Err(e) => {
@@ -293,7 +304,110 @@ pub fn show(selector: &str, stream_filter: Option<&str>) -> bird::Result<()> {
         }
     }
 
+    // Helper to process content (strip ANSI, limit lines)
+    let process_content = |content: Vec<u8>| -> String {
+        let content = if opts.strip_ansi {
+            strip_ansi_escapes(&content)
+        } else {
+            content
+        };
+
+        let content_str = String::from_utf8_lossy(&content);
+
+        if opts.head.is_some() || opts.tail.is_some() {
+            let lines: Vec<&str> = content_str.lines().collect();
+            let selected: Vec<&str> = if let Some(n) = opts.head {
+                lines.into_iter().take(n).collect()
+            } else if let Some(n) = opts.tail {
+                let skip = lines.len().saturating_sub(n);
+                lines.into_iter().skip(skip).collect()
+            } else {
+                lines
+            };
+            selected.join("\n") + if content_str.ends_with('\n') { "\n" } else { "" }
+        } else {
+            content_str.into_owned()
+        }
+    };
+
+    // Output via pager or directly
+    if opts.pager {
+        // Combine all content for pager
+        let mut all_content = stdout_content;
+        all_content.extend_from_slice(&stderr_content);
+        let final_content = process_content(all_content);
+
+        let pager_cmd = std::env::var("PAGER").unwrap_or_else(|_| "less -R".to_string());
+        let parts: Vec<&str> = pager_cmd.split_whitespace().collect();
+        if let Some((cmd, args)) = parts.split_first() {
+            let mut child = Command::new(cmd)
+                .args(args)
+                .stdin(Stdio::piped())
+                .spawn()
+                .map_err(bird::Error::Io)?;
+
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(final_content.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    } else if combine_to_stdout {
+        // Combine all to stdout
+        let mut all_content = stdout_content;
+        all_content.extend_from_slice(&stderr_content);
+        let final_content = process_content(all_content);
+        io::stdout().write_all(final_content.as_bytes())?;
+    } else {
+        // Route to original streams
+        if !stdout_content.is_empty() {
+            let content = process_content(stdout_content);
+            io::stdout().write_all(content.as_bytes())?;
+        }
+        if !stderr_content.is_empty() {
+            let content = process_content(stderr_content);
+            io::stderr().write_all(content.as_bytes())?;
+        }
+    }
+
     Ok(())
+}
+
+/// Strip ANSI escape codes from bytes.
+fn strip_ansi_escapes(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == 0x1b && i + 1 < input.len() && input[i + 1] == b'[' {
+            // Skip CSI sequence: ESC [ ... final_byte
+            i += 2;
+            while i < input.len() {
+                let c = input[i];
+                i += 1;
+                if (0x40..=0x7e).contains(&c) {
+                    break; // Final byte found
+                }
+            }
+        } else if input[i] == 0x1b && i + 1 < input.len() && input[i + 1] == b']' {
+            // Skip OSC sequence: ESC ] ... ST (or BEL)
+            i += 2;
+            while i < input.len() {
+                if input[i] == 0x07 {
+                    // BEL terminates OSC
+                    i += 1;
+                    break;
+                } else if input[i] == 0x1b && i + 1 < input.len() && input[i + 1] == b'\\' {
+                    // ST (ESC \) terminates OSC
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            output.push(input[i]);
+            i += 1;
+        }
+    }
+    output
 }
 
 pub fn init() -> bird::Result<()> {
