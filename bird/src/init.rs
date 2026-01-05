@@ -152,6 +152,13 @@ fn init_database(config: &Config) -> Result<()> {
 
 /// Install required DuckDB extensions.
 fn install_extensions(conn: &duckdb::Connection, config: &Config) -> Result<()> {
+    // Disable autoinstall to avoid network requests
+    conn.execute("SET autoinstall_known_extensions = false", [])?;
+
+    // Load bundled extensions (parquet, icu are bundled in DuckDB 1.0+)
+    conn.execute("LOAD parquet", [])?;
+    conn.execute("LOAD icu", [])?;
+
     // Set custom extensions directory
     conn.execute(
         &format!(

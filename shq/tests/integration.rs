@@ -89,7 +89,7 @@ fn test_save_from_stdin() {
 
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Saved 12 bytes"));
+    // save command is now silent (no "Saved X bytes" output)
 }
 
 #[test]
@@ -143,7 +143,7 @@ fn test_save_with_exit_code() {
 
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("exit 1"));
+    // save command is now silent (no "Saved X bytes for... (exit N)" output)
 }
 
 #[test]
