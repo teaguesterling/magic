@@ -459,7 +459,7 @@ __shq_preexec() {
     __shq_start_time=$EPOCHREALTIME
 }
 
-# Capture result after execution
+# Capture result after execution (metadata only - no output capture)
 __shq_precmd() {
     local exit_code=$?
     local cmd="$__shq_last_cmd"
@@ -492,9 +492,37 @@ __shq_precmd() {
     ) &!
 }
 
-# Convenience function: run command with output capture
+# Run command with full output capture
+# Usage: shqr <command> [args...]
+# Example: shqr make test
 shqr() {
-    shq run -c "$*"
+    local cmd="$*"
+    local tmpdir=$(mktemp -d)
+    local stdout_file="$tmpdir/stdout"
+    local stderr_file="$tmpdir/stderr"
+    local start_time=$EPOCHREALTIME
+
+    # Run command, capturing output while still displaying to terminal
+    # Uses process substitution to tee both streams
+    { eval "$cmd" } > >(tee "$stdout_file") 2> >(tee "$stderr_file" >&2)
+    local exit_code=${pipestatus[1]:-$?}
+
+    # Calculate duration (ensure integer, default to 0)
+    local duration=$(( (EPOCHREALTIME - start_time) * 1000 ))
+    duration=${duration%.*}
+    duration=${duration:-0}
+
+    # Save to BIRD with captured output
+    shq save -c "$cmd" -x "$exit_code" -d "$duration" \
+        -o "$stdout_file" -e "$stderr_file" \
+        --session-id "$__shq_session_id" \
+        --invoker-pid $$ \
+        --invoker zsh \
+        2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
+
+    # Cleanup
+    rm -rf "$tmpdir"
+    return $exit_code
 }
 
 # Register hooks
@@ -519,7 +547,7 @@ __shq_debug() {
     __shq_start_time=$EPOCHREALTIME
 }
 
-# Use PROMPT_COMMAND for precmd equivalent
+# Use PROMPT_COMMAND for precmd equivalent (metadata only - no output capture)
 __shq_prompt() {
     local exit_code=$?
     local cmd="$__shq_last_cmd"
@@ -553,9 +581,37 @@ __shq_prompt() {
     disown 2>/dev/null
 }
 
-# Convenience function: run command with output capture
+# Run command with full output capture
+# Usage: shqr <command> [args...]
+# Example: shqr make test
 shqr() {
-    shq run -c "$*"
+    local cmd="$*"
+    local tmpdir=$(mktemp -d)
+    local stdout_file="$tmpdir/stdout"
+    local stderr_file="$tmpdir/stderr"
+    local start_time=$EPOCHREALTIME
+
+    # Run command, capturing output while still displaying to terminal
+    # Uses process substitution to tee both streams
+    { eval "$cmd" ; } > >(tee "$stdout_file") 2> >(tee "$stderr_file" >&2)
+    local exit_code=${PIPESTATUS[0]:-$?}
+
+    # Calculate duration (ensure integer, default to 0)
+    local duration=$(echo "($EPOCHREALTIME - $start_time) * 1000" | bc 2>/dev/null || echo 0)
+    duration=${duration%.*}
+    duration=${duration:-0}
+
+    # Save to BIRD with captured output
+    shq save -c "$cmd" -x "$exit_code" -d "$duration" \
+        -o "$stdout_file" -e "$stderr_file" \
+        --session-id "$__shq_session_id" \
+        --invoker-pid $$ \
+        --invoker bash \
+        2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
+
+    # Cleanup
+    rm -rf "$tmpdir"
+    return $exit_code
 }
 
 # Register hooks
