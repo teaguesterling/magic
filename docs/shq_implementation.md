@@ -17,17 +17,16 @@ The `shq` binary provides:
 shq <command> [options]
 
 Commands:
-  run <cmd>       Run command with capture and log parsing
-  save            Save command retroactively (from tmux)
-  sql <query>     Execute SQL query
-  show <ref>      Show formatted data reference
-  events          Show parsed errors/warnings from last run
-  stats           Show statistics
-  errors          View/manage error log
   init            Initialize BIRD database
-  compact         Compact parquet files
-  archive         Move old data to archive
-  hook            Generate shell integration code
+  run <cmd>       Run command with capture
+  save            Save command retroactively (from pipes, tmux, or shell hooks)
+  show [selector] Show output from a previous command
+  history         Show recent command history
+  sql <query>     Execute SQL query
+  stats           Show statistics
+  archive         Move old data from recent to archive tier
+  compact         Compact parquet files to reduce storage and improve queries
+  hook init       Generate shell integration code for zsh/bash
 ```
 
 ## Core Implementation
@@ -681,49 +680,84 @@ pub fn cmd_init(config: &Config) -> Result<()> {
 }
 ```
 
+### `shq archive [options]`
+
+Move old data from recent tier to archive tier:
+
+```rust
+pub fn cmd_archive(days: u32, dry_run: bool) -> Result<()> {
+    let store = open_store()?;
+    let stats = store.archive(days, dry_run)?;
+
+    if stats.total_moved > 0 || !dry_run {
+        println!("Archive: moved {} files ({} bytes)",
+            stats.total_moved, stats.bytes_moved);
+    }
+
+    Ok(())
+}
+```
+
+Options:
+- `--days N` (default: 14) - Archive data older than N days
+- `--dry-run` - Show what would be archived without making changes
+
 ### `shq compact [options]`
 
+Compact parquet files to reduce storage and improve query performance:
+
 ```rust
-pub fn cmd_compact(options: &CompactOptions) -> Result<()> {
-    // See COMPACTION_APPENDIX.md for full algorithm
-    
-    let bird_root = get_bird_root()?;
-    let lock_path = bird_root.join("compaction.lock");
-    
-    // Try to acquire lock
-    let _lock = acquire_lock(&lock_path)?;
-    
-    // Compact each date partition
-    for date_dir in find_date_partitions(&bird_root)? {
-        compact_partition(&date_dir, options)?;
+pub fn cmd_compact(
+    file_threshold: usize,
+    session: Option<&str>,
+    today_only: bool,
+    quiet: bool,
+    recent_only: bool,
+    archive_only: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let store = open_store()?;
+
+    let stats = if today_only {
+        // Fast path for shell hooks: only compact today's partition for this session
+        let session_id = session.unwrap_or(&get_default_session_id()?);
+        store.compact_session_today(session_id, file_threshold, dry_run)?
+    } else {
+        // Full compaction
+        store.compact_all(file_threshold, session, recent_only, archive_only, dry_run)?
+    };
+
+    if !quiet || stats.files_removed > 0 {
+        println!("Compact: merged {} files into {}",
+            stats.files_removed, stats.files_created);
     }
-    
-    println!("✓ Compaction complete");
+
     Ok(())
 }
 ```
 
-### `shq archive`
+Options:
+- `-t, --threshold N` (default: 50) - Compact when session has more than N files
+- `-s, --session ID` - Only compact files for this specific session
+- `--today` - Only check today's partition (fast check for shell hooks)
+- `-q, --quiet` - Suppress output unless compaction occurs
+- `--recent-only` - Only compact recent tier (skip archive)
+- `--archive-only` - Only compact archive tier (skip recent)
+- `-n, --dry-run` - Show what would be compacted without making changes
 
-```rust
-pub fn cmd_archive(config: &Config) -> Result<()> {
-    let bird_root = get_bird_root()?;
-    let cutoff_date = Utc::now().date_naive() - Duration::days(config.recent_days as i64);
-    
-    // Find old partitions
-    let recent_dir = bird_root.join("db/data/recent");
-    for entry in fs::read_dir(recent_dir)? {
-        let path = entry?.path();
-        if let Some(date) = extract_date_from_partition(&path) {
-            if date < cutoff_date {
-                archive_partition(&path, config)?;
-            }
-        }
-    }
-    
-    Ok(())
-}
+#### Compaction File Naming
+
+Compacted files use a special naming scheme to track their origin:
 ```
+<session>--__compacted-N__--<uuid>.parquet
+```
+
+Where:
+- `<session>` - The session ID (sanitized)
+- `N` - Compaction generation number (increments each time)
+- `<uuid>` - Unique identifier for the compacted file
+
+This allows queries to track compaction history and maintain proper session grouping.
 
 ## Testing
 

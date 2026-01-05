@@ -97,9 +97,12 @@ cargo install --git https://github.com/yourorg/magic shq
 # Initialize BIRD database
 shq init
 
-# Add shell integration (syntax TBD)
-eval "$(shq shell init --shell zsh)"  # or bash
-source ~/.zshrc
+# Add shell integration to your shell config
+eval "$(shq hook init)"  # Auto-detects zsh/bash
+
+# Or specify shell explicitly
+eval "$(shq hook init --shell zsh)"
+eval "$(shq hook init --shell bash)"
 ```
 
 ### Basic Usage
@@ -224,17 +227,15 @@ shq sql "
 **Commands:**
 ```bash
 shq init              # Initialize BIRD database
-shq run CMD           # Run and parse command
+shq run CMD           # Run and capture command
 shq save              # Manually save from pipes or tmux buffers
 shq show              # Show the previous output of a command
-shq errors            # Show errors from last run
-shq warnings          # Show warnings from last run
-shq event N           # Show Nth error/warning
-shq events            # List all events
 shq history           # Browse command history
 shq sql "QUERY"       # Execute SQL query
 shq stats             # Show statistics
-shq verify            # Verify blob integrity
+shq archive           # Move old data to archive tier
+shq compact           # Compact parquet files for better performance
+shq hook init         # Generate shell integration code
 ```
 
 #### 3. Content-Addressed Storage
@@ -356,7 +357,24 @@ shq run make test || {
 shq ci check --baseline main
 ```
 
-### 5. Storage Management
+### 5. Data Lifecycle Management
+
+```bash
+# Archive old data (moves from recent/ to archive/)
+shq archive                  # Archive data older than 14 days
+shq archive --days 30        # Archive data older than 30 days
+shq archive --dry-run        # Preview what would be archived
+
+# Compact parquet files (merges many small files into fewer large ones)
+shq compact                  # Compact all sessions
+shq compact -s $SESSION_ID   # Compact specific session only
+shq compact --today          # Only compact today's partition
+shq compact --dry-run        # Preview what would be compacted
+```
+
+Note: Shell hooks automatically run `shq compact -s $session --today -q` in the background after each command to keep file counts manageable.
+
+### 6. Storage Management
 
 ```bash
 # Check storage savings
@@ -566,16 +584,20 @@ shq run make test || {
 
 ### Q: How do I clean up old data?
 
-**A:** Configure retention in `config.toml`:
-```toml
-[storage]
-hot_days = 14      # Archive after 14 days
-archive_days = 90  # Delete after 90 days
-```
-
-Or manually:
+**A:** Use the archive and compact commands:
 ```bash
-shq cleanup --before 2025-01-01
+# Archive data older than 14 days (default)
+shq archive
+
+# Archive data older than 30 days
+shq archive --days 30
+
+# Compact parquet files (reduces file count, improves query performance)
+shq compact
+
+# Dry-run to see what would happen
+shq archive --dry-run
+shq compact --dry-run
 ```
 
 ### Q: Does this work with multiple machines?
@@ -589,13 +611,14 @@ GROUP BY client_id;
 
 ## Roadmap
 
-- [ ] **v0.1** - Basic capture + DuckDB storage (In Progress)
-- [ ] **v0.2** - Content-addressed blobs + deduplication
-- [ ] **v0.3** - Full shq executable functionality
-- [ ] **v0.4** - shq shell integration
-- [ ] **v0.5** - shq tmux integration
+- [x] **v0.1** - Basic capture + DuckDB storage
+- [x] **v0.2** - Content-addressed blobs + deduplication
+- [x] **v0.3** - Core shq commands (run, save, show, history, sql, stats)
+- [x] **v0.4** - Shell integration (zsh, bash hooks)
+- [x] **v0.5** - Archive and compact commands
 - [ ] **v0.6** - duck_hunt integration for parsing and searching
 - [ ] **v0.7** - TUI history browser (or integration with existing tools)
+- [ ] **v0.8** - tmux integration
 - [ ] **v1.0** - Production ready
   - Comprehensive test coverage
   - Performance benchmarks

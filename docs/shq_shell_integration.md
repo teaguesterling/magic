@@ -15,15 +15,19 @@ The shell integration provides:
 ### One-Time Setup
 
 ```bash
-# Add to ~/.zshrc
+# Add to ~/.zshrc (zsh)
 eval "$(shq hook init)"
+
+# Or for bash, add to ~/.bashrc
+eval "$(shq hook init --shell bash)"
 ```
 
 On first shell startup, this:
-1. Creates `$BIRD_ROOT` directory structure
-2. Initializes `bird.duckdb` (on first query, not at hook init)
-3. Installs precmd/preexec hooks
+1. Creates `$BIRD_ROOT` directory structure (if needed)
+2. Generates unique session ID for this shell instance
+3. Installs precmd/preexec hooks (zsh) or DEBUG trap + PROMPT_COMMAND (bash)
 4. Sets up error logging
+5. Defines `shqr()` helper function for quick replay
 
 ### What Gets Installed
 
@@ -40,18 +44,22 @@ __shq_precmd() { ... }    # Runs after each command
 ```
 User types: make test
     ↓
-1. preexec hook captures command text
+1. preexec hook captures command text and start time
     ↓
 2. Command executes normally
     ↓
-3. precmd hook captures exit code
+3. precmd hook captures exit code and calculates duration
     ↓
-4. shq save (async, background)
+4. Background process forks off (non-blocking)
+    │
+    ├─→ shq save writes command + output to parquet
+    │
+    └─→ shq compact checks if session needs compaction
     ↓
-5. BIRD parquet written
+5. Shell prompt returns immediately
 ```
 
-### Hook Implementation
+### Hook Implementation (zsh)
 
 ```bash
 __shq_preexec() {
@@ -61,47 +69,73 @@ __shq_preexec() {
 }
 
 __shq_precmd() {
-    local exit=$?
+    local exit_code=$?
     local cmd="$__shq_last_cmd"
-    
+
     # Reset for next command
     __shq_last_cmd=""
-    
+
     # Skip if no command (e.g., empty prompt)
     [[ -z "$cmd" ]] && return
-    
+
     # Skip if command starts with space (privacy escape)
     [[ "$cmd" =~ ^[[:space:]] ]] && return
-    
+
     # Skip if command starts with backslash (explicit skip)
     [[ "$cmd" =~ ^\\ ]] && return
-    
+
     # Calculate duration
     local duration=0
     if [[ -n "$__shq_start_time" ]]; then
         duration=$(( (EPOCHREALTIME - __shq_start_time) * 1000 ))
         duration=${duration%.*}  # Truncate decimals
     fi
-    
-    # Capture to BIRD (async, non-blocking)
+
+    # Save to BIRD and run background compaction (async, non-blocking)
     # Important: Fork to background with &!
     # Important: Redirect stderr to error log
     (
-        shq save \
-            --cmd "$cmd" \
-            --exit "$exit" \
-            --duration "$duration" \
+        shq save -c "$cmd" -x "$exit_code" -d "$duration" \
+            --session-id "$__shq_session_id" \
+            --invoker-pid $$ \
+            --invoker zsh \
+            </dev/null \
+            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
+
+        # Quick compaction check for this session (today only, quiet)
+        shq compact -s "$__shq_session_id" --today -q \
             2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
     ) &!
-    
-    # Check for recent errors (non-blocking check)
-    __shq_check_errors
 }
+
+# Generate unique session ID for this shell instance
+__shq_session_id="shell-$$"
 
 # Register hooks
 preexec_functions+=(__shq_preexec)
 precmd_functions+=(__shq_precmd)
+
+# Quick replay helper - run last command and show output
+shqr() {
+    fc -e - 2>/dev/null
+    shq show
+}
 ```
+
+### Background Compaction
+
+The shell hooks include automatic background compaction to prevent file count growth:
+
+1. After each command is saved, `shq compact` runs with:
+   - `-s "$__shq_session_id"` - Only compact files for this session
+   - `--today` - Only check today's partition (fast)
+   - `-q` - Quiet mode (no output unless compaction occurs)
+
+2. This keeps the recent tier manageable without blocking the shell
+
+3. When the file count for a session exceeds the threshold (default: 50), files are merged into a single compacted file
+
+4. All output is redirected to the error log to avoid cluttering the terminal
 
 ## Privacy & Escape Sequences
 
