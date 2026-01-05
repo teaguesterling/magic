@@ -572,3 +572,192 @@ fn test_compact_quiet_mode() {
         "Quiet mode should not produce output when nothing compacted"
     );
 }
+
+#[test]
+fn test_show_head_option() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run command with multi-line output
+    shq_cmd(tmp.path())
+        .args(["run", "-c", "echo -e 'line1\\nline2\\nline3\\nline4\\nline5'"])
+        .output()
+        .expect("failed to run");
+
+    // Show only first 2 lines
+    let output = shq_cmd(tmp.path())
+        .args(["show", "--head", "2"])
+        .output()
+        .expect("failed to show");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("line1"), "Should contain line1");
+    assert!(stdout.contains("line2"), "Should contain line2");
+    assert!(!stdout.contains("line3"), "Should NOT contain line3");
+}
+
+#[test]
+fn test_show_tail_option() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run command with multi-line output
+    shq_cmd(tmp.path())
+        .args(["run", "-c", "echo -e 'line1\\nline2\\nline3\\nline4\\nline5'"])
+        .output()
+        .expect("failed to run");
+
+    // Show only last 2 lines
+    let output = shq_cmd(tmp.path())
+        .args(["show", "--tail", "2"])
+        .output()
+        .expect("failed to show");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("line1"), "Should NOT contain line1");
+    assert!(!stdout.contains("line3"), "Should NOT contain line3");
+    assert!(stdout.contains("line4"), "Should contain line4");
+    assert!(stdout.contains("line5"), "Should contain line5");
+}
+
+#[test]
+fn test_show_lines_shortcut() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run command with multi-line output
+    shq_cmd(tmp.path())
+        .args(["run", "-c", "echo -e 'a\\nb\\nc\\nd'"])
+        .output()
+        .expect("failed to run");
+
+    // Show only first 2 lines with -n shortcut
+    let output = shq_cmd(tmp.path())
+        .args(["show", "-n", "2"])
+        .output()
+        .expect("failed to show");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("a"), "Should contain a");
+    assert!(stdout.contains("b"), "Should contain b");
+    assert!(!stdout.contains("c"), "Should NOT contain c");
+}
+
+#[test]
+fn test_show_strip_ansi() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run command with ANSI color codes
+    shq_cmd(tmp.path())
+        .args(["run", "-c", "echo -e '\\033[31mred text\\033[0m'"])
+        .output()
+        .expect("failed to run");
+
+    // Show with ANSI codes stripped
+    let output = shq_cmd(tmp.path())
+        .args(["show", "--strip"])
+        .output()
+        .expect("failed to show");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("red text"), "Should contain text");
+    assert!(!stdout.contains("\x1b["), "Should NOT contain ANSI escape codes");
+    assert!(!stdout.contains("\\033"), "Should NOT contain escape sequences");
+}
+
+#[test]
+fn test_show_stdout_shortcut() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run command with both stdout and stderr
+    shq_cmd(tmp.path())
+        .args(["run", "-c", "echo stdout_text; echo stderr_text >&2"])
+        .output()
+        .expect("failed to run");
+
+    // Show only stdout with -O shortcut
+    let output = shq_cmd(tmp.path())
+        .args(["show", "-O"])
+        .output()
+        .expect("failed to show");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stdout_text"), "Should contain stdout");
+    assert!(!stdout.contains("stderr_text"), "Should NOT contain stderr in stdout");
+}
+
+#[test]
+fn test_show_stderr_shortcut() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run command with both stdout and stderr
+    shq_cmd(tmp.path())
+        .args(["run", "-c", "echo stdout_text; echo stderr_text >&2"])
+        .output()
+        .expect("failed to run");
+
+    // Show only stderr with -E shortcut
+    let output = shq_cmd(tmp.path())
+        .args(["show", "-E"])
+        .output()
+        .expect("failed to show");
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stderr_text"), "Should contain stderr");
+    // stdout should be empty or not contain stdout_text
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("stdout_text"), "Should NOT contain stdout in output");
+}
+
+#[test]
+fn test_show_all_combined() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run command with both stdout and stderr
+    shq_cmd(tmp.path())
+        .args(["run", "-c", "echo out_first; echo err_second >&2"])
+        .output()
+        .expect("failed to run");
+
+    // Show all combined to stdout with -A shortcut
+    let output = shq_cmd(tmp.path())
+        .args(["show", "-A"])
+        .output()
+        .expect("failed to show");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Both streams should be in stdout when using -A
+    assert!(stdout.contains("out_first"), "Should contain stdout in combined output");
+    assert!(stdout.contains("err_second"), "Should contain stderr in combined output");
+}
+
+#[test]
+fn test_show_no_output_found() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Don't run any commands, just try to show
+    let output = shq_cmd(tmp.path())
+        .args(["show"])
+        .output()
+        .expect("failed to show");
+
+    // Should succeed but indicate no output found
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No invocation found") || stderr.contains("No output found"),
+        "Should indicate no output: {}", stderr
+    );
+}
