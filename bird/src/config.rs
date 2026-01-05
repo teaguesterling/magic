@@ -164,6 +164,18 @@ impl Config {
             .join(prefix)
             .join(format!("{}--{}.bin", hash, sanitized_cmd))
     }
+
+    /// Path to the event-formats.toml config file.
+    pub fn event_formats_path(&self) -> PathBuf {
+        self.bird_root.join("event-formats.toml")
+    }
+
+    /// Path to events parquet files for a given date.
+    pub fn events_dir(&self, date: &chrono::NaiveDate) -> PathBuf {
+        self.recent_dir()
+            .join("events")
+            .join(format!("date={}", date))
+    }
 }
 
 /// Sanitize a string for use in filenames (used for blob naming).

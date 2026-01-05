@@ -186,6 +186,68 @@ enum Commands {
         #[command(subcommand)]
         action: HookAction,
     },
+
+    /// Query parsed events (errors, warnings, test results) from invocation outputs
+    Events {
+        /// Filter by severity (error, warning, info, note)
+        #[arg(short = 's', long = "severity")]
+        severity: Option<String>,
+
+        /// Filter by command pattern (glob, e.g., "*cargo*")
+        #[arg(short = 'c', long = "cmd")]
+        cmd_pattern: Option<String>,
+
+        /// Filter by client ID
+        #[arg(long = "client")]
+        client: Option<String>,
+
+        /// Filter by hostname
+        #[arg(long = "hostname")]
+        hostname: Option<String>,
+
+        /// Events from the last N invocations
+        #[arg(short = 'n', long = "last")]
+        last_n: Option<usize>,
+
+        /// Filter events by invocation ID
+        #[arg(short = 'i', long = "invocation")]
+        invocation_id: Option<String>,
+
+        /// Show count only
+        #[arg(long = "count")]
+        count_only: bool,
+
+        /// Maximum number of events to show
+        #[arg(short = 'l', long = "limit", default_value = "50")]
+        limit: usize,
+
+        /// Re-parse events from original blobs (ignore cached events)
+        #[arg(long = "reparse")]
+        reparse: bool,
+
+        /// Override format detection (e.g., gcc, pytest, cargo)
+        #[arg(short = 'f', long = "format")]
+        format: Option<String>,
+    },
+
+    /// Extract events from an invocation's output
+    ExtractEvents {
+        /// Invocation ID (default: last invocation)
+        #[arg(default_value = "-1", allow_hyphen_values = true)]
+        selector: String,
+
+        /// Override format detection (default: auto or from config)
+        #[arg(short = 'f', long = "format")]
+        format: Option<String>,
+
+        /// Suppress output (for shell hooks)
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
+
+        /// Re-extract even if events already exist
+        #[arg(long = "force")]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -248,6 +310,23 @@ fn main() {
         Commands::Hook { action } => match action {
             HookAction::Init { shell } => commands::hook_init(shell.as_deref()),
         },
+        Commands::Events { severity, cmd_pattern, client, hostname, last_n, invocation_id, count_only, limit, reparse, format } => {
+            commands::events(
+                severity.as_deref(),
+                cmd_pattern.as_deref(),
+                client.as_deref(),
+                hostname.as_deref(),
+                last_n,
+                invocation_id.as_deref(),
+                count_only,
+                limit,
+                reparse,
+                format.as_deref(),
+            )
+        }
+        Commands::ExtractEvents { selector, format, quiet, force } => {
+            commands::extract_events(&selector, format.as_deref(), quiet, force)
+        }
     };
 
     if let Err(e) = result {

@@ -135,37 +135,31 @@ WHERE c.format_hint = 'gcc'
   AND c.date >= current_date - 7;
 ```
 
-### 2. shq Command Integration
+### 2. shq Command Integration (Planned for v0.6)
 
-Use `shq events` for convenient access:
+*The `shq events` command is planned for v0.6 with duck_hunt integration.*
 
 ```bash
-# Parse last command output
-shq events
+# (Future) Parse last command output
+# shq events
 
-# Filter by severity
-shq events --severity error
-
-# Show specific format
-shq events --format gcc
-
-# Export to JSON
-shq events --format json > errors.json
+# (Future) Filter by severity
+# shq events --severity error
 ```
 
-### 3. blq Pipeline Integration
+### 3. Current shq Commands
 
-Chain shq and blq for advanced analysis:
+For now, use SQL queries to analyze captured data:
 
 ```bash
-# Capture and analyze in one go
-shq run make test | blq analyze --format gcc
+# Run a command with capture
+shq run make test
 
-# Query BIRD, pipe to blq
-shq sql "SELECT stdout_file FROM commands WHERE cmd LIKE 'make%'" \
-  | blq from - --format gcc \
-  | blq where severity=error \
-  | blq stats
+# View the output
+shq show
+
+# Query invocations
+shq sql "SELECT cmd, exit_code FROM invocations WHERE cmd LIKE 'make%'"
 ```
 
 ## Format Detection Strategy
@@ -440,9 +434,9 @@ fn sync_from_remote(local: &Path, remote: &Path) -> Result<()> {
 ```bash
 # Analyze all GCC builds from last week
 shq sql "
-  SELECT stdout_file 
-  FROM commands 
-  WHERE format_hint = 'gcc' 
+  SELECT stdout_file
+  FROM invocations
+  WHERE format_hint = 'gcc'
     AND date >= current_date - 7
 " | blq from - --format gcc \
   | blq stats
@@ -450,7 +444,7 @@ shq sql "
 # Find most common warnings
 shq sql "
   SELECT stdout_file, cmd
-  FROM commands
+  FROM invocations
   WHERE format_hint = 'gcc'
 " | blq from - --format gcc \
   | blq where severity=warning \
@@ -462,8 +456,8 @@ shq sql "
 for date in 2024-12-{25..30}; do
   echo "=== $date ==="
   shq sql "
-    SELECT stdout_file 
-    FROM commands 
+    SELECT stdout_file
+    FROM invocations
     WHERE date = '$date' AND format_hint = 'gcc'
   " | blq from - --format gcc \
     | blq where severity=error \

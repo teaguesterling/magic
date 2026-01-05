@@ -6,10 +6,10 @@ This document specifies the implementation of the `shq` executable (not the shel
 
 The `shq` binary provides:
 - Command capture (`run`, `save`)
-- Query interface (`sql`, `show`)
-- Build log parsing (`events`, `stats`)
-- Error reporting (`errors`)
+- Query interface (`sql`, `show`, `history`)
+- Statistics (`stats`)
 - Database management (`init`, `compact`, `archive`)
+- Shell integration (`hook init`)
 
 ## Command Structure
 
@@ -17,16 +17,32 @@ The `shq` binary provides:
 shq <command> [options]
 
 Commands:
-  init            Initialize BIRD database
-  run <cmd>       Run command with capture
-  save            Save command retroactively (from pipes, tmux, or shell hooks)
-  show [selector] Show output from a previous command
-  history         Show recent command history
-  sql <query>     Execute SQL query
-  stats           Show statistics
-  archive         Move old data from recent to archive tier
-  compact         Compact parquet files to reduce storage and improve queries
-  hook init       Generate shell integration code for zsh/bash
+  init                Initialize BIRD database
+  run <cmd>           Run command with capture
+  save                Save command (used by shell hooks)
+  show [selector]     Show output from a previous command
+  history             Show recent command history
+  sql <query>         Execute SQL query
+  stats               Show statistics
+  archive             Move old data from recent to archive tier
+  compact             Compact parquet files to reduce storage and improve queries
+  hook init           Generate shell integration code for zsh/bash
+```
+
+### Show Options
+
+```
+shq show [selector] [options]
+
+Options:
+  -O, --stdout        Show only stdout
+  -E, --stderr        Show only stderr
+  -A, --all           Combine all streams to stdout
+  -P, --pager         Pipe output through pager
+  --strip             Strip ANSI escape codes
+  --head N            Show first N lines
+  -t, --tail N        Show last N lines
+  -n, --lines N       Limit output to N lines (same as --head)
 ```
 
 ## Core Implementation
@@ -268,7 +284,7 @@ fn write_command_parquet(record: CommandRecord) -> Result<()> {
     let bird_root = get_bird_root()?;
     let date = record.timestamp.date_naive();
     let partition_dir = bird_root.join(format!(
-        "db/data/recent/commands/date={}",
+        "data/recent/invocations/date={}",
         date
     ));
     fs::create_dir_all(&partition_dir)?;
@@ -452,19 +468,22 @@ pub fn cmd_show(reference: &str, config: &Config) -> Result<()> {
 }
 ```
 
-### `shq events [options]`
+### `shq events [options]` (Planned for v0.6)
+
+*This command is planned for the v0.6 release with duck_hunt integration.*
 
 ```rust
+// Future implementation - parse build outputs for structured events
 pub fn cmd_events(options: &EventsOptions, config: &Config) -> Result<()> {
     let db_path = ensure_bird_db()?;
     let conn = Connection::open(db_path)?;
     
-    // Get last command with parsed output
+    // Get last invocation with parsed output
     let query = "
-        SELECT c.id, c.cmd, o.storage_type, o.storage_ref, o.content_hash, c.format_hint
-        FROM commands c
-        JOIN outputs o ON c.id = o.command_id
-        WHERE c.timestamp = (SELECT MAX(timestamp) FROM commands)
+        SELECT i.id, i.cmd, o.storage_type, o.storage_ref, o.content_hash, i.format_hint
+        FROM invocations i
+        JOIN outputs o ON i.id = o.invocation_id
+        WHERE i.timestamp = (SELECT MAX(timestamp) FROM invocations)
         AND o.stream = 'stdout'
     ";
     
@@ -648,11 +667,13 @@ pub fn cmd_init(config: &Config) -> Result<()> {
     let bird_root = get_bird_root()?;
     
     // Create directory structure
-    create_dir_all(bird_root.join("db/data/recent/commands"))?;
-    create_dir_all(bird_root.join("db/data/recent/outputs"))?;
-    create_dir_all(bird_root.join("db/data/recent/managed"))?;
-    create_dir_all(bird_root.join("db/data/archive/by-week"))?;
-    create_dir_all(bird_root.join("db/sql"))?;
+    create_dir_all(bird_root.join("data/recent/invocations"))?;
+    create_dir_all(bird_root.join("data/recent/outputs"))?;
+    create_dir_all(bird_root.join("data/recent/sessions"))?;
+    create_dir_all(bird_root.join("data/archive"))?;
+    create_dir_all(bird_root.join("blobs/content"))?;
+    create_dir_all(bird_root.join("extensions"))?;
+    create_dir_all(bird_root.join("sql"))?;
     
     // Copy SQL files
     fs::write(

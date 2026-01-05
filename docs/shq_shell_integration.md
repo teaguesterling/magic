@@ -23,11 +23,10 @@ eval "$(shq hook init --shell bash)"
 ```
 
 On first shell startup, this:
-1. Creates `$BIRD_ROOT` directory structure (if needed)
-2. Generates unique session ID for this shell instance
-3. Installs precmd/preexec hooks (zsh) or DEBUG trap + PROMPT_COMMAND (bash)
-4. Sets up error logging
-5. Defines `shqr()` helper function for quick replay
+1. Generates unique session ID for this shell instance
+2. Installs precmd/preexec hooks (zsh) or DEBUG trap + PROMPT_COMMAND (bash)
+3. Sets up error logging (stderr redirected to `$BIRD_ROOT/errors.log`)
+4. Defines `shqr()` helper function for running commands with output capture
 
 ### What Gets Installed
 
@@ -46,28 +45,34 @@ User types: make test
     ↓
 1. preexec hook captures command text and start time
     ↓
-2. Command executes normally
+2. Command executes normally (output NOT captured by default)
     ↓
 3. precmd hook captures exit code and calculates duration
     ↓
 4. Background process forks off (non-blocking)
     │
-    ├─→ shq save writes command + output to parquet
+    ├─→ shq save writes command metadata to parquet
     │
     └─→ shq compact checks if session needs compaction
     ↓
 5. Shell prompt returns immediately
 ```
 
+**Note:** Default hooks capture command metadata only, not output. Use `shqr` or `shq run` to capture full output.
+
 ### Hook Implementation (zsh)
 
 ```bash
+# Session ID based on this shell's PID (stable across commands)
+__shq_session_id="zsh-$$"
+
+# Capture command before execution
 __shq_preexec() {
-    # Capture command text before execution
     __shq_last_cmd="$1"
     __shq_start_time=$EPOCHREALTIME
 }
 
+# Capture result after execution (metadata only - no output capture)
 __shq_precmd() {
     local exit_code=$?
     local cmd="$__shq_last_cmd"
@@ -75,25 +80,21 @@ __shq_precmd() {
     # Reset for next command
     __shq_last_cmd=""
 
-    # Skip if no command (e.g., empty prompt)
+    # Skip if no command (empty prompt)
     [[ -z "$cmd" ]] && return
 
     # Skip if command starts with space (privacy escape)
     [[ "$cmd" =~ ^[[:space:]] ]] && return
 
-    # Skip if command starts with backslash (explicit skip)
-    [[ "$cmd" =~ ^\\ ]] && return
-
-    # Calculate duration
+    # Calculate duration in milliseconds
     local duration=0
     if [[ -n "$__shq_start_time" ]]; then
         duration=$(( (EPOCHREALTIME - __shq_start_time) * 1000 ))
         duration=${duration%.*}  # Truncate decimals
     fi
+    __shq_start_time=""
 
-    # Save to BIRD and run background compaction (async, non-blocking)
-    # Important: Fork to background with &!
-    # Important: Redirect stderr to error log
+    # Save to BIRD and check compaction (async, non-blocking)
     (
         shq save -c "$cmd" -x "$exit_code" -d "$duration" \
             --session-id "$__shq_session_id" \
@@ -101,25 +102,52 @@ __shq_precmd() {
             --invoker zsh \
             </dev/null \
             2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
-
         # Quick compaction check for this session (today only, quiet)
         shq compact -s "$__shq_session_id" --today -q \
             2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
     ) &!
 }
 
-# Generate unique session ID for this shell instance
-__shq_session_id="shell-$$"
+# Run command with full output capture
+# Usage: shqr <command> [args...]
+shqr() {
+    local cmd="$*"
+    local tmpdir=$(mktemp -d)
+    local stdout_file="$tmpdir/stdout"
+    local stderr_file="$tmpdir/stderr"
+    local start_time=$EPOCHREALTIME
+
+    # Run command, capturing output while still displaying to terminal
+    { eval "$cmd" } > >(tee "$stdout_file") 2> >(tee "$stderr_file" >&2)
+    local exit_code=${pipestatus[1]:-$?}
+
+    # Calculate duration
+    local duration=$(( (EPOCHREALTIME - start_time) * 1000 ))
+    duration=${duration%.*}
+    duration=${duration:-0}
+
+    # Save to BIRD with captured output
+    shq save -c "$cmd" -x "$exit_code" -d "$duration" \
+        -o "$stdout_file" -e "$stderr_file" \
+        --session-id "$__shq_session_id" \
+        --invoker-pid $$ \
+        --invoker zsh \
+        2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
+
+    # Cleanup
+    rm -rf "$tmpdir"
+
+    # Quick compaction check (background, quiet)
+    (shq compact -s "$__shq_session_id" --today -q \
+        2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log") &!
+
+    return $exit_code
+}
 
 # Register hooks
-preexec_functions+=(__shq_preexec)
-precmd_functions+=(__shq_precmd)
-
-# Quick replay helper - run last command and show output
-shqr() {
-    fc -e - 2>/dev/null
-    shq show
-}
+autoload -Uz add-zsh-hook
+add-zsh-hook preexec __shq_preexec
+add-zsh-hook precmd __shq_precmd
 ```
 
 ### Background Compaction
@@ -148,15 +176,15 @@ Commands NOT captured:
 
 ### Disabling Temporarily
 
+To temporarily disable capture, you can unset the hook functions:
+
 ```bash
-# Disable for this session
-shq hook disable
+# Disable for this session (zsh)
+add-zsh-hook -d precmd __shq_precmd
+add-zsh-hook -d preexec __shq_preexec
 
-# Re-enable
-shq hook enable
-
-# Check status
-shq hook status
+# Re-enable by sourcing the hook again
+eval "$(shq hook init)"
 ```
 
 ## Error Handling
@@ -167,7 +195,7 @@ The shell hook MUST be bulletproof. If shq fails, your shell continues normally.
 
 ### Error Log
 
-All hook errors logged to: `$BIRD_ROOT/errors.log`
+All hook errors are logged to: `$BIRD_ROOT/errors.log`
 
 ```bash
 # Example error log entry
@@ -175,79 +203,17 @@ All hook errors logged to: `$BIRD_ROOT/errors.log`
 [2024-12-30T15:24:10Z] Cannot create session directory: permission denied
 ```
 
-### Visual Error Indicator
-
-When errors occur, a subtle indicator appears in your prompt:
-
-```bash
-# Normal prompt
-❯ 
-
-# With recent errors (last 5 minutes)
-❯ ⚠
-
-# After user acknowledges
-❯ 
-```
-
-Implementation:
-
-```bash
-__shq_check_errors() {
-    # Only check once per minute (avoid overhead)
-    local now=$(date +%s)
-    local last_check=${__shq_last_error_check:-0}
-    [[ $((now - last_check)) -lt 60 ]] && return
-    
-    __shq_last_error_check=$now
-    
-    # Check if errors in last 5 minutes
-    local error_log="${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
-    [[ ! -f "$error_log" ]] && return
-    
-    local recent_errors=$(tail -100 "$error_log" 2>/dev/null | \
-        awk -v cutoff="$(date -d '5 minutes ago' +%s)" '
-            /^\[/ {
-                gsub(/[^0-9]/, "", $1)
-                if ($1 > cutoff) print
-            }
-        ' | wc -l)
-    
-    if [[ $recent_errors -gt 0 ]]; then
-        __shq_has_errors=1
-    else
-        __shq_has_errors=0
-    fi
-}
-
-# Add to prompt (optional, user preference)
-__shq_prompt_indicator() {
-    [[ "${__shq_has_errors:-0}" -eq 1 ]] && echo "⚠"
-}
-
-# User adds to their prompt:
-# PS1='$(git_prompt)$(shq_prompt_indicator) ❯ '
-```
-
 ### Viewing Errors
 
 ```bash
-# Show recent errors
-shq errors
+# View recent errors
+tail -20 "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
 
-# Show all errors
-shq errors --all
+# View all errors
+cat "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
 
 # Clear error log
-shq errors --clear
-
-# Example output:
-# Recent errors (last 24 hours):
-# 
-# [2024-12-30 15:23:45] Failed to write parquet: disk full
-# [2024-12-30 15:24:10] Cannot create directory: permission denied
-# 
-# Fix: Check disk space with 'df -h'
+: > "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
 ```
 
 ## Performance
@@ -268,20 +234,14 @@ shq errors --clear
 
 ### Performance Monitoring
 
-```bash
-# Show hook statistics
-shq stats hook
+Performance can be monitored by checking the error log and database statistics:
 
-# Example output:
-# Hook Performance (last 1000 commands):
-# 
-# Avg precmd latency:  1.2ms
-# Max precmd latency:  4.8ms
-# Background save avg: 23ms
-# Background save max: 156ms
-# 
-# Failed captures:     2 (0.2%)
-# Error log entries:   2
+```bash
+# Check overall statistics
+shq stats
+
+# Query recent capture performance
+shq sql "SELECT AVG(duration_ms) as avg_cmd_duration FROM invocations_today"
 ```
 
 ## Hook Behavior Details
@@ -385,26 +345,26 @@ eval "$(shq hook init --force)"
 ### Slow Prompt
 
 ```bash
-# Check hook performance
-shq stats hook
-
 # If precmd is slow (>5ms):
 # 1. Check disk I/O (is disk full?)
+df -h
+
 # 2. Check error log size (rotate if huge)
-# 3. Disable temporarily: shq hook disable
+ls -la "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
+
+# 3. Disable temporarily
+add-zsh-hook -d precmd __shq_precmd
+add-zsh-hook -d preexec __shq_preexec
 ```
 
-### Errors Not Appearing
+### Checking for Errors
 
 ```bash
 # Check error log location
-echo $BIRD_ROOT/errors.log
+echo "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
 
-# Manually check log
-tail -20 $BIRD_ROOT/errors.log
-
-# Test error detection
-shq errors --test
+# View recent errors
+tail -20 "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
 ```
 
 ## Advanced: Custom Integration
@@ -456,16 +416,11 @@ Best practices:
 Error log can grow large. Rotate periodically:
 
 ```bash
-# In crontab
-0 0 * * 0 $HOME/.local/bin/shq errors --rotate
-```
+# In crontab - rotate weekly
+0 0 * * 0 mv "${HOME}/.local/share/bird/errors.log" "${HOME}/.local/share/bird/errors.log.old" 2>/dev/null
 
-Or configure automatic rotation:
-
-```toml
-[hook]
-error_log_max_size = "10M"    # Rotate when >10MB
-error_log_keep_count = 3       # Keep last 3 rotated logs
+# Or clear if not needed
+0 0 * * 0 : > "${HOME}/.local/share/bird/errors.log"
 ```
 
 ---

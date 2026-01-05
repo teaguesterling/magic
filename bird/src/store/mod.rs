@@ -4,6 +4,7 @@
 
 mod atomic;
 mod compact;
+mod events;
 mod invocations;
 mod outputs;
 mod sessions;
@@ -18,6 +19,7 @@ use crate::{Config, Error, Result};
 
 // Re-export types from submodules
 pub use compact::{ArchiveStats, AutoCompactOptions, CompactStats};
+pub use events::{EventFilters, EventSummary, FormatConfig, FormatRule};
 pub use invocations::InvocationSummary;
 pub use outputs::OutputInfo;
 
@@ -56,6 +58,7 @@ impl Store {
         )?;
         conn.execute("SET allow_community_extensions = true", [])?;
         conn.execute("LOAD scalarfs", [])?;
+        conn.execute("LOAD duck_hunt", [])?;
 
         // Set file search path so views resolve relative paths correctly
         conn.execute(

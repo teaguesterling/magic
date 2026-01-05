@@ -455,14 +455,14 @@ pub fn archive_week(&self, week: Week) -> Result<()> {
     let fully_archived = self.db.query(
         "SELECT DISTINCT o.content_hash
          FROM outputs o
-         JOIN commands c ON c.id = o.command_id
+         JOIN invocations i ON i.id = o.invocation_id
          WHERE o.storage_type = 'blob'
-           AND date_trunc('week', c.timestamp) = ?
+           AND date_trunc('week', i.timestamp) = ?
            AND NOT EXISTS (
-               SELECT 1 FROM commands c2
-               JOIN outputs o2 ON o2.command_id = c2.id
+               SELECT 1 FROM invocations i2
+               JOIN outputs o2 ON o2.invocation_id = i2.id
                WHERE o2.content_hash = o.content_hash
-                 AND c2.timestamp >= ?
+                 AND i2.timestamp >= ?
            )",
         params![week.start(), week.end()]
     )?;
@@ -588,15 +588,15 @@ WHERE storage_type = 'blob';
 
 ```sql
 -- Find most frequently duplicated blobs
-SELECT 
+SELECT
     b.content_hash,
     b.ref_count,
     b.byte_length / 1024.0 / 1024.0 as size_mb,
     b.ref_count * b.byte_length / 1024.0 / 1024.0 as saved_mb,
-    COUNT(DISTINCT c.program) as unique_programs
+    COUNT(DISTINCT i.executable) as unique_programs
 FROM blob_registry b
 JOIN outputs o ON o.content_hash = b.content_hash
-JOIN commands c ON c.id = o.command_id
+JOIN invocations i ON i.id = o.invocation_id
 WHERE b.ref_count > 5
 GROUP BY b.content_hash, b.ref_count, b.byte_length
 ORDER BY saved_mb DESC

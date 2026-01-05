@@ -24,6 +24,9 @@ pub enum Error {
 
     #[error("Invalid path: {0}")]
     InvalidPath(String),
+
+    #[error("Not found: {0}")]
+    NotFound(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

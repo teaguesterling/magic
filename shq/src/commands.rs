@@ -4,7 +4,7 @@ use std::io::{self, Read};
 use std::process::Command;
 use std::time::Instant;
 
-use bird::{init, Config, InvocationRecord, SessionRecord, Store};
+use bird::{init, Config, EventFilters, InvocationRecord, SessionRecord, Store};
 
 /// Generate a session ID for grouping related invocations.
 fn session_id() -> String {
@@ -690,6 +690,231 @@ pub fn hook_init(shell: Option<&str>) -> bird::Result<()> {
     Ok(())
 }
 
+/// Query parsed events from invocation outputs.
+#[allow(clippy::too_many_arguments)]
+pub fn events(
+    severity: Option<&str>,
+    cmd_pattern: Option<&str>,
+    client: Option<&str>,
+    hostname: Option<&str>,
+    last_n: Option<usize>,
+    invocation_id: Option<&str>,
+    count_only: bool,
+    limit: usize,
+    reparse: bool,
+    format: Option<&str>,
+) -> bird::Result<()> {
+    let config = Config::load()?;
+    let store = Store::open(config)?;
+
+    // Handle reparse mode: re-extract events from outputs
+    if reparse {
+        // If invocation specified, reparse just that one
+        if let Some(inv_id) = invocation_id {
+            let resolved_id = resolve_invocation_id(&store, inv_id)?;
+            let count = store.extract_events(&resolved_id, format)?;
+            if count > 0 {
+                println!("Re-extracted {} events from invocation {}", count, resolved_id);
+            } else {
+                println!("No events found in invocation {}", resolved_id);
+            }
+            return Ok(());
+        }
+
+        // Otherwise, reparse last N invocations
+        let n = last_n.unwrap_or(10);
+        let invocations = store.recent_invocations(n)?;
+        let mut total_events = 0;
+
+        for inv in &invocations {
+            // Delete existing events for this invocation
+            store.delete_events_for_invocation(&inv.id)?;
+            // Re-extract
+            let count = store.extract_events(&inv.id, format)?;
+            total_events += count;
+        }
+
+        println!(
+            "Re-extracted {} events from {} invocations",
+            total_events,
+            invocations.len()
+        );
+        return Ok(());
+    }
+
+    // Build filters
+    let mut filters = EventFilters {
+        severity: severity.map(|s| s.to_string()),
+        cmd_pattern: cmd_pattern.map(|s| s.to_string()),
+        client_id: client.map(|s| s.to_string()),
+        hostname: hostname.map(|s| s.to_string()),
+        invocation_id: invocation_id.map(|s| s.to_string()),
+        limit: Some(limit),
+        ..Default::default()
+    };
+
+    // If filtering by last N invocations, get their IDs
+    if let Some(n) = last_n {
+        let invocations = store.recent_invocations(n)?;
+        if invocations.is_empty() {
+            println!("No invocations found.");
+            return Ok(());
+        }
+        // For now, we'll just use date filtering based on the oldest invocation
+        // A more precise approach would query events by invocation_id IN (...)
+        filters.limit = Some(limit);
+    }
+
+    // Count only mode
+    if count_only {
+        let count = store.event_count(&filters)?;
+        println!("{}", count);
+        return Ok(());
+    }
+
+    // Query events
+    let events = store.query_events(&filters)?;
+
+    if events.is_empty() {
+        println!("No events found.");
+        return Ok(());
+    }
+
+    // Display events
+    println!(
+        "{:<8} {:<40} {:<30} {}",
+        "SEVERITY", "FILE:LINE", "CODE", "MESSAGE"
+    );
+    println!("{}", "-".repeat(100));
+
+    for event in &events {
+        let severity = event.severity.as_deref().unwrap_or("-");
+        let location = match (&event.ref_file, event.ref_line) {
+            (Some(f), Some(l)) => format!("{}:{}", truncate_path(f, 35), l),
+            (Some(f), None) => truncate_path(f, 40).to_string(),
+            _ => "-".to_string(),
+        };
+        let code = event
+            .error_code
+            .as_deref()
+            .or(event.test_name.as_deref())
+            .unwrap_or("-");
+        let message = event
+            .message
+            .as_deref()
+            .map(|m| truncate_string(m, 50))
+            .unwrap_or_else(|| "-".to_string());
+
+        // Color based on severity
+        let severity_display = match severity {
+            "error" => format!("\x1b[31m{:<8}\x1b[0m", severity),
+            "warning" => format!("\x1b[33m{:<8}\x1b[0m", severity),
+            _ => format!("{:<8}", severity),
+        };
+
+        println!(
+            "{} {:<40} {:<30} {}",
+            severity_display, location, code, message
+        );
+    }
+
+    println!("\n({} events)", events.len());
+
+    Ok(())
+}
+
+/// Extract events from an invocation's output.
+pub fn extract_events(
+    selector: &str,
+    format: Option<&str>,
+    quiet: bool,
+    force: bool,
+) -> bird::Result<()> {
+    let config = Config::load()?;
+    let store = Store::open(config)?;
+
+    // Resolve selector to invocation ID
+    let invocation_id = resolve_invocation_id(&store, selector)?;
+
+    // Check if events already exist
+    let existing_count = store.event_count(&EventFilters {
+        invocation_id: Some(invocation_id.clone()),
+        ..Default::default()
+    })?;
+
+    if existing_count > 0 && !force {
+        if !quiet {
+            println!(
+                "Events already exist for invocation {} ({} events). Use --force to re-extract.",
+                invocation_id, existing_count
+            );
+        }
+        return Ok(());
+    }
+
+    // Delete existing events if forcing
+    if force && existing_count > 0 {
+        store.delete_events_for_invocation(&invocation_id)?;
+    }
+
+    // Extract events
+    let count = store.extract_events(&invocation_id, format)?;
+
+    if !quiet {
+        if count > 0 {
+            println!("Extracted {} events from invocation {}", count, invocation_id);
+        } else {
+            println!("No events found in invocation {}", invocation_id);
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve a selector (negative offset or UUID) to an invocation ID.
+fn resolve_invocation_id(store: &Store, selector: &str) -> bird::Result<String> {
+    if let Ok(offset) = selector.parse::<i64>() {
+        if offset < 0 {
+            let n = (-offset) as usize;
+            let invocations = store.recent_invocations(n)?;
+            if let Some(inv) = invocations.last() {
+                return Ok(inv.id.clone());
+            } else {
+                return Err(bird::Error::NotFound(format!(
+                    "No invocation found at offset {}",
+                    offset
+                )));
+            }
+        }
+    }
+    // Assume it's a UUID
+    Ok(selector.to_string())
+}
+
+/// Truncate a path for display, keeping the filename visible.
+fn truncate_path(path: &str, max_len: usize) -> &str {
+    if path.len() <= max_len {
+        return path;
+    }
+    // Try to keep at least the filename
+    if let Some(pos) = path.rfind('/') {
+        let filename = &path[pos + 1..];
+        if filename.len() < max_len {
+            return &path[path.len() - max_len..];
+        }
+    }
+    &path[path.len() - max_len..]
+}
+
+/// Truncate a string for display.
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len - 3])
+    }
+}
+
 const ZSH_HOOK: &str = r#"# shq shell integration for zsh
 # Add to ~/.zshrc: eval "$(shq hook init)"
 
@@ -724,13 +949,16 @@ __shq_precmd() {
     fi
     __shq_start_time=""
 
-    # Save to BIRD and check compaction (async, non-blocking)
+    # Save to BIRD, extract events, and check compaction (async, non-blocking)
     (
         shq save -c "$cmd" -x "$exit_code" -d "$duration" \
             --session-id "$__shq_session_id" \
             --invoker-pid $$ \
             --invoker zsh \
             </dev/null \
+            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
+        # Extract events from the output (quiet, non-blocking)
+        shq extract-events -q \
             2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
         # Quick compaction check for this session (today only, quiet)
         shq compact -s "$__shq_session_id" --today -q \
@@ -769,9 +997,13 @@ shqr() {
     # Cleanup
     rm -rf "$tmpdir"
 
-    # Quick compaction check (background, quiet)
-    (shq compact -s "$__shq_session_id" --today -q \
-        2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log") &!
+    # Extract events and compaction check (background, quiet)
+    (
+        shq extract-events -q \
+            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
+        shq compact -s "$__shq_session_id" --today -q \
+            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
+    ) &!
 
     return $exit_code
 }
@@ -820,13 +1052,16 @@ __shq_prompt() {
     fi
     __shq_start_time=""
 
-    # Save to BIRD and check compaction (async, background)
+    # Save to BIRD, extract events, and check compaction (async, background)
     (
         shq save -c "$cmd" -x "$exit_code" -d "$duration" \
             --session-id "$__shq_session_id" \
             --invoker-pid $$ \
             --invoker bash \
             </dev/null \
+            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
+        # Extract events from the output (quiet, non-blocking)
+        shq extract-events -q \
             2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
         # Quick compaction check for this session (today only, quiet)
         shq compact -s "$__shq_session_id" --today -q \
@@ -866,9 +1101,13 @@ shqr() {
     # Cleanup
     rm -rf "$tmpdir"
 
-    # Quick compaction check (background, quiet)
-    (shq compact -s "$__shq_session_id" --today -q \
-        2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log") &
+    # Extract events and compaction check (background, quiet)
+    (
+        shq extract-events -q \
+            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
+        shq compact -s "$__shq_session_id" --today -q \
+            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
+    ) &
     disown 2>/dev/null
 
     return $exit_code

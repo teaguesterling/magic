@@ -25,6 +25,9 @@ pub fn initialize(config: &Config) -> Result<()> {
     // Save config
     config.save()?;
 
+    // Create default event-formats.toml
+    create_event_formats_config(config)?;
+
     Ok(())
 }
 
@@ -35,6 +38,7 @@ fn create_directories(config: &Config) -> Result<()> {
         config.recent_dir().join("invocations"),
         config.recent_dir().join("outputs"),
         config.recent_dir().join("sessions"),
+        config.recent_dir().join("events"),
         config.blobs_dir(), // blobs/content
         config.archive_dir().join("blobs/content"),
         config.extensions_dir(),
@@ -144,6 +148,27 @@ fn init_database(config: &Config) -> Result<()> {
             COUNT(DISTINCT session_id) as session_count
         FROM sessions
         GROUP BY client_id;
+
+        -- Events view: reads all event parquet files (parsed log entries)
+        CREATE OR REPLACE VIEW events AS
+        SELECT * EXCLUDE (filename)
+        FROM read_parquet(
+            'recent/events/**/*.parquet',
+            union_by_name = true,
+            hive_partitioning = true,
+            filename = true
+        );
+
+        -- Events with invocation context (joined view)
+        CREATE OR REPLACE VIEW events_with_context AS
+        SELECT
+            e.*,
+            i.cmd,
+            i.timestamp,
+            i.cwd,
+            i.exit_code
+        FROM events e
+        JOIN invocations i ON e.invocation_id = i.id;
         "#,
     )?;
 
@@ -175,6 +200,11 @@ fn install_extensions(conn: &duckdb::Connection, config: &Config) -> Result<()> 
     // This provides read_blob() support for data: URIs
     conn.execute("INSTALL scalarfs FROM community", [])?;
     conn.execute("LOAD scalarfs", [])?;
+
+    // Install duck_hunt from community repository for log parsing
+    // This provides read_duck_hunt_log() for parsing build/test output
+    conn.execute("INSTALL duck_hunt FROM community", [])?;
+    conn.execute("LOAD duck_hunt", [])?;
 
     Ok(())
 }
@@ -276,8 +306,147 @@ fn create_seed_files(conn: &duckdb::Connection, config: &Config) -> Result<()> {
         sessions_seed_path.display()
     ))?;
 
+    // Create events seed
+    let events_seed_dir = config.recent_dir().join("events").join("date=1970-01-01");
+    fs::create_dir_all(&events_seed_dir)?;
+
+    let events_seed_path = events_seed_dir.join("_seed.parquet");
+    conn.execute_batch(&format!(
+        r#"
+        COPY (
+            SELECT
+                NULL::UUID as id,
+                NULL::UUID as invocation_id,
+                NULL::VARCHAR as client_id,
+                NULL::VARCHAR as hostname,
+                NULL::VARCHAR as event_type,
+                NULL::VARCHAR as severity,
+                NULL::VARCHAR as ref_file,
+                NULL::INTEGER as ref_line,
+                NULL::INTEGER as ref_column,
+                NULL::VARCHAR as message,
+                NULL::VARCHAR as error_code,
+                NULL::VARCHAR as test_name,
+                NULL::VARCHAR as status,
+                NULL::VARCHAR as format_used,
+                NULL::DATE as date
+            WHERE false
+        ) TO '{}' (FORMAT PARQUET);
+        "#,
+        events_seed_path.display()
+    ))?;
+
     Ok(())
 }
+
+/// Create the default event-formats.toml configuration file.
+fn create_event_formats_config(config: &Config) -> Result<()> {
+    let path = config.event_formats_path();
+    if !path.exists() {
+        fs::write(&path, DEFAULT_EVENT_FORMATS_CONFIG)?;
+    }
+    Ok(())
+}
+
+/// Default content for event-formats.toml.
+pub const DEFAULT_EVENT_FORMATS_CONFIG: &str = r#"# Event format detection rules for duck_hunt
+# Patterns are glob-matched against the command string
+# First matching rule wins; use 'auto' for duck_hunt's built-in detection
+
+# C/C++ compilers
+[[rules]]
+pattern = "*gcc*"
+format = "gcc"
+
+[[rules]]
+pattern = "*g++*"
+format = "gcc"
+
+[[rules]]
+pattern = "*clang*"
+format = "gcc"
+
+[[rules]]
+pattern = "*clang++*"
+format = "gcc"
+
+# Rust
+[[rules]]
+pattern = "*cargo build*"
+format = "cargo_build"
+
+[[rules]]
+pattern = "*cargo test*"
+format = "cargo_test_json"
+
+[[rules]]
+pattern = "*cargo check*"
+format = "cargo_build"
+
+[[rules]]
+pattern = "*rustc*"
+format = "rustc"
+
+# Python
+[[rules]]
+pattern = "*pytest*"
+format = "pytest_text"
+
+[[rules]]
+pattern = "*python*-m*pytest*"
+format = "pytest_text"
+
+[[rules]]
+pattern = "*mypy*"
+format = "mypy"
+
+[[rules]]
+pattern = "*flake8*"
+format = "flake8"
+
+[[rules]]
+pattern = "*pylint*"
+format = "pylint"
+
+# JavaScript/TypeScript
+[[rules]]
+pattern = "*eslint*"
+format = "eslint"
+
+[[rules]]
+pattern = "*tsc*"
+format = "typescript"
+
+[[rules]]
+pattern = "*jest*"
+format = "jest"
+
+# Build systems
+[[rules]]
+pattern = "*make*"
+format = "make_error"
+
+[[rules]]
+pattern = "*cmake*"
+format = "cmake"
+
+[[rules]]
+pattern = "*ninja*"
+format = "ninja"
+
+# Go
+[[rules]]
+pattern = "*go build*"
+format = "go_build"
+
+[[rules]]
+pattern = "*go test*"
+format = "go_test"
+
+# Default: use duck_hunt's auto-detection
+[default]
+format = "auto"
+"#;
 
 /// Check if BIRD is initialized at the given location.
 pub fn is_initialized(config: &Config) -> bool {

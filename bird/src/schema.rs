@@ -240,6 +240,104 @@ impl OutputRecord {
     }
 }
 
+/// An event record (a parsed log entry from an invocation output).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventRecord {
+    /// Unique identifier (UUIDv7 for time-ordering).
+    pub id: Uuid,
+
+    /// Invocation this event was parsed from.
+    pub invocation_id: Uuid,
+
+    /// Client identifier (for cross-client queries).
+    pub client_id: String,
+
+    /// Hostname where the invocation ran.
+    pub hostname: Option<String>,
+
+    /// Event type from duck_hunt (e.g., "diagnostic", "test_result").
+    pub event_type: Option<String>,
+
+    /// Severity level: error, warning, info, note.
+    pub severity: Option<String>,
+
+    /// Source file referenced by this event.
+    pub ref_file: Option<String>,
+
+    /// Line number in the source file.
+    pub ref_line: Option<i32>,
+
+    /// Column number in the source file.
+    pub ref_column: Option<i32>,
+
+    /// The event message.
+    pub message: Option<String>,
+
+    /// Error/warning code (e.g., "E0308", "W0401").
+    pub error_code: Option<String>,
+
+    /// Test name (for test results).
+    pub test_name: Option<String>,
+
+    /// Test status: passed, failed, skipped.
+    pub status: Option<String>,
+
+    /// Format used for parsing.
+    pub format_used: String,
+
+    /// Date for partitioning.
+    pub date: NaiveDate,
+}
+
+impl EventRecord {
+    /// Create a new event record with a fresh UUIDv7.
+    pub fn new(
+        invocation_id: Uuid,
+        client_id: impl Into<String>,
+        format_used: impl Into<String>,
+        date: NaiveDate,
+    ) -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            invocation_id,
+            client_id: client_id.into(),
+            hostname: gethostname::gethostname().to_str().map(|s| s.to_string()),
+            event_type: None,
+            severity: None,
+            ref_file: None,
+            ref_line: None,
+            ref_column: None,
+            message: None,
+            error_code: None,
+            test_name: None,
+            status: None,
+            format_used: format_used.into(),
+            date,
+        }
+    }
+}
+
+/// SQL to create the events table schema (for documentation/reference).
+pub const EVENTS_SCHEMA: &str = r#"
+CREATE TABLE events (
+    id                UUID PRIMARY KEY,
+    invocation_id     UUID NOT NULL,
+    client_id         VARCHAR NOT NULL,
+    hostname          VARCHAR,
+    event_type        VARCHAR,
+    severity          VARCHAR,
+    ref_file          VARCHAR,
+    ref_line          INTEGER,
+    ref_column        INTEGER,
+    message           VARCHAR,
+    error_code        VARCHAR,
+    test_name         VARCHAR,
+    status            VARCHAR,
+    format_used       VARCHAR NOT NULL,
+    date              DATE NOT NULL
+);
+"#;
+
 /// SQL to create the invocations table schema (for documentation/reference).
 pub const INVOCATIONS_SCHEMA: &str = r#"
 CREATE TABLE invocations (

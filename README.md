@@ -11,10 +11,9 @@ MAGIC = **BIRD** + **shq**
 │                          Your Shell                              │
 │                                                                  │
 │  $ make test                                                     │
-│  $ shq save              # manually save from tmux buffer        │
-│  $ shq errors            # show errors from last run             │
-│  $ shq show --client claude -n -1                                │
-│  $ shq sql "SELECT * FROM commands WHERE exit_code != 0"         │
+│  $ shq show              # show output from last command         │
+│  $ shq history           # browse command history                │
+│  $ shq sql "SELECT * FROM invocations WHERE exit_code != 0"      │
 └──────────────────────────────────────────────────────────────────┘
                             │
                             ▼
@@ -22,8 +21,8 @@ MAGIC = **BIRD** + **shq**
 │                     shq (Shell Query)                            │
 │                                                                  │
 │  • Captures commands automatically via shell hooks               │
-│  • Parses outputs (gcc, pytest, eslint, etc.) via duck_hunt      │
-│  • Provides CLI for querying: shq errors, shq run, shq sql       │
+│  • Provides CLI for querying: shq show, shq history, shq sql     │
+│  • Manages data lifecycle: shq archive, shq compact              │
 └──────────────────────────────────────────────────────────────────┘
                             │
                             ▼
@@ -33,7 +32,7 @@ MAGIC = **BIRD** + **shq**
 │  • DuckDB-based database with Parquet files                      │
 │  • Content-addressed blob storage (70-90% space savings!)        │
 │  • Hot/warm/cold tiering for lifecycle management                │
-│  • SQL-queryable: commands, outputs, parsed events               │
+│  • SQL-queryable: invocations, outputs, sessions                 │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -43,20 +42,24 @@ MAGIC = **BIRD** + **shq**
 ```sql
 -- Find all failed builds in the last week
 SELECT cmd, exit_code, duration_ms, timestamp
-FROM commands
-WHERE exit_code != 0 AND timestamp > NOW() - INTERVAL '7 days';
+FROM invocations
+WHERE exit_code != 0 AND date >= CURRENT_DATE - 7;
 
--- What errors came from yesterday's test run?
-SELECT file, line, message
-FROM events
-WHERE severity = 'error' AND date = CURRENT_DATE - 1;
+-- Find flaky commands (sometimes pass, sometimes fail)
+SELECT cmd,
+       COUNT(*) as runs,
+       SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) as passes,
+       SUM(CASE WHEN exit_code != 0 THEN 1 ELSE 0 END) as failures
+FROM invocations
+WHERE cmd LIKE '%test%'
+GROUP BY cmd
+HAVING failures > 0 AND passes > 0;
 
--- Which files have the most build errors?
-SELECT file, COUNT(*) as error_count
-FROM events
-WHERE severity = 'error'
-GROUP BY file
-ORDER BY error_count DESC
+-- Slowest commands this week
+SELECT cmd, duration_ms, timestamp
+FROM invocations
+WHERE date >= CURRENT_DATE - 7 AND duration_ms IS NOT NULL
+ORDER BY duration_ms DESC
 LIMIT 10;
 ```
 
@@ -67,12 +70,14 @@ Content-addressed blob storage with automatic deduplication:
 - Automatic: no configuration needed
 - Fast: BLAKE3 hashing at 3GB/s
 
-### Structured Output Parsing
+### Structured Output Parsing (Coming in v0.6)
 Optional integration with [duck_hunt](https://github.com/teaguesterling/duck_hunt), a DuckDB extension for parsing 90+ log formats:
 - Compilers: GCC, Clang, MSVC, rustc
 - Linters: ESLint, pylint, shellcheck
 - Test runners: pytest, jest, go test
 - Build tools: Make, Cargo, npm
+
+*Note: duck_hunt integration is planned for v0.6. Currently shq captures raw outputs.*
 
 ### Fast Queries
 - DuckDB columnar storage for analytics
@@ -108,25 +113,29 @@ eval "$(shq hook init --shell bash)"
 ### Basic Usage
 
 ```bash
-# Commands are automatically captured
+# Commands are automatically captured via shell hooks
 make test
+
+# View output from the last command
+shq show
 
 # View recent commands
 shq history
 
-# Query errors from last run
-shq errors
-
-# Run and parse build output
+# Run a command with full output capture
 shq run make all
 
-# Query with SQL
-shq sql "SELECT cmd, exit_code FROM commands WHERE date = CURRENT_DATE"
+# Or use shqr (shell function, captures output while showing it)
+shqr make test
 
-# Get detailed event info
-shq event 1                    # First error
-shq events --severity error    # All errors
-shq events --severity warning  # All warnings
+# Query with SQL
+shq sql "SELECT cmd, exit_code FROM invocations WHERE date = CURRENT_DATE"
+
+# View today's commands
+shq sql "SELECT * FROM invocations_today"
+
+# View failed commands
+shq sql "SELECT * FROM failed_invocations LIMIT 10"
 ```
 
 ### Advanced Queries
@@ -139,7 +148,7 @@ shq sql "
     COUNT(DISTINCT exit_code) as exit_codes,
     SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) as passes,
     SUM(CASE WHEN exit_code != 0 THEN 1 ELSE 0 END) as failures
-  FROM commands
+  FROM invocations
   WHERE cmd LIKE '%test%'
   GROUP BY cmd
   HAVING exit_codes > 1
@@ -157,8 +166,8 @@ shq sql "
 # Slowest commands this week
 shq sql "
   SELECT cmd, duration_ms, timestamp
-  FROM commands
-  WHERE timestamp > CURRENT_DATE - 7
+  FROM invocations
+  WHERE date >= CURRENT_DATE - 7
   ORDER BY duration_ms DESC
   LIMIT 10
 "
@@ -171,26 +180,24 @@ shq sql "
 ```
 ~/.local/share/bird/              # Default BIRD_ROOT
 ├── db/
-│   ├── bird.duckdb               # Main database (metadata)
-│   ├── data/
-│   │   ├── recent/               # Hot tier (0-14 days)
-│   │   │   ├── commands/
-│   │   │   │   └── date=YYYY-MM-DD/*.parquet
-│   │   │   ├── outputs/
-│   │   │   │   └── date=YYYY-MM-DD/*.parquet
-│   │   │   └── blobs/
-│   │   │       └── content/      # Content-addressed pool
-│   │   │           ├── ab/
-│   │   │           │   └── abc123...def.bin.gz
-│   │   │           ├── cd/
-│   │   │           └── ...       # 256 subdirs (00-ff)
-│   │   └── archive/              # Cold tier (>14 days)
-│   │       └── blobs/
-│   │           └── content/      # Global pool
-│   └── sql/
-│       ├── init.sql
-│       ├── views.sql
-│       └── macros.sql
+│   └── bird.duckdb               # Main DuckDB database
+├── data/
+│   ├── recent/                   # Hot tier (0-14 days)
+│   │   ├── invocations/
+│   │   │   └── date=YYYY-MM-DD/*.parquet
+│   │   ├── outputs/
+│   │   │   └── date=YYYY-MM-DD/*.parquet
+│   │   └── sessions/
+│   │       └── date=YYYY-MM-DD/*.parquet
+│   └── archive/                  # Cold tier (>14 days)
+│       └── ...                   # Same structure
+├── blobs/
+│   └── content/                  # Content-addressed pool
+│       ├── ab/
+│       │   └── abc123...def.bin.gz
+│       └── ...                   # 256 subdirs (00-ff)
+├── extensions/                   # DuckDB extensions
+├── sql/                          # Custom SQL files
 └── config.toml
 ```
 
@@ -208,10 +215,17 @@ shq sql "
 - SQL-queryable schema
 
 **Schema:**
-- `commands` - Command execution metadata
+- `invocations` - Command execution metadata
 - `outputs` - Stdout/stderr with content hashes
+- `sessions` - Shell session information
 - `blob_registry` - Tracks deduplicated blobs
-- `events` - Parsed structured data (errors, warnings, test results)
+
+**Convenience Views:**
+- `recent_invocations` - Commands from last 7 days
+- `invocations_today` - Commands from today
+- `failed_invocations` - Commands with non-zero exit code
+- `invocations_with_outputs` - Joined view with output metadata
+- `clients` - Aggregated client information
 
 #### 2. shq (Shell Query)
 
@@ -219,23 +233,30 @@ shq sql "
 
 **Features:**
 - Automatic command capture via shell hooks
-- Output parsing via `duck_hunt` DuckDB extension (optional)
-- CLI for common queries (`shq errors`, `shq run`)
-- Direct SQL access (`shq sql`)
-- TUI history browser
+- CLI for common queries (`shq show`, `shq history`, `shq sql`)
+- Direct SQL access with full DuckDB power
+- Data lifecycle management (`shq archive`, `shq compact`)
 
 **Commands:**
 ```bash
 shq init              # Initialize BIRD database
-shq run CMD           # Run and capture command
-shq save              # Manually save from pipes or tmux buffers
-shq show              # Show the previous output of a command
+shq run CMD           # Run and capture command with output
+shq save              # Manually save from pipes (used by shell hooks)
+shq show              # Show output from the last command
+shq show -O           # Show only stdout
+shq show -E           # Show only stderr
+shq show --head 20    # Show first 20 lines
 shq history           # Browse command history
 shq sql "QUERY"       # Execute SQL query
 shq stats             # Show statistics
 shq archive           # Move old data to archive tier
 shq compact           # Compact parquet files for better performance
 shq hook init         # Generate shell integration code
+```
+
+**Shell Functions (provided by hook init):**
+```bash
+shqr CMD              # Run command with full output capture, displaying in real-time
 ```
 
 #### 3. Content-Addressed Storage
@@ -254,44 +275,33 @@ shq hook init         # Generate shell integration code
 - Fast (2-3ms overhead per command)
 - Transparent to queries
 
-#### 4. duck_hunt Integration (Optional)
+#### 4. duck_hunt Integration (Coming in v0.6)
 
 [duck_hunt](https://github.com/teaguesterling/duck_hunt) is a separate DuckDB extension for parsing structured data from logs. It supports 90+ formats and provides retrospective extraction of errors and warnings without the noise of raw CLI output.
 
-**Formats supported:**
+**Formats to be supported:**
 - Compilers: GCC, Clang, MSVC, rustc
 - Linters: ESLint, pylint, shellcheck
 - Test runners: pytest, jest, go test
 - Build tools: Make, Cargo, npm
 
-**Usage:**
-```bash
-# Automatic parsing
-shq run make 2>&1      # Detects GCC output
-
-# Manual format hint
-shq run --format gcc make
-shq run --format pytest pytest tests/
-
-# Query parsed events
-shq sql "SELECT * FROM events WHERE severity = 'error'"
-```
+*Note: This integration is planned for v0.6. Currently outputs are stored as raw content.*
 
 ## Use Cases
 
 ### 1. Debugging Failed Builds
 
 ```bash
-# What failed?
-shq errors
+# What failed? Show output from last command
+shq show
 
-# Where did it fail?
-shq event 1            # Drill into first error
+# Show only stderr
+shq show -E
 
 # Has this failed before?
 shq sql "
   SELECT timestamp, cmd, exit_code
-  FROM commands
+  FROM invocations
   WHERE cmd LIKE '%make test%'
   ORDER BY timestamp DESC
   LIMIT 10
@@ -308,7 +318,7 @@ shq sql "
     SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) as passes,
     SUM(CASE WHEN exit_code != 0 THEN 1 ELSE 0 END) as failures,
     ROUND(100.0 * SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) / COUNT(*), 1) as pass_rate
-  FROM commands
+  FROM invocations
   WHERE cmd LIKE '%test%'
   GROUP BY cmd
   HAVING failures > 0
@@ -322,8 +332,8 @@ shq sql "
 # Slowest commands today
 shq sql "
   SELECT cmd, duration_ms, timestamp
-  FROM commands
-  WHERE date = CURRENT_DATE
+  FROM invocations_today
+  WHERE duration_ms IS NOT NULL
   ORDER BY duration_ms DESC
   LIMIT 10
 "
@@ -335,7 +345,7 @@ shq sql "
     AVG(duration_ms) as avg_duration,
     MIN(duration_ms) as min_duration,
     MAX(duration_ms) as max_duration
-  FROM commands
+  FROM invocations
   WHERE cmd LIKE '%make%'
   GROUP BY date
   ORDER BY date DESC
@@ -348,13 +358,11 @@ shq sql "
 # In your CI pipeline
 shq run make test || {
   echo "Build failed!"
-  shq errors > build-errors.txt
-  shq sql "SELECT COUNT(*) as error_count FROM events WHERE severity = 'error'"
+  shq show > build-output.txt
+  shq show -E > build-stderr.txt
+  shq sql "SELECT * FROM failed_invocations ORDER BY timestamp DESC LIMIT 5"
   exit 1
 }
-
-# Compare to baseline
-shq ci check --baseline main
 ```
 
 ### 5. Data Lifecycle Management
@@ -472,8 +480,8 @@ shq run --format gcc make
 duckdb ~/.local/share/bird/db/bird.duckdb
 
 # Use BIRD's views and macros
-> SELECT * FROM recent_commands LIMIT 10;
-> SELECT * FROM events_today WHERE severity = 'error';
+> SELECT * FROM recent_invocations LIMIT 10;
+> SELECT * FROM invocations_today LIMIT 10;
 ```
 
 ### tmux/screen
@@ -483,7 +491,7 @@ duckdb ~/.local/share/bird/db/bird.duckdb
 tmux new-session -d 'shq run make watch'
 
 # Query while it runs
-shq sql "SELECT COUNT(*) FROM commands WHERE date = CURRENT_DATE"
+shq sql "SELECT COUNT(*) FROM invocations_today"
 ```
 
 ## Development
@@ -564,7 +572,7 @@ Or prefix with space (` command`) or backslash (`\command`) to skip capture.
 **A:** All data remains queryable regardless of tier:
 ```sql
 -- Works seamlessly across hot/warm/cold
-SELECT * FROM commands WHERE timestamp > '2025-01-01';
+SELECT * FROM invocations WHERE date >= '2025-01-01';
 ```
 
 ### Q: What if two processes write the same blob?
@@ -576,8 +584,8 @@ SELECT * FROM commands WHERE timestamp > '2025-01-01';
 **A:** Yes! Common pattern:
 ```bash
 shq run make test || {
-  shq errors > build-errors.txt
-  shq ci comment  # Post to PR
+  shq show > build-output.txt
+  shq show -E > build-stderr.txt
   exit 1
 }
 ```
@@ -605,7 +613,7 @@ shq compact --dry-run
 **A:** Yes! Each machine writes to its own `client_id`. Query across machines:
 ```sql
 SELECT client_id, COUNT(*)
-FROM commands
+FROM invocations
 GROUP BY client_id;
 ```
 
