@@ -81,9 +81,22 @@ enum Commands {
         #[arg(default_value = "-1", allow_hyphen_values = true)]
         selector: String,
 
-        /// Filter by stream (stdout, stderr, or combined). Shows all by default.
+        /// Filter by stream: O/stdout, E/stderr, A/all (combined to stdout)
+        /// Default (no flag) shows streams routed to their original fds
         #[arg(short = 's', long = "stream")]
         stream: Option<String>,
+
+        /// Shortcut for -s stdout
+        #[arg(short = 'O', long = "stdout", conflicts_with = "stream")]
+        stdout_only: bool,
+
+        /// Shortcut for -s stderr
+        #[arg(short = 'E', long = "stderr", conflicts_with = "stream")]
+        stderr_only: bool,
+
+        /// Shortcut for -s all (combined to stdout)
+        #[arg(short = 'A', long = "all", conflicts_with = "stream")]
+        all_combined: bool,
     },
 
     /// Show recent command history
@@ -140,7 +153,19 @@ fn main() {
                 &invoker_type,
             )
         }
-        Commands::Show { selector, stream } => commands::show(&selector, stream.as_deref()),
+        Commands::Show { selector, stream, stdout_only, stderr_only, all_combined } => {
+            // Resolve stream from flags or -s value
+            let resolved_stream = if stdout_only {
+                Some("stdout")
+            } else if stderr_only {
+                Some("stderr")
+            } else if all_combined {
+                Some("all")
+            } else {
+                stream.as_deref()
+            };
+            commands::show(&selector, resolved_stream)
+        }
         Commands::History { limit } => commands::history(limit),
         Commands::Sql { query } => commands::sql(&query),
         Commands::Stats => commands::stats(),

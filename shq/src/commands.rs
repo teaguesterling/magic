@@ -239,6 +239,15 @@ pub fn show(selector: &str, stream_filter: Option<&str>) -> bird::Result<()> {
     let config = Config::load()?;
     let store = Store::open(config)?;
 
+    // Normalize stream filter aliases
+    let (db_filter, combine_to_stdout) = match stream_filter {
+        Some("O") | Some("o") => (Some("stdout"), false),
+        Some("E") | Some("e") => (Some("stderr"), false),
+        Some("A") | Some("a") | Some("all") => (None, true), // No filter, but combine to stdout
+        Some(s) => (Some(s), false),
+        None => (None, false), // No filter, route to original streams
+    };
+
     // Parse selector: negative number = offset from end, UUID = direct lookup
     let invocation_id = if let Ok(offset) = selector.parse::<i64>() {
         if offset < 0 {
@@ -260,7 +269,7 @@ pub fn show(selector: &str, stream_filter: Option<&str>) -> bird::Result<()> {
     };
 
     // Get outputs for the invocation (optionally filtered by stream)
-    let outputs = store.get_outputs(&invocation_id, stream_filter)?;
+    let outputs = store.get_outputs(&invocation_id, db_filter)?;
 
     if outputs.is_empty() {
         eprintln!("No output found for invocation {}", invocation_id);
@@ -271,11 +280,11 @@ pub fn show(selector: &str, stream_filter: Option<&str>) -> bird::Result<()> {
     for output_info in outputs {
         match store.read_output_content(&output_info) {
             Ok(content) => {
-                // Write to appropriate stream
-                if output_info.stream == "stderr" {
-                    io::stderr().write_all(&content)?;
-                } else {
+                // Write to stdout if combining, otherwise route to original stream
+                if combine_to_stdout || output_info.stream != "stderr" {
                     io::stdout().write_all(&content)?;
+                } else {
+                    io::stderr().write_all(&content)?;
                 }
             }
             Err(e) => {
