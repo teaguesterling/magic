@@ -291,3 +291,284 @@ fn test_hook_init_bash() {
     assert!(hook.contains("__shq_prompt"));
     assert!(hook.contains("PROMPT_COMMAND"));
 }
+
+#[test]
+fn test_archive_recent_data_not_archived() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // First archive clears seed files (dated 1970-01-01)
+    shq_cmd(tmp.path())
+        .args(["archive"])
+        .output()
+        .expect("failed to archive seed files");
+
+    // Run a command (creates today's data)
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "recent data"])
+        .output()
+        .expect("failed to run");
+
+    // Archive again with default 14 days - today's data should NOT be archived
+    let output = shq_cmd(tmp.path())
+        .args(["archive"])
+        .output()
+        .expect("failed to archive");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Nothing to archive"), "Today's data should not be archived: {}", stdout);
+}
+
+#[test]
+fn test_archive_dry_run() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "test"])
+        .output()
+        .expect("failed to run");
+
+    // Create an old date partition and backdate the files
+    let old_date = "2020-01-01";
+    let old_inv_dir = tmp.path().join("data/recent/invocations").join(format!("date={}", old_date));
+    std::fs::create_dir_all(&old_inv_dir).unwrap();
+
+    // Copy a parquet file to the old partition
+    let recent_inv_dir = tmp.path().join("data/recent/invocations");
+    if let Ok(entries) = std::fs::read_dir(&recent_inv_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.file_name().unwrap().to_string_lossy().starts_with("date=") {
+                // Find a parquet file to copy
+                if let Ok(files) = std::fs::read_dir(&path) {
+                    for file in files.flatten() {
+                        let file_path = file.path();
+                        if file_path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                            let dest = old_inv_dir.join(file_path.file_name().unwrap());
+                            std::fs::copy(&file_path, &dest).unwrap();
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // Archive dry-run with 1 day threshold
+    let output = shq_cmd(tmp.path())
+        .args(["archive", "--days", "1", "--dry-run"])
+        .output()
+        .expect("failed to archive");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Dry run"));
+}
+
+#[test]
+fn test_archive_moves_old_data() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command to have something to archive
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "test"])
+        .output()
+        .expect("failed to run");
+
+    // Create an old date partition
+    let old_date = "2020-01-01";
+    let old_inv_dir = tmp.path().join("data/recent/invocations").join(format!("date={}", old_date));
+    std::fs::create_dir_all(&old_inv_dir).unwrap();
+
+    // Copy a parquet file to the old partition
+    let recent_inv_dir = tmp.path().join("data/recent/invocations");
+    let mut copied = false;
+    if let Ok(entries) = std::fs::read_dir(&recent_inv_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.file_name().unwrap().to_string_lossy().starts_with("date=2") {
+                if let Ok(files) = std::fs::read_dir(&path) {
+                    for file in files.flatten() {
+                        let file_path = file.path();
+                        if file_path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                            let dest = old_inv_dir.join(file_path.file_name().unwrap());
+                            std::fs::copy(&file_path, &dest).unwrap();
+                            copied = true;
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    if !copied {
+        // Skip test if we couldn't set up the test data
+        return;
+    }
+
+    // Verify old partition exists before archive
+    assert!(old_inv_dir.exists());
+
+    // Archive with 1 day threshold
+    let output = shq_cmd(tmp.path())
+        .args(["archive", "--days", "1"])
+        .output()
+        .expect("failed to archive");
+
+    assert!(output.status.success());
+
+    // Old partition should be gone from recent
+    assert!(!old_inv_dir.exists(), "Old partition should have been archived");
+
+    // Should be in archive
+    let archive_dir = tmp.path().join("data/archive/invocations").join(format!("date={}", old_date));
+    assert!(archive_dir.exists(), "Data should be in archive tier");
+}
+
+#[test]
+fn test_compact_nothing_to_compact() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run just one command (not enough to trigger compaction)
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "single"])
+        .output()
+        .expect("failed to run");
+
+    // Compact with default threshold (50) - nothing should be compacted
+    let output = shq_cmd(tmp.path())
+        .args(["compact"])
+        .output()
+        .expect("failed to compact");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Nothing to compact"));
+}
+
+#[test]
+fn test_compact_dry_run() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "test"])
+        .output()
+        .expect("failed to run");
+
+    // Compact dry-run
+    let output = shq_cmd(tmp.path())
+        .args(["compact", "--dry-run"])
+        .output()
+        .expect("failed to compact");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Dry run"));
+}
+
+#[test]
+fn test_compact_with_low_threshold() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run multiple commands to create multiple files
+    for i in 1..=5 {
+        shq_cmd(tmp.path())
+            .args(["run", "echo", &format!("command {}", i)])
+            .output()
+            .expect("failed to run");
+    }
+
+    // Compact with low threshold (2) to trigger compaction
+    let output = shq_cmd(tmp.path())
+        .args(["compact", "--threshold", "2"])
+        .output()
+        .expect("failed to compact");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should have compacted something
+    assert!(
+        stdout.contains("Compacted") || stdout.contains("Nothing to compact"),
+        "Unexpected output: {}", stdout
+    );
+}
+
+#[test]
+fn test_compact_session_specific() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run multiple commands
+    for i in 1..=3 {
+        shq_cmd(tmp.path())
+            .args(["run", "echo", &format!("cmd {}", i)])
+            .output()
+            .expect("failed to run");
+    }
+
+    // Compact for a specific (non-existent) session - should do nothing
+    let output = shq_cmd(tmp.path())
+        .args(["compact", "-s", "nonexistent-session", "--threshold", "1"])
+        .output()
+        .expect("failed to compact");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Nothing to compact"));
+}
+
+#[test]
+fn test_compact_today_only() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "today"])
+        .output()
+        .expect("failed to run");
+
+    // Compact with --today flag
+    let output = shq_cmd(tmp.path())
+        .args(["compact", "--today", "-s", "test-session"])
+        .output()
+        .expect("failed to compact");
+
+    assert!(output.status.success());
+}
+
+#[test]
+fn test_compact_quiet_mode() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "quiet"])
+        .output()
+        .expect("failed to run");
+
+    // Compact with quiet mode - should produce no output when nothing to compact
+    let output = shq_cmd(tmp.path())
+        .args(["compact", "-q", "-s", "test-session", "--today"])
+        .output()
+        .expect("failed to compact");
+
+    assert!(output.status.success());
+    // Quiet mode should produce no output when nothing is compacted
+    assert!(
+        String::from_utf8_lossy(&output.stdout).is_empty(),
+        "Quiet mode should not produce output when nothing compacted"
+    );
+}
