@@ -34,7 +34,8 @@ fn invoker_pid() -> u32 {
 ///
 /// `extract_override`: Some(true) forces extraction, Some(false) disables it, None uses config.
 /// `format_override`: Override format detection for event extraction.
-pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract_override: Option<bool>, format_override: Option<&str>) -> bird::Result<()> {
+/// `auto_compact`: If true, spawn background compaction after saving.
+pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract_override: Option<bool>, format_override: Option<&str>, auto_compact: bool) -> bird::Result<()> {
     use std::io::Write;
 
     // Determine command string and how to execute
@@ -130,6 +131,18 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract_override: Optio
         if count > 0 {
             eprintln!("shq: extracted {} events", count);
         }
+    }
+
+    // Spawn background compaction if requested
+    if auto_compact {
+        let session_id = sid.clone();
+        // Spawn shq compact in background
+        let _ = Command::new(std::env::current_exe().unwrap_or_else(|_| "shq".into()))
+            .args(["compact", "-s", &session_id, "--today", "-q"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
 
     // Exit with the same code as the wrapped command
@@ -589,10 +602,12 @@ pub fn archive(days: u32, dry_run: bool, extract_first: bool) -> bird::Result<()
 }
 
 /// Compact parquet files to reduce storage and improve performance.
+#[allow(clippy::too_many_arguments)]
 pub fn compact(
     file_threshold: usize,
     recompact_threshold: usize,
     consolidate: bool,
+    extract_first: bool,
     session: Option<&str>,
     today_only: bool,
     quiet: bool,
@@ -605,6 +620,22 @@ pub fn compact(
 
     if dry_run && !quiet {
         println!("Dry run - no changes will be made\n");
+    }
+
+    // Extract events first if requested
+    if extract_first && !dry_run {
+        if !quiet {
+            println!("Extracting events from invocations before compacting...");
+        }
+        let invocations = store.invocations_without_events(None, None)?;
+        let mut extracted = 0;
+        for inv in &invocations {
+            let count = store.extract_events(&inv.id, None)?;
+            extracted += count;
+        }
+        if !quiet && extracted > 0 {
+            println!("  Extracted {} events from {} invocations\n", extracted, invocations.len());
+        }
     }
 
     let opts = CompactOptions {

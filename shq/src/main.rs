@@ -36,6 +36,10 @@ enum Commands {
         #[arg(short = 'f', long = "extract-format")]
         format: Option<String>,
 
+        /// Run compaction in background after command completes
+        #[arg(short = 'C', long = "compact")]
+        compact: bool,
+
         /// The command to run (alternative to -c)
         #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -180,6 +184,10 @@ enum Commands {
         #[arg(short = 'c', long = "consolidate")]
         consolidate: bool,
 
+        /// Extract events from invocations before compacting
+        #[arg(short = 'x', long = "extract-first")]
+        extract_first: bool,
+
         /// Only compact files for this specific session (used by shell hooks)
         #[arg(short = 's', long = "session")]
         session: Option<String>,
@@ -305,7 +313,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::Init => commands::init(),
-        Commands::Run { shell_cmd, extract, no_extract, format, cmd } => {
+        Commands::Run { shell_cmd, extract, no_extract, format, compact, cmd } => {
             // Resolve extract behavior: --extract forces on, --no-extract forces off, otherwise use config
             let extract_override = if extract {
                 Some(true)
@@ -314,7 +322,7 @@ fn main() {
             } else {
                 None
             };
-            commands::run(shell_cmd.as_deref(), &cmd, extract_override, format.as_deref())
+            commands::run(shell_cmd.as_deref(), &cmd, extract_override, format.as_deref(), compact)
         }
         Commands::Save { file, command, exit_code, duration_ms, stream, stdout_file, stderr_file, session_id, invoker_pid, invoker, invoker_type } => {
             commands::save(
@@ -354,8 +362,8 @@ fn main() {
         Commands::Sql { query } => commands::sql(&query),
         Commands::Stats => commands::stats(),
         Commands::Archive { days, dry_run, extract_first } => commands::archive(days, dry_run, extract_first),
-        Commands::Compact { file_threshold, recompact_threshold, consolidate, session, today_only, quiet, recent_only, archive_only, dry_run } => {
-            commands::compact(file_threshold, recompact_threshold, consolidate, session.as_deref(), today_only, quiet, recent_only, archive_only, dry_run)
+        Commands::Compact { file_threshold, recompact_threshold, consolidate, extract_first, session, today_only, quiet, recent_only, archive_only, dry_run } => {
+            commands::compact(file_threshold, recompact_threshold, consolidate, extract_first, session.as_deref(), today_only, quiet, recent_only, archive_only, dry_run)
         }
         Commands::Hook { action } => match action {
             HookAction::Init { shell } => commands::hook_init(shell.as_deref()),
