@@ -761,3 +761,276 @@ fn test_show_no_output_found() {
         "Should indicate no output: {}", stderr
     );
 }
+
+// ============================================================================
+// Events command tests
+// ============================================================================
+
+#[test]
+fn test_events_no_events() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a simple command that produces no parseable events
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "hello"])
+        .output()
+        .expect("failed to run");
+
+    // Query events - should find none
+    let output = shq_cmd(tmp.path())
+        .args(["events"])
+        .output()
+        .expect("failed to query events");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No events found"));
+}
+
+#[test]
+fn test_extract_events_manual() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command that produces gcc-like error output
+    shq_cmd(tmp.path())
+        .args(["run", "-c", "echo 'test.c:10:5: error: undefined reference' >&2; exit 1"])
+        .output()
+        .expect("failed to run");
+
+    // Manually extract events
+    let output = shq_cmd(tmp.path())
+        .args(["extract-events"])
+        .output()
+        .expect("failed to extract events");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should report extraction (may or may not find events depending on duck_hunt parsing)
+    assert!(
+        stdout.contains("Extracted") || stdout.contains("No events found"),
+        "Unexpected output: {}", stdout
+    );
+}
+
+#[test]
+fn test_extract_events_quiet_mode() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "test"])
+        .output()
+        .expect("failed to run");
+
+    // Extract with quiet mode
+    let output = shq_cmd(tmp.path())
+        .args(["extract-events", "-q"])
+        .output()
+        .expect("failed to extract events");
+
+    assert!(output.status.success());
+    // Quiet mode should produce no output
+    assert!(
+        String::from_utf8_lossy(&output.stdout).is_empty(),
+        "Quiet mode should not produce output"
+    );
+}
+
+#[test]
+fn test_run_with_extract_flag() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run with -E flag to auto-extract events
+    let output = shq_cmd(tmp.path())
+        .args(["run", "-E", "echo", "hello"])
+        .output()
+        .expect("failed to run");
+
+    assert!(output.status.success());
+    // The -E flag should work without errors (may or may not find events)
+}
+
+#[test]
+fn test_events_count_only() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a simple command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "test"])
+        .output()
+        .expect("failed to run");
+
+    // Query event count
+    let output = shq_cmd(tmp.path())
+        .args(["events", "--count"])
+        .output()
+        .expect("failed to count events");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should output a number (likely 0)
+    assert!(
+        stdout.trim().parse::<i64>().is_ok(),
+        "Count should be a number: {}", stdout
+    );
+}
+
+#[test]
+fn test_events_with_severity_filter() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "test"])
+        .output()
+        .expect("failed to run");
+
+    // Query events with severity filter
+    let output = shq_cmd(tmp.path())
+        .args(["events", "-s", "error"])
+        .output()
+        .expect("failed to query events");
+
+    assert!(output.status.success());
+}
+
+#[test]
+fn test_events_with_last_n_filter() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run multiple commands
+    for i in 1..=3 {
+        shq_cmd(tmp.path())
+            .args(["run", "echo", &format!("cmd {}", i)])
+            .output()
+            .expect("failed to run");
+    }
+
+    // Query events from last 1 invocation
+    let output = shq_cmd(tmp.path())
+        .args(["events", "-n", "1"])
+        .output()
+        .expect("failed to query events");
+
+    assert!(output.status.success());
+}
+
+#[test]
+fn test_events_with_limit() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "test"])
+        .output()
+        .expect("failed to run");
+
+    // Query events with limit
+    let output = shq_cmd(tmp.path())
+        .args(["events", "-l", "10"])
+        .output()
+        .expect("failed to query events");
+
+    assert!(output.status.success());
+}
+
+#[test]
+fn test_extract_events_with_format_override() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "test output"])
+        .output()
+        .expect("failed to run");
+
+    // Extract with explicit format
+    let output = shq_cmd(tmp.path())
+        .args(["extract-events", "-f", "auto"])
+        .output()
+        .expect("failed to extract events");
+
+    assert!(output.status.success());
+}
+
+#[test]
+fn test_extract_events_force_reextract() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "test"])
+        .output()
+        .expect("failed to run");
+
+    // Extract events first time
+    shq_cmd(tmp.path())
+        .args(["extract-events"])
+        .output()
+        .expect("failed to extract events");
+
+    // Force re-extract
+    let output = shq_cmd(tmp.path())
+        .args(["extract-events", "--force"])
+        .output()
+        .expect("failed to re-extract events");
+
+    assert!(output.status.success());
+}
+
+#[test]
+fn test_events_reparse_mode() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "test"])
+        .output()
+        .expect("failed to run");
+
+    // Use reparse mode to re-extract and query
+    let output = shq_cmd(tmp.path())
+        .args(["events", "--reparse"])
+        .output()
+        .expect("failed to reparse events");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Re-extracted") || stdout.contains("events"),
+        "Should indicate re-extraction: {}", stdout
+    );
+}
+
+#[test]
+fn test_events_from_stderr() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command that outputs to stderr (like gcc does)
+    shq_cmd(tmp.path())
+        .args(["run", "-c", "echo 'file.c:1:1: warning: test warning' >&2"])
+        .output()
+        .expect("failed to run");
+
+    // Extract events - should parse stderr too
+    let output = shq_cmd(tmp.path())
+        .args(["extract-events"])
+        .output()
+        .expect("failed to extract events");
+
+    assert!(output.status.success());
+    // The extraction should complete without error
+    // (actual event detection depends on duck_hunt)
+}
