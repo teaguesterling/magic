@@ -844,14 +844,14 @@ fn test_run_with_extract_flag() {
     let tmp = TempDir::new().unwrap();
     init_bird(tmp.path());
 
-    // Run with -E flag to auto-extract events
+    // Run with -x flag to auto-extract events
     let output = shq_cmd(tmp.path())
-        .args(["run", "-E", "echo", "hello"])
+        .args(["run", "-x", "echo", "hello"])
         .output()
         .expect("failed to run");
 
     assert!(output.status.success());
-    // The -E flag should work without errors (may or may not find events)
+    // The -x flag should work without errors (may or may not find events)
 }
 
 #[test]

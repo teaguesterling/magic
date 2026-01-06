@@ -29,6 +29,10 @@ pub struct Config {
     /// Threshold in bytes for inline vs blob storage.
     #[serde(default = "default_inline_threshold")]
     pub inline_threshold: usize,
+
+    /// Automatically extract events after `shq run` commands.
+    #[serde(default)]
+    pub auto_extract: bool,
 }
 
 fn default_client_id() -> String {
@@ -58,6 +62,7 @@ impl Config {
             client_id: default_client_id(),
             hot_days: default_hot_days(),
             inline_threshold: default_inline_threshold(),
+            auto_extract: false,
         }
     }
 

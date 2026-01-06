@@ -30,7 +30,11 @@ fn invoker_pid() -> u32 {
     std::os::unix::process::parent_id()
 }
 
-pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract: bool) -> bird::Result<()> {
+/// Run a command and capture it to BIRD.
+///
+/// `extract_override`: Some(true) forces extraction, Some(false) disables it, None uses config.
+/// `format_override`: Override format detection for event extraction.
+pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract_override: Option<bool>, format_override: Option<&str>) -> bird::Result<()> {
     use std::io::Write;
 
     // Determine command string and how to execute
@@ -119,9 +123,10 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract: bool) -> bird:
         store.store_output(inv_id, "stderr", &stderr, date, cmd_hint)?;
     }
 
-    // Extract events if requested
-    if extract {
-        let count = store.extract_events(&inv_id.to_string(), None)?;
+    // Extract events if enabled (via flag or config)
+    let should_extract = extract_override.unwrap_or(config.auto_extract);
+    if should_extract {
+        let count = store.extract_events(&inv_id.to_string(), format_override)?;
         if count > 0 {
             eprintln!("shq: extracted {} events", count);
         }

@@ -24,9 +24,17 @@ enum Commands {
         #[arg(short = 'c', long = "command")]
         shell_cmd: Option<String>,
 
-        /// Extract events from output after command completes
-        #[arg(short = 'E', long = "extract")]
+        /// Extract events from output after command completes (overrides config)
+        #[arg(short = 'x', long = "extract", conflicts_with = "no_extract")]
         extract: bool,
+
+        /// Disable event extraction (overrides config)
+        #[arg(short = 'X', long = "no-extract", conflicts_with = "extract")]
+        no_extract: bool,
+
+        /// Override format detection for event extraction (e.g., gcc, pytest, cargo)
+        #[arg(short = 'f', long = "extract-format")]
+        format: Option<String>,
 
         /// The command to run (alternative to -c)
         #[arg(trailing_var_arg = true)]
@@ -269,7 +277,17 @@ fn main() {
 
     let result = match cli.command {
         Commands::Init => commands::init(),
-        Commands::Run { shell_cmd, extract, cmd } => commands::run(shell_cmd.as_deref(), &cmd, extract),
+        Commands::Run { shell_cmd, extract, no_extract, format, cmd } => {
+            // Resolve extract behavior: --extract forces on, --no-extract forces off, otherwise use config
+            let extract_override = if extract {
+                Some(true)
+            } else if no_extract {
+                Some(false)
+            } else {
+                None
+            };
+            commands::run(shell_cmd.as_deref(), &cmd, extract_override, format.as_deref())
+        }
         Commands::Save { file, command, exit_code, duration_ms, stream, stdout_file, stderr_file, session_id, invoker_pid, invoker, invoker_type } => {
             commands::save(
                 file.as_deref(),
