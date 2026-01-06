@@ -168,9 +168,17 @@ enum Commands {
 
     /// Compact parquet files to reduce storage and improve query performance
     Compact {
-        /// Compact when a session has more than this many files (keeps this many recent)
+        /// Compact when a session has more than this many non-compacted files
         #[arg(short = 't', long = "threshold", default_value = "50")]
         file_threshold: usize,
+
+        /// Re-compact when more than this many compacted files exist (0 = disabled)
+        #[arg(short = 'r', long = "recompact-threshold", default_value = "10")]
+        recompact_threshold: usize,
+
+        /// Consolidate ALL files into a single file per session (full merge)
+        #[arg(short = 'c', long = "consolidate")]
+        consolidate: bool,
 
         /// Only compact files for this specific session (used by shell hooks)
         #[arg(short = 's', long = "session")]
@@ -346,8 +354,8 @@ fn main() {
         Commands::Sql { query } => commands::sql(&query),
         Commands::Stats => commands::stats(),
         Commands::Archive { days, dry_run, extract_first } => commands::archive(days, dry_run, extract_first),
-        Commands::Compact { file_threshold, session, today_only, quiet, recent_only, archive_only, dry_run } => {
-            commands::compact(file_threshold, session.as_deref(), today_only, quiet, recent_only, archive_only, dry_run)
+        Commands::Compact { file_threshold, recompact_threshold, consolidate, session, today_only, quiet, recent_only, archive_only, dry_run } => {
+            commands::compact(file_threshold, recompact_threshold, consolidate, session.as_deref(), today_only, quiet, recent_only, archive_only, dry_run)
         }
         Commands::Hook { action } => match action {
             HookAction::Init { shell } => commands::hook_init(shell.as_deref()),

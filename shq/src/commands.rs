@@ -4,7 +4,7 @@ use std::io::{self, Read};
 use std::process::Command;
 use std::time::Instant;
 
-use bird::{init, Config, EventFilters, InvocationRecord, SessionRecord, Store};
+use bird::{init, CompactOptions, Config, EventFilters, InvocationRecord, SessionRecord, Store};
 
 /// Generate a session ID for grouping related invocations.
 fn session_id() -> String {
@@ -591,6 +591,8 @@ pub fn archive(days: u32, dry_run: bool, extract_first: bool) -> bird::Result<()
 /// Compact parquet files to reduce storage and improve performance.
 pub fn compact(
     file_threshold: usize,
+    recompact_threshold: usize,
+    consolidate: bool,
     session: Option<&str>,
     today_only: bool,
     quiet: bool,
@@ -605,16 +607,26 @@ pub fn compact(
         println!("Dry run - no changes will be made\n");
     }
 
+    let opts = CompactOptions {
+        file_threshold,
+        recompact_threshold,
+        consolidate,
+        dry_run,
+        session_filter: session.map(|s| s.to_string()),
+    };
+
     // Session-specific compaction (lightweight, used by shell hooks)
     if let Some(session_id) = session {
         let stats = if today_only {
+            // today_only uses legacy API (no recompact support for shell hooks)
             store.compact_session_today(session_id, file_threshold, dry_run)?
         } else {
-            store.compact_for_session(session_id, file_threshold, dry_run)?
+            store.compact_for_session_with_opts(session_id, &opts)?
         };
 
         if stats.sessions_compacted > 0 {
-            println!("Compacted session '{}':", session_id);
+            let action = if consolidate { "Consolidated" } else { "Compacted" };
+            println!("{} session '{}':", action, session_id);
             println!("  {} files -> {} files", stats.files_before, stats.files_after);
             println!(
                 "  {} -> {} ({})",
@@ -632,19 +644,20 @@ pub fn compact(
     let mut total_stats = bird::CompactStats::default();
 
     if !archive_only {
-        let stats = store.compact_recent(file_threshold, dry_run)?;
+        let stats = store.compact_recent_with_opts(&opts)?;
         total_stats.add(&stats);
     }
 
     if !recent_only {
-        let stats = store.compact_archive(file_threshold, dry_run)?;
+        let stats = store.compact_archive_with_opts(&opts)?;
         total_stats.add(&stats);
     }
 
     if total_stats.sessions_compacted > 0 {
+        let action = if consolidate { "Consolidated" } else { "Compacted" };
         println!(
-            "Compacted {} sessions across {} partitions",
-            total_stats.sessions_compacted, total_stats.partitions_compacted
+            "{} {} sessions across {} partitions",
+            action, total_stats.sessions_compacted, total_stats.partitions_compacted
         );
         println!(
             "  {} files -> {} files",

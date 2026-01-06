@@ -18,7 +18,7 @@ use duckdb::{
 use crate::{Config, Error, Result};
 
 // Re-export types from submodules
-pub use compact::{ArchiveStats, AutoCompactOptions, CompactStats};
+pub use compact::{ArchiveStats, AutoCompactOptions, CompactOptions, CompactStats};
 pub use events::{EventFilters, EventSummary, FormatConfig, FormatRule};
 pub use invocations::InvocationSummary;
 pub use outputs::OutputInfo;

@@ -117,26 +117,48 @@ pub struct ArchiveStats {
     pub bytes_moved: u64,
 }
 
-/// Options for auto-compaction.
-#[derive(Debug)]
-pub struct AutoCompactOptions {
-    /// Compact when a session has more than this many files.
+/// Options for compaction operations.
+#[derive(Debug, Clone)]
+pub struct CompactOptions {
+    /// Compact when a session has more than this many non-compacted files.
     pub file_threshold: usize,
-    /// Migrate data older than this many days to archive.
-    pub archive_days: u32,
+    /// Re-compact when a session has more than this many compacted files.
+    /// Set to 0 to disable re-compaction.
+    pub recompact_threshold: usize,
+    /// If true, consolidate ALL files (including compacted) into a single file.
+    pub consolidate: bool,
     /// If true, don't actually make changes.
     pub dry_run: bool,
     /// If set, only compact files for this specific session.
     pub session_filter: Option<String>,
 }
 
-impl Default for AutoCompactOptions {
+impl Default for CompactOptions {
     fn default() -> Self {
         Self {
             file_threshold: 50,
-            archive_days: 14,
+            recompact_threshold: 10,
+            consolidate: false,
             dry_run: false,
             session_filter: None,
+        }
+    }
+}
+
+/// Options for auto-compaction (includes archive settings).
+#[derive(Debug)]
+pub struct AutoCompactOptions {
+    /// Compact options.
+    pub compact: CompactOptions,
+    /// Migrate data older than this many days to archive.
+    pub archive_days: u32,
+}
+
+impl Default for AutoCompactOptions {
+    fn default() -> Self {
+        Self {
+            compact: CompactOptions::default(),
+            archive_days: 14,
         }
     }
 }
@@ -244,28 +266,116 @@ impl Store {
         })
     }
 
-    /// Compact files in a partition directory, grouped by session.
+    /// Consolidate ALL files for a session into a single file.
     ///
-    /// For each session with more than `file_threshold` files, compacts oldest
-    /// files while keeping the most recent ones.
-    pub fn compact_partition(
+    /// Unlike regular compaction, this merges everything including previously
+    /// compacted files into a single `data_0.parquet` file.
+    fn consolidate_session_files(
         &self,
         partition_dir: &Path,
-        file_threshold: usize,
-        session_filter: Option<&str>,
+        _session: &str,
+        files: Vec<PathBuf>,
         dry_run: bool,
+    ) -> Result<CompactStats> {
+        if files.len() < 2 {
+            return Ok(CompactStats::default());
+        }
+
+        let files_before = files.len();
+        let bytes_before: u64 = files
+            .iter()
+            .filter_map(|p| fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum();
+
+        if dry_run {
+            return Ok(CompactStats {
+                partitions_compacted: 0,
+                sessions_compacted: 1,
+                files_before,
+                files_after: 1,
+                bytes_before,
+                bytes_after: bytes_before,
+            });
+        }
+
+        let conn = self.connection()?;
+
+        // Build list of files to read
+        let file_list_sql = files
+            .iter()
+            .map(|p| format!("'{}'", p.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Create temp table with data from all files
+        conn.execute(
+            &format!(
+                "CREATE OR REPLACE TEMP TABLE consolidate_temp AS
+                 SELECT * FROM read_parquet([{}], union_by_name = true)",
+                file_list_sql
+            ),
+            [],
+        )?;
+
+        // Use simple data_0.parquet naming for consolidated files
+        let uuid = Uuid::now_v7();
+        let consolidated_name = format!("data_{}.parquet", uuid);
+        let consolidated_path = partition_dir.join(&consolidated_name);
+        let temp_path = atomic::temp_path(&consolidated_path);
+
+        conn.execute(
+            &format!(
+                "COPY consolidate_temp TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+                temp_path.display()
+            ),
+            [],
+        )?;
+
+        conn.execute("DROP TABLE consolidate_temp", [])?;
+
+        let bytes_after = fs::metadata(&temp_path)?.len();
+
+        // Remove old files
+        for file in &files {
+            fs::remove_file(file)?;
+        }
+
+        // Rename consolidated file to final location
+        atomic::rename_into_place(&temp_path, &consolidated_path)?;
+
+        Ok(CompactStats {
+            partitions_compacted: 0,
+            sessions_compacted: 1,
+            files_before,
+            files_after: 1,
+            bytes_before,
+            bytes_after,
+        })
+    }
+
+    /// Compact files in a partition directory, grouped by session.
+    ///
+    /// Behavior depends on options:
+    /// - `consolidate`: Merge ALL files into single file per session
+    /// - `file_threshold`: Compact when > N non-compacted files
+    /// - `recompact_threshold`: Re-compact when > N compacted files exist
+    pub fn compact_partition_with_opts(
+        &self,
+        partition_dir: &Path,
+        opts: &CompactOptions,
     ) -> Result<CompactStats> {
         let mut total_stats = CompactStats::default();
 
-        // Group files by session
-        let mut session_files: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        // Group files by session, separating compacted from non-compacted
+        let mut session_files: HashMap<String, (Vec<PathBuf>, Vec<PathBuf>)> = HashMap::new();
 
         for entry in fs::read_dir(partition_dir)? {
             let entry = entry?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
 
-            // Skip non-parquet, seed files, and already-compacted files
+            // Skip non-parquet and seed files
             if !name.ends_with(".parquet") || is_seed_file(&name) {
                 continue;
             }
@@ -273,41 +383,69 @@ impl Store {
             // Extract session from filename
             if let Some(session) = extract_session(&name) {
                 // Apply session filter if specified
-                if let Some(filter) = session_filter {
-                    if session != filter {
+                if let Some(ref filter) = opts.session_filter {
+                    if session != *filter {
                         continue;
                     }
                 }
 
-                session_files.entry(session).or_default().push(path);
+                let entry = session_files.entry(session).or_insert_with(|| (vec![], vec![]));
+                if is_compacted_file(&name) || name.starts_with("data_") {
+                    entry.1.push(path); // compacted/consolidated
+                } else {
+                    entry.0.push(path); // non-compacted
+                }
             }
         }
 
-        // Compact each session that exceeds threshold
         let mut any_compacted = false;
-        for (session, files) in session_files {
-            // Include compacted files in count but don't re-compact them
-            let non_compacted: Vec<PathBuf> = files
-                .iter()
-                .filter(|p| {
-                    !is_compacted_file(&p.file_name().unwrap_or_default().to_string_lossy())
-                })
-                .cloned()
-                .collect();
+        for (session, (non_compacted, compacted)) in session_files {
+            if opts.consolidate {
+                // Consolidate mode: merge ALL files into one
+                let all_files: Vec<PathBuf> = non_compacted.into_iter().chain(compacted).collect();
+                if all_files.len() >= 2 {
+                    let stats = self.consolidate_session_files(
+                        partition_dir,
+                        &session,
+                        all_files,
+                        opts.dry_run,
+                    )?;
+                    if stats.sessions_compacted > 0 {
+                        any_compacted = true;
+                        total_stats.add(&stats);
+                    }
+                }
+            } else {
+                // Regular compaction mode
 
-            if non_compacted.len() >= file_threshold {
-                // Only compact non-compacted files, keep threshold files
-                let mut to_process = non_compacted;
-                let stats = self.compact_session_files(
-                    partition_dir,
-                    &session,
-                    &mut to_process,
-                    file_threshold,
-                    dry_run,
-                )?;
-                if stats.sessions_compacted > 0 {
-                    any_compacted = true;
-                    total_stats.add(&stats);
+                // First: compact non-compacted files if threshold exceeded
+                if non_compacted.len() >= opts.file_threshold {
+                    let mut to_process = non_compacted;
+                    let stats = self.compact_session_files(
+                        partition_dir,
+                        &session,
+                        &mut to_process,
+                        opts.file_threshold,
+                        opts.dry_run,
+                    )?;
+                    if stats.sessions_compacted > 0 {
+                        any_compacted = true;
+                        total_stats.add(&stats);
+                    }
+                }
+
+                // Second: re-compact compacted files if recompact threshold exceeded
+                if opts.recompact_threshold > 0 && compacted.len() >= opts.recompact_threshold {
+                    let stats = self.consolidate_session_files(
+                        partition_dir,
+                        &session,
+                        compacted,
+                        opts.dry_run,
+                    )?;
+                    if stats.sessions_compacted > 0 {
+                        any_compacted = true;
+                        total_stats.add(&stats);
+                    }
                 }
             }
         }
@@ -317,6 +455,24 @@ impl Store {
         }
 
         Ok(total_stats)
+    }
+
+    /// Compact files in a partition directory (legacy API).
+    pub fn compact_partition(
+        &self,
+        partition_dir: &Path,
+        file_threshold: usize,
+        session_filter: Option<&str>,
+        dry_run: bool,
+    ) -> Result<CompactStats> {
+        let opts = CompactOptions {
+            file_threshold,
+            recompact_threshold: 0, // Disable re-compaction for legacy API
+            consolidate: false,
+            dry_run,
+            session_filter: session_filter.map(|s| s.to_string()),
+        };
+        self.compact_partition_with_opts(partition_dir, &opts)
     }
 
     /// Compact all partitions in a data type directory (invocations, outputs, sessions).
@@ -429,9 +585,10 @@ impl Store {
         Ok(total_stats)
     }
 
-    /// Migrate old data from recent to archive.
+    /// Migrate old data from recent to archive with consolidation.
     ///
-    /// Moves entire date partitions that are older than the specified days.
+    /// Consolidates all files in each date partition into a single parquet file
+    /// in the archive, then removes the source files.
     pub fn archive_old_data(&self, older_than_days: u32, dry_run: bool) -> Result<ArchiveStats> {
         let mut stats = ArchiveStats::default();
         let cutoff_date = Utc::now().date_naive() - chrono::Duration::days(older_than_days as i64);
@@ -447,55 +604,97 @@ impl Store {
                 continue;
             }
 
-            for entry in fs::read_dir(&recent_data_dir)? {
-                let entry = entry?;
-                let path = entry.path();
+            // Collect partitions to archive
+            let partitions_to_archive: Vec<(NaiveDate, PathBuf, String)> = fs::read_dir(&recent_data_dir)?
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let path = e.path();
+                    if !path.is_dir() {
+                        return None;
+                    }
+                    let dir_name = e.file_name().to_string_lossy().to_string();
+                    let date_str = dir_name.strip_prefix("date=")?;
+                    let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d").ok()?;
+                    if date < cutoff_date {
+                        Some((date, path, dir_name))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
-                if !path.is_dir() {
+            for (_date, partition_path, dir_name) in partitions_to_archive {
+                let dest_dir = archive_data_dir.join(&dir_name);
+
+                // Count source stats
+                let source_files: Vec<PathBuf> = fs::read_dir(&partition_path)?
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().map(|ext| ext == "parquet").unwrap_or(false))
+                    .collect();
+
+                if source_files.is_empty() {
                     continue;
                 }
 
-                // Parse date from partition name (date=YYYY-MM-DD)
-                let dir_name = entry.file_name().to_string_lossy().to_string();
-                if let Some(date_str) = dir_name.strip_prefix("date=") {
-                    if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-                        if date < cutoff_date {
-                            let dest_dir = archive_data_dir.join(&dir_name);
+                let file_count = source_files.len();
+                let bytes_before: u64 = source_files
+                    .iter()
+                    .filter_map(|p| fs::metadata(p).ok())
+                    .map(|m| m.len())
+                    .sum();
 
-                            if dry_run {
-                                // Count files for dry run
-                                let file_count =
-                                    fs::read_dir(&path)?.filter_map(|e| e.ok()).count();
-                                let bytes: u64 = fs::read_dir(&path)?
-                                    .filter_map(|e| e.ok())
-                                    .filter_map(|e| fs::metadata(e.path()).ok())
-                                    .map(|m| m.len())
-                                    .sum();
+                if dry_run {
+                    stats.partitions_archived += 1;
+                    stats.files_moved += file_count;
+                    stats.bytes_moved += bytes_before;
+                    continue;
+                }
 
-                                stats.partitions_archived += 1;
-                                stats.files_moved += file_count;
-                                stats.bytes_moved += bytes;
-                            } else {
-                                // Create destination and move partition
-                                fs::create_dir_all(&dest_dir)?;
-
-                                let file_count = move_partition(&path, &dest_dir)?;
-                                let bytes: u64 = fs::read_dir(&dest_dir)?
-                                    .filter_map(|e| e.ok())
-                                    .filter_map(|e| fs::metadata(e.path()).ok())
-                                    .map(|m| m.len())
-                                    .sum();
-
-                                // Remove empty source directory
-                                let _ = fs::remove_dir(&path);
-
-                                stats.partitions_archived += 1;
-                                stats.files_moved += file_count;
-                                stats.bytes_moved += bytes;
-                            }
-                        }
+                // Skip if archive partition already exists with data
+                if dest_dir.exists() {
+                    let existing_files = fs::read_dir(&dest_dir)?
+                        .filter_map(|e| e.ok())
+                        .any(|e| e.path().extension().map(|ext| ext == "parquet").unwrap_or(false));
+                    if existing_files {
+                        // Already archived, skip
+                        continue;
                     }
                 }
+
+                fs::create_dir_all(&dest_dir)?;
+
+                // Consolidate using DuckDB's COPY
+                let conn = self.connection()?;
+                let src_glob = format!("{}/*.parquet", partition_path.display());
+                let dest_file = dest_dir.join(format!("data_0.parquet"));
+                let temp_file = dest_dir.join(format!(".data_0.parquet.tmp"));
+
+                conn.execute(
+                    &format!(
+                        "COPY (SELECT * FROM read_parquet('{}', union_by_name = true)) \
+                         TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+                        src_glob,
+                        temp_file.display()
+                    ),
+                    [],
+                )?;
+
+                // Atomic rename
+                fs::rename(&temp_file, &dest_file)?;
+
+                // Get consolidated size
+                let bytes_after = fs::metadata(&dest_file)?.len();
+
+                // Remove source files
+                for file in &source_files {
+                    let _ = fs::remove_file(file);
+                }
+                let _ = fs::remove_dir(&partition_path);
+
+                stats.partitions_archived += 1;
+                stats.files_moved += file_count;
+                stats.bytes_moved += bytes_after;
             }
         }
 
@@ -505,42 +704,104 @@ impl Store {
     /// Run auto-compaction based on options.
     pub fn auto_compact(&self, opts: &AutoCompactOptions) -> Result<(CompactStats, ArchiveStats)> {
         // First, archive old data (skip if doing session-specific compaction)
-        let archive_stats = if opts.session_filter.is_none() {
-            self.archive_old_data(opts.archive_days, opts.dry_run)?
+        let archive_stats = if opts.compact.session_filter.is_none() {
+            self.archive_old_data(opts.archive_days, opts.compact.dry_run)?
         } else {
             ArchiveStats::default()
         };
 
         // Then compact based on mode
-        let compact_stats = if let Some(ref session) = opts.session_filter {
+        let compact_stats = if let Some(ref session) = opts.compact.session_filter {
             // Client-specific mode
-            self.compact_for_session(session, opts.file_threshold, opts.dry_run)?
+            self.compact_for_session_with_opts(session, &opts.compact)?
         } else {
             // Global mode: compact both recent and archive
-            let mut stats = self.compact_recent(opts.file_threshold, opts.dry_run)?;
-            let archive_compact = self.compact_archive(opts.file_threshold, opts.dry_run)?;
+            let mut stats = self.compact_recent_with_opts(&opts.compact)?;
+            let archive_compact = self.compact_archive_with_opts(&opts.compact)?;
             stats.add(&archive_compact);
             stats
         };
 
         Ok((compact_stats, archive_stats))
     }
-}
 
-/// Move all files from source partition to destination.
-fn move_partition(src: &Path, dest: &Path) -> Result<usize> {
-    let mut count = 0;
+    /// Compact recent data with full options.
+    pub fn compact_recent_with_opts(&self, opts: &CompactOptions) -> Result<CompactStats> {
+        let mut total_stats = CompactStats::default();
+        let recent_dir = self.config().recent_dir();
 
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
+        for data_type in &["invocations", "outputs", "sessions", "events"] {
+            let data_dir = recent_dir.join(data_type);
+            let stats = self.compact_data_type_with_opts(&data_dir, opts)?;
+            total_stats.add(&stats);
+        }
 
-        fs::rename(&src_path, &dest_path)?;
-        count += 1;
+        Ok(total_stats)
     }
 
-    Ok(count)
+    /// Compact archive data with full options.
+    pub fn compact_archive_with_opts(&self, opts: &CompactOptions) -> Result<CompactStats> {
+        let mut total_stats = CompactStats::default();
+        let archive_dir = self.config().archive_dir();
+
+        for data_type in &["invocations", "outputs", "sessions", "events"] {
+            let data_dir = archive_dir.join(data_type);
+            let stats = self.compact_data_type_with_opts(&data_dir, opts)?;
+            total_stats.add(&stats);
+        }
+
+        Ok(total_stats)
+    }
+
+    /// Compact data type directory with full options.
+    pub fn compact_data_type_with_opts(
+        &self,
+        data_dir: &Path,
+        opts: &CompactOptions,
+    ) -> Result<CompactStats> {
+        let mut total_stats = CompactStats::default();
+
+        if !data_dir.exists() {
+            return Ok(total_stats);
+        }
+
+        for entry in fs::read_dir(data_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if !path.is_dir() {
+                continue;
+            }
+
+            let stats = self.compact_partition_with_opts(&path, opts)?;
+            total_stats.add(&stats);
+        }
+
+        Ok(total_stats)
+    }
+
+    /// Compact files for a specific session with full options.
+    pub fn compact_for_session_with_opts(
+        &self,
+        session_id: &str,
+        opts: &CompactOptions,
+    ) -> Result<CompactStats> {
+        let mut total_stats = CompactStats::default();
+        let recent_dir = self.config().recent_dir();
+
+        let session_opts = CompactOptions {
+            session_filter: Some(session_id.to_string()),
+            ..opts.clone()
+        };
+
+        for data_type in &["invocations", "outputs", "sessions", "events"] {
+            let data_dir = recent_dir.join(data_type);
+            let stats = self.compact_data_type_with_opts(&data_dir, &session_opts)?;
+            total_stats.add(&stats);
+        }
+
+        Ok(total_stats)
+    }
 }
 
 #[cfg(test)]
