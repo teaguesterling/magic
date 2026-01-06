@@ -244,7 +244,7 @@ enum Commands {
 
     /// Extract events from an invocation's output
     ExtractEvents {
-        /// Invocation ID (default: last invocation)
+        /// Invocation ID (default: last invocation, ignored if --all)
         #[arg(default_value = "-1", allow_hyphen_values = true)]
         selector: String,
 
@@ -259,6 +259,22 @@ enum Commands {
         /// Re-extract even if events already exist
         #[arg(long = "force")]
         force: bool,
+
+        /// Extract from all invocations that don't have events yet
+        #[arg(short = 'a', long = "all")]
+        all: bool,
+
+        /// Only process invocations since this date (YYYY-MM-DD, default: 30 days ago)
+        #[arg(long = "since")]
+        since: Option<String>,
+
+        /// Maximum number of invocations to process (default: 1000)
+        #[arg(short = 'n', long = "limit")]
+        limit: Option<usize>,
+
+        /// Show what would be extracted without actually extracting
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 }
 
@@ -346,8 +362,8 @@ fn main() {
                 format.as_deref(),
             )
         }
-        Commands::ExtractEvents { selector, format, quiet, force } => {
-            commands::extract_events(&selector, format.as_deref(), quiet, force)
+        Commands::ExtractEvents { selector, format, quiet, force, all, since, limit, dry_run } => {
+            commands::extract_events(&selector, format.as_deref(), quiet, force, all, since.as_deref(), limit, dry_run)
         }
     };
 

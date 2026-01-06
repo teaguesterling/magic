@@ -707,6 +707,63 @@ impl Store {
 
         Ok(deleted)
     }
+
+    /// Get invocations that have outputs but no events extracted yet.
+    ///
+    /// Useful for backfilling events from existing invocations.
+    pub fn invocations_without_events(
+        &self,
+        since: Option<NaiveDate>,
+        limit: Option<usize>,
+    ) -> Result<Vec<super::InvocationSummary>> {
+        let conn = self.connection()?;
+
+        // Default to last 30 days if not specified
+        let since_date = since.unwrap_or_else(|| {
+            chrono::Utc::now().date_naive() - chrono::Duration::days(30)
+        });
+
+        let limit_clause = limit
+            .map(|l| format!("LIMIT {}", l))
+            .unwrap_or_else(|| "LIMIT 1000".to_string());
+
+        let sql = format!(
+            r#"
+            SELECT i.id::VARCHAR, i.cmd, i.exit_code, i.timestamp::VARCHAR, i.duration_ms
+            FROM invocations i
+            WHERE EXISTS (SELECT 1 FROM outputs o WHERE o.invocation_id = i.id)
+              AND NOT EXISTS (SELECT 1 FROM events e WHERE e.invocation_id = i.id)
+              AND i.date >= '{}'
+            ORDER BY i.timestamp DESC
+            {}
+            "#,
+            since_date, limit_clause
+        );
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                // Handle case where tables don't exist yet
+                if e.to_string().contains("No files found") {
+                    return Ok(Vec::new());
+                }
+                return Err(e.into());
+            }
+        };
+
+        let rows = stmt.query_map([], |row| {
+            Ok(super::InvocationSummary {
+                id: row.get(0)?,
+                cmd: row.get(1)?,
+                exit_code: row.get(2)?,
+                timestamp: row.get(3)?,
+                duration_ms: row.get(4)?,
+            })
+        })?;
+
+        let results: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+        Ok(results)
+    }
 }
 
 #[cfg(test)]

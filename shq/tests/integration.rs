@@ -1034,3 +1034,108 @@ fn test_events_from_stderr() {
     // The extraction should complete without error
     // (actual event detection depends on duck_hunt)
 }
+
+#[test]
+fn test_extract_events_backfill_all() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run multiple commands without extracting events
+    for i in 1..=3 {
+        shq_cmd(tmp.path())
+            .args(["run", "echo", &format!("command {}", i)])
+            .output()
+            .expect("failed to run");
+    }
+
+    // Backfill all invocations
+    let output = shq_cmd(tmp.path())
+        .args(["extract-events", "--all"])
+        .output()
+        .expect("failed to backfill");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("invocations") || stdout.contains("No invocations"),
+        "Should report backfill results: {}", stdout
+    );
+}
+
+#[test]
+fn test_extract_events_backfill_dry_run() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "test"])
+        .output()
+        .expect("failed to run");
+
+    // Dry-run backfill
+    let output = shq_cmd(tmp.path())
+        .args(["extract-events", "--all", "--dry-run"])
+        .output()
+        .expect("failed to dry-run backfill");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Would extract") || stdout.contains("No invocations"),
+        "Dry-run should show what would be done: {}", stdout
+    );
+}
+
+#[test]
+fn test_extract_events_backfill_limit() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run multiple commands
+    for i in 1..=5 {
+        shq_cmd(tmp.path())
+            .args(["run", "echo", &format!("cmd {}", i)])
+            .output()
+            .expect("failed to run");
+    }
+
+    // Backfill with limit
+    let output = shq_cmd(tmp.path())
+        .args(["extract-events", "--all", "--limit", "2", "--dry-run"])
+        .output()
+        .expect("failed to backfill with limit");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should only show 2 invocations
+    assert!(
+        stdout.contains("2 invocations") || stdout.contains("No invocations"),
+        "Should limit to 2 invocations: {}", stdout
+    );
+}
+
+#[test]
+fn test_extract_events_backfill_since() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "recent"])
+        .output()
+        .expect("failed to run");
+
+    // Backfill with future since date (should find nothing)
+    let output = shq_cmd(tmp.path())
+        .args(["extract-events", "--all", "--since", "2099-01-01"])
+        .output()
+        .expect("failed to backfill with since");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No invocations"),
+        "Future date should find no invocations: {}", stdout
+    );
+}

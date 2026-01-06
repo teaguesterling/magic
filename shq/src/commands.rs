@@ -842,11 +842,20 @@ pub fn extract_events(
     format: Option<&str>,
     quiet: bool,
     force: bool,
+    all: bool,
+    since: Option<&str>,
+    limit: Option<usize>,
+    dry_run: bool,
 ) -> bird::Result<()> {
     let config = Config::load()?;
     let store = Store::open(config)?;
 
-    // Resolve selector to invocation ID
+    // Backfill mode: extract from all invocations without events
+    if all {
+        return extract_events_backfill(&store, format, quiet, since, limit, dry_run);
+    }
+
+    // Single invocation mode
     let invocation_id = resolve_invocation_id(&store, selector)?;
 
     // Check if events already exist
@@ -882,6 +891,79 @@ pub fn extract_events(
     }
 
     Ok(())
+}
+
+/// Backfill events from all invocations that don't have events yet.
+fn extract_events_backfill(
+    store: &Store,
+    format: Option<&str>,
+    quiet: bool,
+    since: Option<&str>,
+    limit: Option<usize>,
+    dry_run: bool,
+) -> bird::Result<()> {
+    use chrono::NaiveDate;
+
+    // Parse since date if provided
+    let since_date = if let Some(date_str) = since {
+        Some(
+            NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+                .map_err(|e| bird::Error::Config(format!("Invalid date '{}': {}", date_str, e)))?,
+        )
+    } else {
+        None
+    };
+
+    // Get invocations without events
+    let invocations = store.invocations_without_events(since_date, limit)?;
+
+    if invocations.is_empty() {
+        if !quiet {
+            println!("No invocations found without events.");
+        }
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("Would extract events from {} invocations:", invocations.len());
+        for inv in &invocations {
+            let cmd_preview: String = inv.cmd.chars().take(60).collect();
+            let suffix = if inv.cmd.len() > 60 { "..." } else { "" };
+            println!("  {} {}{}", &inv.id[..8], cmd_preview, suffix);
+        }
+        return Ok(());
+    }
+
+    let mut total_events = 0;
+    let mut processed = 0;
+
+    for inv in &invocations {
+        let count = store.extract_events(&inv.id, format)?;
+        total_events += count;
+        processed += 1;
+
+        if !quiet && count > 0 {
+            println!("  {} events from: {}", count, truncate_cmd(&inv.cmd, 50));
+        }
+    }
+
+    if !quiet {
+        println!(
+            "Extracted {} events from {} invocations.",
+            total_events, processed
+        );
+    }
+
+    Ok(())
+}
+
+/// Truncate a command string for display.
+fn truncate_cmd(cmd: &str, max_len: usize) -> String {
+    if cmd.len() <= max_len {
+        cmd.to_string()
+    } else {
+        format!("{}...", &cmd[..max_len])
+    }
 }
 
 /// Resolve a selector (negative offset or UUID) to an invocation ID.
