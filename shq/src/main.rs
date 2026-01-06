@@ -160,6 +160,10 @@ enum Commands {
         /// Show what would be done without making changes
         #[arg(short = 'n', long = "dry-run")]
         dry_run: bool,
+
+        /// Extract events from invocations before archiving (backfill)
+        #[arg(short = 'x', long = "extract-first")]
+        extract_first: bool,
     },
 
     /// Compact parquet files to reduce storage and improve query performance
@@ -341,7 +345,7 @@ fn main() {
         Commands::History { limit } => commands::history(limit),
         Commands::Sql { query } => commands::sql(&query),
         Commands::Stats => commands::stats(),
-        Commands::Archive { days, dry_run } => commands::archive(days, dry_run),
+        Commands::Archive { days, dry_run, extract_first } => commands::archive(days, dry_run, extract_first),
         Commands::Compact { file_threshold, session, today_only, quiet, recent_only, archive_only, dry_run } => {
             commands::compact(file_threshold, session.as_deref(), today_only, quiet, recent_only, archive_only, dry_run)
         }

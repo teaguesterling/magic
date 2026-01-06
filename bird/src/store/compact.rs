@@ -361,7 +361,7 @@ impl Store {
         let mut total_stats = CompactStats::default();
         let recent_dir = self.config().recent_dir();
 
-        for data_type in &["invocations", "outputs", "sessions"] {
+        for data_type in &["invocations", "outputs", "sessions", "events"] {
             let data_dir = recent_dir.join(data_type);
             let stats =
                 self.compact_data_type(&data_dir, file_threshold, Some(session_id), dry_run)?;
@@ -385,7 +385,7 @@ impl Store {
         let today = Utc::now().date_naive();
         let date_partition = format!("date={}", today.format("%Y-%m-%d"));
 
-        for data_type in &["invocations", "outputs", "sessions"] {
+        for data_type in &["invocations", "outputs", "sessions", "events"] {
             let partition_dir = recent_dir.join(data_type).join(&date_partition);
             if partition_dir.exists() {
                 let stats = self.compact_partition(
@@ -406,7 +406,7 @@ impl Store {
         let mut total_stats = CompactStats::default();
         let recent_dir = self.config().recent_dir();
 
-        for data_type in &["invocations", "outputs", "sessions"] {
+        for data_type in &["invocations", "outputs", "sessions", "events"] {
             let data_dir = recent_dir.join(data_type);
             let stats = self.compact_data_type(&data_dir, file_threshold, None, dry_run)?;
             total_stats.add(&stats);
@@ -420,7 +420,7 @@ impl Store {
         let mut total_stats = CompactStats::default();
         let archive_dir = self.config().archive_dir();
 
-        for data_type in &["invocations", "outputs", "sessions"] {
+        for data_type in &["invocations", "outputs", "sessions", "events"] {
             let data_dir = archive_dir.join(data_type);
             let stats = self.compact_data_type(&data_dir, file_threshold, None, dry_run)?;
             total_stats.add(&stats);
@@ -439,7 +439,7 @@ impl Store {
         let recent_dir = self.config().recent_dir();
         let archive_dir = self.config().archive_dir();
 
-        for data_type in &["invocations", "outputs", "sessions"] {
+        for data_type in &["invocations", "outputs", "sessions", "events"] {
             let recent_data_dir = recent_dir.join(data_type);
             let archive_data_dir = archive_dir.join(data_type);
 

@@ -544,12 +544,32 @@ pub fn stats() -> bird::Result<()> {
 }
 
 /// Move old data from recent to archive.
-pub fn archive(days: u32, dry_run: bool) -> bird::Result<()> {
+pub fn archive(days: u32, dry_run: bool, extract_first: bool) -> bird::Result<()> {
     let config = Config::load()?;
     let store = Store::open(config)?;
 
     if dry_run {
         println!("Dry run - no changes will be made\n");
+    }
+
+    // Optionally extract events from invocations before archiving
+    if extract_first && !dry_run {
+        println!("Extracting events from invocations to be archived...");
+        let cutoff_date = chrono::Utc::now().date_naive() - chrono::Duration::days(days as i64);
+        let invocations = store.invocations_without_events(Some(cutoff_date), None)?;
+
+        if !invocations.is_empty() {
+            let mut total_events = 0;
+            for inv in &invocations {
+                let count = store.extract_events(&inv.id, None)?;
+                total_events += count;
+            }
+            println!(
+                "  Extracted {} events from {} invocations",
+                total_events,
+                invocations.len()
+            );
+        }
     }
 
     let stats = store.archive_old_data(days, dry_run)?;

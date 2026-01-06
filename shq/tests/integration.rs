@@ -1139,3 +1139,51 @@ fn test_extract_events_backfill_since() {
         "Future date should find no invocations: {}", stdout
     );
 }
+
+#[test]
+fn test_archive_extract_first() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command that produces events
+    shq_cmd(tmp.path())
+        .args(["run", "-c", "echo 'test.c:1: warning: test' >&2"])
+        .output()
+        .expect("failed to run");
+
+    // Archive with extract-first flag (dry-run to avoid actual archiving)
+    let output = shq_cmd(tmp.path())
+        .args(["archive", "--extract-first", "--dry-run"])
+        .output()
+        .expect("failed to archive");
+
+    assert!(output.status.success());
+    // Dry-run should not actually extract, just show what would be archived
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Dry run"));
+}
+
+#[test]
+fn test_compact_includes_events() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run multiple commands and extract events
+    for i in 1..=3 {
+        shq_cmd(tmp.path())
+            .args(["run", "-x", "-c", &format!("echo 'test.c:{}: warning: warn{}' >&2", i, i)])
+            .output()
+            .expect("failed to run");
+    }
+
+    // Compact with low threshold
+    let output = shq_cmd(tmp.path())
+        .args(["compact", "--threshold", "2", "--dry-run"])
+        .output()
+        .expect("failed to compact");
+
+    assert!(output.status.success());
+    // Should mention dry run
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Dry run"));
+}
