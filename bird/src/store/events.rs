@@ -152,6 +152,8 @@ pub struct EventFilters {
     pub severity: Option<String>,
     /// Filter by invocation ID.
     pub invocation_id: Option<String>,
+    /// Filter by multiple invocation IDs (for last_n queries).
+    pub invocation_ids: Option<Vec<String>>,
     /// Filter by command pattern (glob).
     pub cmd_pattern: Option<String>,
     /// Filter by client ID.
@@ -204,10 +206,10 @@ impl Store {
             None => self.detect_format(&cmd)?,
         };
 
-        // Get output info for this invocation (stdout)
+        // Get output info for this invocation (both stdout and stderr)
         let outputs: Vec<(String, String)> = {
             let mut stmt = conn.prepare(
-                "SELECT storage_type, storage_ref FROM outputs WHERE invocation_id = ? AND stream = 'stdout'",
+                "SELECT storage_type, storage_ref FROM outputs WHERE invocation_id = ? AND stream IN ('stdout', 'stderr')",
             )?;
             let rows = stmt.query_map(params![invocation_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
             rows.filter_map(|r| r.ok()).collect()
@@ -469,6 +471,16 @@ impl Store {
             ));
         }
 
+        if let Some(ref inv_ids) = filters.invocation_ids {
+            if !inv_ids.is_empty() {
+                let ids_list: Vec<String> = inv_ids
+                    .iter()
+                    .map(|id| format!("'{}'", id.replace("'", "''")))
+                    .collect();
+                conditions.push(format!("e.invocation_id IN ({})", ids_list.join(", ")));
+            }
+        }
+
         if let Some(ref client) = filters.client_id {
             conditions.push(format!("e.client_id = '{}'", client.replace("'", "''")));
         }
@@ -606,6 +618,16 @@ impl Store {
                 "invocation_id = '{}'",
                 inv_id.replace("'", "''")
             ));
+        }
+
+        if let Some(ref inv_ids) = filters.invocation_ids {
+            if !inv_ids.is_empty() {
+                let ids_list: Vec<String> = inv_ids
+                    .iter()
+                    .map(|id| format!("'{}'", id.replace("'", "''")))
+                    .collect();
+                conditions.push(format!("invocation_id IN ({})", ids_list.join(", ")));
+            }
         }
 
         if let Some(ref client) = filters.client_id {

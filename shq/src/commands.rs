@@ -30,7 +30,7 @@ fn invoker_pid() -> u32 {
     std::os::unix::process::parent_id()
 }
 
-pub fn run(shell_cmd: Option<&str>, cmd_args: &[String]) -> bird::Result<()> {
+pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract: bool) -> bird::Result<()> {
     use std::io::Write;
 
     // Determine command string and how to execute
@@ -117,6 +117,14 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String]) -> bird::Result<()> {
     }
     if !stderr.is_empty() {
         store.store_output(inv_id, "stderr", &stderr, date, cmd_hint)?;
+    }
+
+    // Extract events if requested
+    if extract {
+        let count = store.extract_events(&inv_id.to_string(), None)?;
+        if count > 0 {
+            eprintln!("shq: extracted {} events", count);
+        }
     }
 
     // Exit with the same code as the wrapped command
@@ -760,9 +768,9 @@ pub fn events(
             println!("No invocations found.");
             return Ok(());
         }
-        // For now, we'll just use date filtering based on the oldest invocation
-        // A more precise approach would query events by invocation_id IN (...)
-        filters.limit = Some(limit);
+        // Filter events to only those from the last N invocations
+        let inv_ids: Vec<String> = invocations.iter().map(|inv| inv.id.clone()).collect();
+        filters.invocation_ids = Some(inv_ids);
     }
 
     // Count only mode

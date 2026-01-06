@@ -24,6 +24,10 @@ enum Commands {
         #[arg(short = 'c', long = "command")]
         shell_cmd: Option<String>,
 
+        /// Extract events from output after command completes
+        #[arg(short = 'E', long = "extract")]
+        extract: bool,
+
         /// The command to run (alternative to -c)
         #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -265,7 +269,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::Init => commands::init(),
-        Commands::Run { shell_cmd, cmd } => commands::run(shell_cmd.as_deref(), &cmd),
+        Commands::Run { shell_cmd, extract, cmd } => commands::run(shell_cmd.as_deref(), &cmd, extract),
         Commands::Save { file, command, exit_code, duration_ms, stream, stdout_file, stderr_file, session_id, invoker_pid, invoker, invoker_type } => {
             commands::save(
                 file.as_deref(),
