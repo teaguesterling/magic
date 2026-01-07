@@ -4,7 +4,7 @@ use std::io::{self, Read};
 use std::process::Command;
 use std::time::Instant;
 
-use bird::{init, CompactOptions, Config, EventFilters, InvocationRecord, SessionRecord, Store};
+use bird::{init, parse_query, CompactOptions, Config, EventFilters, InvocationRecord, Query, SessionRecord, Store};
 
 /// Generate a session ID for grouping related invocations.
 fn session_id() -> String {
@@ -247,22 +247,25 @@ pub fn save(
     Ok(())
 }
 
-/// Options for the show command.
+/// Options for the output command.
 #[derive(Default)]
-pub struct ShowOptions {
+pub struct OutputOptions {
     pub pager: bool,
     pub strip_ansi: bool,
     pub head: Option<usize>,
     pub tail: Option<usize>,
 }
 
-/// Show output from a previous invocation.
-pub fn show(selector: &str, stream_filter: Option<&str>, opts: &ShowOptions) -> bird::Result<()> {
+/// Show captured output from invocation(s).
+pub fn output(query_str: &str, stream_filter: Option<&str>, opts: &OutputOptions) -> bird::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
     let config = Config::load()?;
     let store = Store::open(config)?;
+
+    // Parse query
+    let query = parse_query(query_str);
 
     // Normalize stream filter aliases
     let (db_filter, combine_to_stdout) = match stream_filter {
@@ -273,25 +276,8 @@ pub fn show(selector: &str, stream_filter: Option<&str>, opts: &ShowOptions) -> 
         None => (None, false), // No filter, route to original streams
     };
 
-    // Parse selector: negative number = offset from end, UUID = direct lookup
-    let invocation_id = if let Ok(offset) = selector.parse::<i64>() {
-        if offset < 0 {
-            // Get Nth invocation from the end
-            let n = (-offset) as usize;
-            let invocations = store.recent_invocations(n)?;
-            if let Some(inv) = invocations.last() {
-                inv.id.clone()
-            } else {
-                eprintln!("No invocation found at offset {}", offset);
-                return Ok(());
-            }
-        } else {
-            selector.to_string()
-        }
-    } else {
-        // Assume it's a UUID
-        selector.to_string()
-    };
+    // Resolve invocation(s) from query
+    let invocation_id = resolve_query_to_invocation(&store, &query)?;
 
     // Get outputs for the invocation (optionally filtered by stream)
     let outputs = store.get_outputs(&invocation_id, db_filter)?;
@@ -440,10 +426,16 @@ pub fn init() -> bird::Result<()> {
     Ok(())
 }
 
-pub fn history(limit: usize) -> bird::Result<()> {
+/// List invocation history.
+pub fn invocations(query_str: &str, format: &str) -> bird::Result<()> {
     let config = Config::load()?;
     let store = Store::open(config)?;
 
+    // Parse query to get limit from range
+    let query = parse_query(query_str);
+    let limit = query.range.map(|r| r.start).unwrap_or(20);
+
+    // TODO: Apply full query filters (source, path, field filters)
     let invocations = store.recent_invocations(limit)?;
 
     if invocations.is_empty() {
@@ -451,36 +443,70 @@ pub fn history(limit: usize) -> bird::Result<()> {
         return Ok(());
     }
 
-    // Simple table output
-    println!("{:<20} {:<6} {:<10} {}", "TIMESTAMP", "EXIT", "DURATION", "COMMAND");
-    println!("{}", "-".repeat(80));
+    match format {
+        "json" => {
+            // JSON output
+            println!("[");
+            for (i, inv) in invocations.iter().enumerate() {
+                let comma = if i < invocations.len() - 1 { "," } else { "" };
+                println!(
+                    r#"  {{"id": "{}", "timestamp": "{}", "cmd": "{}", "exit_code": {}, "duration_ms": {}}}{}"#,
+                    inv.id,
+                    inv.timestamp,
+                    inv.cmd.replace('\\', "\\\\").replace('"', "\\\""),
+                    inv.exit_code,
+                    inv.duration_ms.unwrap_or(0),
+                    comma
+                );
+            }
+            println!("]");
+        }
+        "oneline" => {
+            // One-line per invocation
+            for inv in &invocations {
+                let duration = inv.duration_ms.map(|d| format!("{}ms", d)).unwrap_or_else(|| "-".to_string());
+                println!("{} [{}] {} {}", &inv.id[..8], inv.exit_code, duration, inv.cmd);
+            }
+        }
+        _ => {
+            // Table output (default)
+            println!("{:<20} {:<6} {:<10} {}", "TIMESTAMP", "EXIT", "DURATION", "COMMAND");
+            println!("{}", "-".repeat(80));
 
-    for inv in invocations {
-        let duration = inv
-            .duration_ms
-            .map(|d| format!("{}ms", d))
-            .unwrap_or_else(|| "-".to_string());
+            for inv in invocations {
+                let duration = inv
+                    .duration_ms
+                    .map(|d| format!("{}ms", d))
+                    .unwrap_or_else(|| "-".to_string());
 
-        // Truncate timestamp to just time portion if today
-        let timestamp = if inv.timestamp.len() > 19 {
-            &inv.timestamp[11..19]
-        } else {
-            &inv.timestamp
-        };
+                // Truncate timestamp to just time portion if today
+                let timestamp = if inv.timestamp.len() > 19 {
+                    &inv.timestamp[11..19]
+                } else {
+                    &inv.timestamp
+                };
 
-        // Truncate command if too long
-        let cmd_display = if inv.cmd.len() > 50 {
-            format!("{}...", &inv.cmd[..47])
-        } else {
-            inv.cmd.clone()
-        };
+                // Truncate command if too long
+                let cmd_display = if inv.cmd.len() > 50 {
+                    format!("{}...", &inv.cmd[..47])
+                } else {
+                    inv.cmd.clone()
+                };
 
-        println!(
-            "{:<20} {:<6} {:<10} {}",
-            timestamp, inv.exit_code, duration, cmd_display
-        );
+                println!(
+                    "{:<20} {:<6} {:<10} {}",
+                    timestamp, inv.exit_code, duration, cmd_display
+                );
+            }
+        }
     }
 
+    Ok(())
+}
+
+/// Show quick reference for commands and query syntax.
+pub fn quick_help() -> bird::Result<()> {
+    print!("{}", QUICK_HELP);
     Ok(())
 }
 
@@ -768,14 +794,9 @@ pub fn hook_init(shell: Option<&str>) -> bird::Result<()> {
 }
 
 /// Query parsed events from invocation outputs.
-#[allow(clippy::too_many_arguments)]
 pub fn events(
+    query_str: &str,
     severity: Option<&str>,
-    cmd_pattern: Option<&str>,
-    client: Option<&str>,
-    hostname: Option<&str>,
-    last_n: Option<usize>,
-    invocation_id: Option<&str>,
     count_only: bool,
     limit: usize,
     reparse: bool,
@@ -784,22 +805,12 @@ pub fn events(
     let config = Config::load()?;
     let store = Store::open(config)?;
 
+    // Parse query to get limit from range
+    let query = parse_query(query_str);
+    let n = query.range.map(|r| r.start).unwrap_or(10);
+
     // Handle reparse mode: re-extract events from outputs
     if reparse {
-        // If invocation specified, reparse just that one
-        if let Some(inv_id) = invocation_id {
-            let resolved_id = resolve_invocation_id(&store, inv_id)?;
-            let count = store.extract_events(&resolved_id, format)?;
-            if count > 0 {
-                println!("Re-extracted {} events from invocation {}", count, resolved_id);
-            } else {
-                println!("No events found in invocation {}", resolved_id);
-            }
-            return Ok(());
-        }
-
-        // Otherwise, reparse last N invocations
-        let n = last_n.unwrap_or(10);
         let invocations = store.recent_invocations(n)?;
         let mut total_events = 0;
 
@@ -819,28 +830,22 @@ pub fn events(
         return Ok(());
     }
 
+    // Get invocations matching query
+    // TODO: Apply full query filters (source, path, field filters)
+    let invocations = store.recent_invocations(n)?;
+    if invocations.is_empty() {
+        println!("No invocations found.");
+        return Ok(());
+    }
+
     // Build filters
-    let mut filters = EventFilters {
+    let inv_ids: Vec<String> = invocations.iter().map(|inv| inv.id.clone()).collect();
+    let filters = EventFilters {
         severity: severity.map(|s| s.to_string()),
-        cmd_pattern: cmd_pattern.map(|s| s.to_string()),
-        client_id: client.map(|s| s.to_string()),
-        hostname: hostname.map(|s| s.to_string()),
-        invocation_id: invocation_id.map(|s| s.to_string()),
+        invocation_ids: Some(inv_ids),
         limit: Some(limit),
         ..Default::default()
     };
-
-    // If filtering by last N invocations, get their IDs
-    if let Some(n) = last_n {
-        let invocations = store.recent_invocations(n)?;
-        if invocations.is_empty() {
-            println!("No invocations found.");
-            return Ok(());
-        }
-        // Filter events to only those from the last N invocations
-        let inv_ids: Vec<String> = invocations.iter().map(|inv| inv.id.clone()).collect();
-        filters.invocation_ids = Some(inv_ids);
-    }
 
     // Count only mode
     if count_only {
@@ -865,7 +870,7 @@ pub fn events(
     println!("{}", "-".repeat(100));
 
     for event in &events {
-        let severity = event.severity.as_deref().unwrap_or("-");
+        let sev = event.severity.as_deref().unwrap_or("-");
         let location = match (&event.ref_file, event.ref_line) {
             (Some(f), Some(l)) => format!("{}:{}", truncate_path(f, 35), l),
             (Some(f), None) => truncate_path(f, 40).to_string(),
@@ -883,10 +888,10 @@ pub fn events(
             .unwrap_or_else(|| "-".to_string());
 
         // Color based on severity
-        let severity_display = match severity {
-            "error" => format!("\x1b[31m{:<8}\x1b[0m", severity),
-            "warning" => format!("\x1b[33m{:<8}\x1b[0m", severity),
-            _ => format!("{:<8}", severity),
+        let severity_display = match sev {
+            "error" => format!("\x1b[31m{:<8}\x1b[0m", sev),
+            "warning" => format!("\x1b[33m{:<8}\x1b[0m", sev),
+            _ => format!("{:<8}", sev),
         };
 
         println!(
@@ -1073,6 +1078,283 @@ fn truncate_string(s: &str, max_len: usize) -> String {
         format!("{}...", &s[..max_len - 3])
     }
 }
+
+/// Resolve a query to a single invocation ID.
+fn resolve_query_to_invocation(store: &Store, query: &Query) -> bird::Result<String> {
+    // For now, use range as offset (e.g., ~1 = last command)
+    let n = query.range.map(|r| r.start).unwrap_or(1);
+
+    // TODO: Apply full query filters (source, path, field filters)
+    let invocations = store.recent_invocations(n)?;
+
+    if let Some(inv) = invocations.last() {
+        Ok(inv.id.clone())
+    } else {
+        Err(bird::Error::NotFound("No matching invocation found".to_string()))
+    }
+}
+
+/// Show detailed info about an invocation.
+pub fn info(query_str: &str, format: &str) -> bird::Result<()> {
+    let config = Config::load()?;
+    let store = Store::open(config)?;
+
+    // Parse query and resolve to invocation
+    let query = parse_query(query_str);
+    let invocation_id = resolve_query_to_invocation(&store, &query)?;
+
+    // Get full invocation details via SQL
+    let result = store.query(&format!(
+        "SELECT id, cmd, cwd, exit_code, timestamp, duration_ms, session_id
+         FROM read_parquet('{}/**/invocations/*.parquet')
+         WHERE id = '{}'",
+        store.config().bird_root.display(),
+        invocation_id
+    ))?;
+
+    if result.rows.is_empty() {
+        return Err(bird::Error::NotFound(format!("Invocation {} not found", invocation_id)));
+    }
+
+    let row = &result.rows[0];
+    let id = &row[0];
+    let cmd = &row[1];
+    let cwd = &row[2];
+    let exit_code = &row[3];
+    let timestamp = &row[4];
+    let duration_ms = &row[5];
+    let session_id = &row[6];
+
+    // Get output info
+    let outputs = store.get_outputs(&invocation_id, None)?;
+    let stdout_size: i64 = outputs.iter().filter(|o| o.stream == "stdout").map(|o| o.byte_length).sum();
+    let stderr_size: i64 = outputs.iter().filter(|o| o.stream == "stderr").map(|o| o.byte_length).sum();
+
+    // Get event count
+    let event_count = store.event_count(&EventFilters {
+        invocation_id: Some(invocation_id.clone()),
+        ..Default::default()
+    })?;
+
+    match format {
+        "json" => {
+            println!(r#"{{"#);
+            println!(r#"  "id": "{}","#, id);
+            println!(r#"  "timestamp": "{}","#, timestamp);
+            println!(r#"  "cmd": "{}","#, cmd.replace('\\', "\\\\").replace('"', "\\\""));
+            println!(r#"  "cwd": "{}","#, cwd.replace('\\', "\\\\").replace('"', "\\\""));
+            println!(r#"  "exit_code": {},"#, exit_code);
+            println!(r#"  "duration_ms": {},"#, duration_ms);
+            println!(r#"  "session_id": "{}","#, session_id);
+            println!(r#"  "stdout_bytes": {},"#, stdout_size);
+            println!(r#"  "stderr_bytes": {},"#, stderr_size);
+            println!(r#"  "event_count": {}"#, event_count);
+            println!(r#"}}"#);
+        }
+        _ => {
+            // Table format
+            println!("Invocation Details");
+            println!("==================");
+            println!();
+            println!("ID:          {}", id);
+            println!("Timestamp:   {}", timestamp);
+            println!("Command:     {}", cmd);
+            println!("Working Dir: {}", cwd);
+            println!("Exit Code:   {}", exit_code);
+            println!("Duration:    {}ms", duration_ms);
+            println!("Session:     {}", session_id);
+            println!();
+            println!("Output:");
+            println!("  stdout:    {} bytes", stdout_size);
+            println!("  stderr:    {} bytes", stderr_size);
+            println!("  events:    {}", event_count);
+        }
+    }
+
+    Ok(())
+}
+
+/// Re-run a previous command.
+pub fn rerun(query_str: &str, dry_run: bool, no_capture: bool) -> bird::Result<()> {
+    use std::io::Write;
+
+    let config = Config::load()?;
+    let store = Store::open(config)?;
+
+    // Parse query and resolve to invocation
+    let query = parse_query(query_str);
+    let invocation_id = resolve_query_to_invocation(&store, &query)?;
+
+    // Get full invocation details via SQL (need cmd and cwd)
+    let result = store.query(&format!(
+        "SELECT cmd, cwd FROM read_parquet('{}/**/invocations/*.parquet') WHERE id = '{}'",
+        store.config().bird_root.display(),
+        invocation_id
+    ))?;
+
+    if result.rows.is_empty() {
+        return Err(bird::Error::NotFound(format!("Invocation {} not found", invocation_id)));
+    }
+
+    let cmd = &result.rows[0][0];
+    let cwd = &result.rows[0][1];
+
+    if dry_run {
+        println!("Would run: {}", cmd);
+        println!("In directory: {}", cwd);
+        return Ok(());
+    }
+
+    // Print the command being re-run
+    eprintln!("\x1b[2m$ {}\x1b[0m", cmd);
+
+    if no_capture {
+        // Just execute without capturing
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+        let status = Command::new(&shell)
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(cwd)
+            .status()?;
+
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    } else {
+        // Use shq run to capture the command
+        let start = std::time::Instant::now();
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+        let output = Command::new(&shell)
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(cwd)
+            .output()?;
+        let duration_ms = start.elapsed().as_millis() as i64;
+
+        // Display output
+        if !output.stdout.is_empty() {
+            io::stdout().write_all(&output.stdout)?;
+        }
+        if !output.stderr.is_empty() {
+            io::stderr().write_all(&output.stderr)?;
+        }
+
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        // Save to BIRD
+        let store = Store::open(Config::load()?)?;
+        let sid = session_id();
+        let session = SessionRecord::new(
+            &sid,
+            &Config::load()?.client_id,
+            &invoker_name(),
+            invoker_pid(),
+            "shell",
+        );
+        store.ensure_session(&session)?;
+
+        let record = InvocationRecord::new(
+            &sid,
+            cmd,
+            cwd,
+            exit_code,
+            &Config::load()?.client_id,
+        )
+        .with_duration(duration_ms);
+
+        let inv_id = record.id;
+        let date = record.date();
+        store.write_invocation(&record)?;
+
+        let cmd_hint = record.executable.as_deref();
+        if !output.stdout.is_empty() {
+            store.store_output(inv_id, "stdout", &output.stdout, date, cmd_hint)?;
+        }
+        if !output.stderr.is_empty() {
+            store.store_output(inv_id, "stderr", &output.stderr, date, cmd_hint)?;
+        }
+
+        if !output.status.success() {
+            std::process::exit(exit_code);
+        }
+    }
+
+    Ok(())
+}
+
+const QUICK_HELP: &str = r#"
+SHQ QUICK REFERENCE
+===================
+
+COMMANDS                                    EXAMPLES
+────────────────────────────────────────────────────────────────────────────────
+output (o, show)   Show captured output     shq o ~1          shq o %/make/~1
+invocations (i)    List command history     shq i ~20         shq i %exit<>0~10
+events (e)         Show parsed events       shq e ~10         shq e -s error ~5
+info (I)           Invocation details       shq I ~1          shq I %/test/~1
+rerun (R, !!)      Re-run a command         shq R ~1          shq R %/make/~1
+run (r)            Run and capture          shq r cargo test  shq r -c "make all"
+sql (q)            Execute SQL query        shq q "SELECT * FROM invocations LIMIT 5"
+
+QUERY SYNTAX: [source][path][filters][range]
+────────────────────────────────────────────────────────────────────────────────
+RANGE         1 or ~1     Last command
+              5 or ~5     Last 5 commands
+              ~10:5       Commands 10 to 5 ago
+
+SOURCE        shell:      Shell commands on this host
+              shell:zsh:  Zsh shells only
+              *:*:*:*:    Everything everywhere
+
+PATH          .           Current directory
+              ~/Projects/ Home-relative
+              /tmp/       Absolute path
+
+FILTERS       %exit<>0    Non-zero exit code
+              %exit=0     Successful commands only
+              %duration>5000   Took > 5 seconds
+              %cmd~=test  Command matches regex
+              %cwd~=/src/ Working dir matches
+
+CMD REGEX     %/make/     Commands containing "make"
+              %/^cargo/   Commands starting with "cargo"
+              %/test$/    Commands ending with "test"
+
+OPERATORS     =  equals      <>  not equals     ~=  regex match
+              >  greater     <   less           >=  gte    <=  lte
+
+EXAMPLES
+────────────────────────────────────────────────────────────────────────────────
+shq o                        Show output of last command (default: 1)
+shq o 1                      Same as above
+shq o -E 1                   Show only stderr of last command
+shq o %/make/~1              Output of last make command
+shq o %exit<>0~1             Output of last failed command
+
+shq i                        Last 20 commands (default)
+shq i 50                     Last 50 commands
+shq i %exit<>0~20            Last 20 failed commands
+shq i %duration>10000~10     Last 10 commands that took >10s
+shq i %/cargo/~10            Last 10 cargo commands
+
+shq e                        Events from last 10 commands (default)
+shq e 5                      Events from last 5 commands
+shq e -s error 10            Only errors from last 10 commands
+shq e %/cargo build/~1       Events from last cargo build
+
+shq R                        Re-run last command
+shq R 3                      Re-run 3rd-last command
+shq R %/make test/~1         Re-run last "make test"
+shq R -n %/deploy/~1         Dry-run: show what would run
+
+shq I                        Details about last command
+shq I -f json 1              Details as JSON
+
+.~5                          Last 5 commands in current directory
+~/Projects/foo/~10           Last 10 in ~/Projects/foo/
+shell:%exit<>0~5             Last 5 failed shell commands
+
+"#;
 
 const ZSH_HOOK: &str = r#"# shq shell integration for zsh
 # Add to ~/.zshrc: eval "$(shq hook init)"

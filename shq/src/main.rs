@@ -19,6 +19,7 @@ enum Commands {
     Init,
 
     /// Run a command and capture it to BIRD
+    #[command(visible_alias = "r")]
     Run {
         /// Shell command string (passed to $SHELL -c)
         #[arg(short = 'c', long = "command")]
@@ -91,11 +92,12 @@ enum Commands {
         invoker_type: String,
     },
 
-    /// Show output from a previous command
-    Show {
-        /// Command ID or offset (negative for relative, e.g., -1 for last)
-        #[arg(default_value = "-1", allow_hyphen_values = true)]
-        selector: String,
+    /// Show captured output from invocation(s)
+    #[command(visible_aliases = ["o", "show"])]
+    Output {
+        /// Query selector (e.g., ~1, shell:%exit<>0~5, %/make/~1)
+        #[arg(default_value = "~1")]
+        query: String,
 
         /// Filter by stream: O/stdout, E/stderr, A/all (combined to stdout)
         /// Default (no flag) shows streams routed to their original fds
@@ -139,18 +141,56 @@ enum Commands {
         lines: Option<usize>,
     },
 
-    /// Show recent command history
-    History {
-        /// Number of commands to show
-        #[arg(short = 'n', default_value = "20")]
-        limit: usize,
+    /// List invocation history
+    #[command(visible_aliases = ["i", "history"])]
+    Invocations {
+        /// Query selector (e.g., ~20, shell:~10, %exit<>0~5)
+        #[arg(default_value = "~20")]
+        query: String,
+
+        /// Output format: table, json, oneline
+        #[arg(short = 'f', long = "format", default_value = "table")]
+        format: String,
+    },
+
+    /// Show detailed info about an invocation
+    #[command(visible_alias = "I")]
+    Info {
+        /// Query selector (e.g., ~1, %/make/~1)
+        #[arg(default_value = "~1")]
+        query: String,
+
+        /// Output format: table, json
+        #[arg(short = 'f', long = "format", default_value = "table")]
+        format: String,
+    },
+
+    /// Re-run a previous command
+    #[command(visible_aliases = ["R", "!!"])]
+    Rerun {
+        /// Query selector (e.g., ~1, ~3, %/make/~1)
+        #[arg(default_value = "~1")]
+        query: String,
+
+        /// Print command without executing
+        #[arg(short = 'n', long = "dry-run")]
+        dry_run: bool,
+
+        /// Don't capture the re-run (just execute)
+        #[arg(short = 'N', long = "no-capture")]
+        no_capture: bool,
     },
 
     /// Execute SQL query
+    #[command(visible_alias = "q")]
     Sql {
         /// SQL query to execute
         query: String,
     },
+
+    /// Quick reference for commands and query syntax
+    #[command(name = "quick-help", visible_alias = "?")]
+    QuickHelp,
 
     /// Show statistics
     Stats,
@@ -220,30 +260,15 @@ enum Commands {
     },
 
     /// Query parsed events (errors, warnings, test results) from invocation outputs
+    #[command(visible_alias = "e")]
     Events {
+        /// Query selector (e.g., ~10, %exit<>0~5, %/cargo/~10)
+        #[arg(default_value = "~10")]
+        query: String,
+
         /// Filter by severity (error, warning, info, note)
         #[arg(short = 's', long = "severity")]
         severity: Option<String>,
-
-        /// Filter by command pattern (glob, e.g., "*cargo*")
-        #[arg(short = 'c', long = "cmd")]
-        cmd_pattern: Option<String>,
-
-        /// Filter by client ID
-        #[arg(long = "client")]
-        client: Option<String>,
-
-        /// Filter by hostname
-        #[arg(long = "hostname")]
-        hostname: Option<String>,
-
-        /// Events from the last N invocations
-        #[arg(short = 'n', long = "last")]
-        last_n: Option<usize>,
-
-        /// Filter events by invocation ID
-        #[arg(short = 'i', long = "invocation")]
-        invocation_id: Option<String>,
 
         /// Show count only
         #[arg(long = "count")]
@@ -339,7 +364,7 @@ fn main() {
                 &invoker_type,
             )
         }
-        Commands::Show { selector, stream, stdout_only, stderr_only, all_combined, pager, raw: _, strip, head, tail, lines } => {
+        Commands::Output { query, stream, stdout_only, stderr_only, all_combined, pager, raw: _, strip, head, tail, lines } => {
             // Resolve stream from flags or -s value
             let resolved_stream = if stdout_only {
                 Some("stdout")
@@ -350,16 +375,19 @@ fn main() {
             } else {
                 stream.as_deref()
             };
-            let opts = commands::ShowOptions {
+            let opts = commands::OutputOptions {
                 pager,
                 strip_ansi: strip,
                 head: head.or(lines),
                 tail,
             };
-            commands::show(&selector, resolved_stream, &opts)
+            commands::output(&query, resolved_stream, &opts)
         }
-        Commands::History { limit } => commands::history(limit),
+        Commands::Invocations { query, format } => commands::invocations(&query, &format),
+        Commands::Info { query, format } => commands::info(&query, &format),
+        Commands::Rerun { query, dry_run, no_capture } => commands::rerun(&query, dry_run, no_capture),
         Commands::Sql { query } => commands::sql(&query),
+        Commands::QuickHelp => commands::quick_help(),
         Commands::Stats => commands::stats(),
         Commands::Archive { days, dry_run, extract_first } => commands::archive(days, dry_run, extract_first),
         Commands::Compact { file_threshold, recompact_threshold, consolidate, extract_first, session, today_only, quiet, recent_only, archive_only, dry_run } => {
@@ -368,19 +396,8 @@ fn main() {
         Commands::Hook { action } => match action {
             HookAction::Init { shell } => commands::hook_init(shell.as_deref()),
         },
-        Commands::Events { severity, cmd_pattern, client, hostname, last_n, invocation_id, count_only, limit, reparse, format } => {
-            commands::events(
-                severity.as_deref(),
-                cmd_pattern.as_deref(),
-                client.as_deref(),
-                hostname.as_deref(),
-                last_n,
-                invocation_id.as_deref(),
-                count_only,
-                limit,
-                reparse,
-                format.as_deref(),
-            )
+        Commands::Events { query, severity, count_only, limit, reparse, format } => {
+            commands::events(&query, severity.as_deref(), count_only, limit, reparse, format.as_deref())
         }
         Commands::ExtractEvents { selector, format, quiet, force, all, since, limit, dry_run } => {
             commands::extract_events(&selector, format.as_deref(), quiet, force, all, since.as_deref(), limit, dry_run)
