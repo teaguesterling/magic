@@ -11,9 +11,10 @@ MAGIC = **BIRD** + **shq**
 │                          Your Shell                              │
 │                                                                  │
 │  $ make test                                                     │
-│  $ shq show              # show output from last command         │
-│  $ shq history           # browse command history                │
-│  $ shq sql "SELECT * FROM invocations WHERE exit_code != 0"      │
+│  $ shq o                 # show output from last command         │
+│  $ shq i                 # browse command history                │
+│  $ shq R %/make/~1       # re-run last make command              │
+│  $ shq q "SELECT * FROM invocations WHERE exit_code != 0"        │
 └──────────────────────────────────────────────────────────────────┘
                             │
                             ▼
@@ -21,8 +22,8 @@ MAGIC = **BIRD** + **shq**
 │                     shq (Shell Query)                            │
 │                                                                  │
 │  • Captures commands automatically via shell hooks               │
-│  • Provides CLI for querying: shq show, shq history, shq sql     │
-│  • Manages data lifecycle: shq archive, shq compact              │
+│  • Query with micro-language: shq o %exit<>0~5                   │
+│  • Re-run commands: shq R, manage data: shq archive/compact      │
 └──────────────────────────────────────────────────────────────────┘
                             │
                             ▼

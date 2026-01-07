@@ -90,61 +90,67 @@ ls -la
 make --version
 
 # Check that they were captured
-shq history
+shq i              # or: shq invocations
 
 # View output from last command
-shq show
+shq o              # or: shq output
 ```
+
+## Quick Reference
+
+Run `shq ?` for a quick reference card showing all commands and query syntax.
 
 ## Basic Usage
 
 ### View Command History
 
 ```bash
-# Show last 20 commands (default)
-shq history
-
-# Show last 50 commands
-shq history -n 50
+shq i              # Last 20 commands (default)
+shq i 50           # Last 50 commands
+shq i %exit<>0~10  # Last 10 failed commands
+shq i %/cargo/~20  # Last 20 cargo commands
 ```
 
 ### View Command Output
 
 ```bash
-# Show output from last command
-shq show
+shq o              # Output from last command
+shq o 3            # Output from 3rd-last command
+shq o -E 1         # Only stderr
+shq o -A 1         # Both streams combined
+shq o %/make/~1    # Output of last make command
+```
 
-# Show only stdout
-shq show -O
+### Show Invocation Details
 
-# Show only stderr
-shq show -E
+```bash
+shq I              # Details about last command (alias: info)
+shq I 3            # Details about 3rd-last command
+shq I -f json 1    # As JSON
+```
 
-# Show both combined to stdout
-shq show -A
+### Re-run Previous Commands
+
+```bash
+shq R              # Re-run last command (alias: rerun)
+shq R 3            # Re-run 3rd-last command
+shq R %/make/~1    # Re-run last make command
+shq R -n %/test/~1 # Dry-run: show what would run
 ```
 
 ### Run with Capture
 
 ```bash
-# Run a command and capture it
-shq run make test
-
-# Run a shell command
-shq run -c "echo hello && echo world"
+shq r make test           # Run and capture (alias: run)
+shq r -c "echo hello"     # Run shell command
 ```
 
 ### SQL Queries
 
 ```bash
-# Direct SQL access
-shq sql "SELECT cmd, exit_code FROM invocations LIMIT 10"
-
-# Find failed commands
-shq sql "SELECT * FROM failed_invocations LIMIT 5"
-
-# Today's commands
-shq sql "SELECT * FROM invocations_today"
+shq q "SELECT cmd, exit_code FROM invocations LIMIT 10"
+shq q "SELECT * FROM failed_invocations LIMIT 5"
+shq q "SELECT * FROM invocations_today"
 ```
 
 ### Statistics
