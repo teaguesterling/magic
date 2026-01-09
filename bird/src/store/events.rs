@@ -82,50 +82,56 @@ impl FormatConfig {
     }
 }
 
-/// Simple glob-like pattern matching for command strings.
-/// Supports `*` as wildcard matching any characters.
+/// Convert a glob pattern to SQL LIKE pattern.
+/// `*` becomes `%`, `?` becomes `_`, and special chars are escaped.
+fn glob_to_like(pattern: &str) -> String {
+    let mut result = String::with_capacity(pattern.len() + 10);
+    for c in pattern.chars() {
+        match c {
+            '*' => result.push('%'),
+            '?' => result.push('_'),
+            '%' => result.push_str("\\%"),
+            '_' => result.push_str("\\_"),
+            '\\' => result.push_str("\\\\"),
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
+/// Simple glob pattern matching for in-memory FormatConfig.
+/// Used by FormatConfig::detect_format() when no database is available.
 fn pattern_matches(pattern: &str, text: &str) -> bool {
-    // Split pattern by * and check if all parts appear in order
+    // Convert glob to regex-like matching
     let parts: Vec<&str> = pattern.split('*').collect();
 
-    if parts.is_empty() {
-        return true;
-    }
-
-    // Handle edge cases
     if parts.len() == 1 {
-        // No wildcards - exact match
         return pattern == text;
     }
 
     let mut pos = 0;
 
     // First part must match at start (if not empty)
-    if !parts[0].is_empty() {
-        if !text.starts_with(parts[0]) {
-            return false;
-        }
-        pos = parts[0].len();
+    if !parts[0].is_empty() && !text.starts_with(parts[0]) {
+        return false;
     }
+    pos = parts[0].len();
 
     // Middle parts must appear in order
     for part in &parts[1..parts.len() - 1] {
         if part.is_empty() {
             continue;
         }
-        if let Some(found) = text[pos..].find(part) {
-            pos += found + part.len();
-        } else {
-            return false;
+        match text[pos..].find(part) {
+            Some(found) => pos += found + part.len(),
+            None => return false,
         }
     }
 
     // Last part must match at end (if not empty)
     let last = parts[parts.len() - 1];
-    if !last.is_empty() {
-        if !text[pos..].ends_with(last) {
-            return false;
-        }
+    if !last.is_empty() && !text[pos..].ends_with(last) {
+        return false;
     }
 
     true
@@ -174,10 +180,54 @@ impl Store {
         FormatConfig::load(&self.config.event_formats_path())
     }
 
-    /// Detect format for a command using the config rules.
+    /// Detect format for a command using DuckDB SQL matching.
+    ///
+    /// Uses SQL LIKE patterns for matching, which prepares for future
+    /// integration with duck_hunt_match_command_patterns().
     pub fn detect_format(&self, cmd: &str) -> Result<String> {
         let config = self.load_format_config()?;
-        Ok(config.detect_format(cmd))
+
+        // If no rules, fall back to default
+        if config.rules.is_empty() {
+            return Ok(config
+                .default
+                .as_ref()
+                .map(|d| d.format.clone())
+                .unwrap_or_else(|| "auto".to_string()));
+        }
+
+        let conn = self.connection()?;
+
+        // Create temp table with rules (convert glob to LIKE patterns)
+        conn.execute_batch("CREATE OR REPLACE TEMP TABLE format_rules (priority INT, pattern VARCHAR, format VARCHAR)")?;
+
+        {
+            let mut stmt = conn.prepare("INSERT INTO format_rules VALUES (?, ?, ?)")?;
+            for (i, rule) in config.rules.iter().enumerate() {
+                let like_pattern = glob_to_like(&rule.pattern);
+                stmt.execute(params![i as i32, like_pattern, rule.format.clone()])?;
+            }
+        }
+
+        // Query for matching format using SQL LIKE
+        // This can be easily swapped with duck_hunt_match_command_patterns() later
+        let result: std::result::Result<String, _> = conn.query_row(
+            "SELECT format FROM format_rules WHERE ? LIKE pattern ORDER BY priority LIMIT 1",
+            params![cmd],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(format) => Ok(format),
+            Err(_) => {
+                // No match - fall back to default
+                Ok(config
+                    .default
+                    .as_ref()
+                    .map(|d| d.format.clone())
+                    .unwrap_or_else(|| "auto".to_string()))
+            }
+        }
     }
 
     /// Extract events from an invocation's output using duck_hunt.
@@ -797,6 +847,63 @@ mod tests {
         assert_eq!(config.detect_format("/usr/bin/gcc main.c"), "gcc");
         assert_eq!(config.detect_format("cargo test --release"), "cargo_test_json");
         assert_eq!(config.detect_format("make test"), "auto");
+    }
+
+    #[test]
+    fn test_glob_to_like() {
+        use super::glob_to_like;
+
+        // Basic wildcards
+        assert_eq!(glob_to_like("*"), "%");
+        assert_eq!(glob_to_like("?"), "_");
+        assert_eq!(glob_to_like("*gcc*"), "%gcc%");
+        assert_eq!(glob_to_like("cargo test*"), "cargo test%");
+        assert_eq!(glob_to_like("*cargo test*"), "%cargo test%");
+
+        // Escape special LIKE chars
+        assert_eq!(glob_to_like("100%"), "100\\%");
+        assert_eq!(glob_to_like("file_name"), "file\\_name");
+
+        // Mixed
+        assert_eq!(glob_to_like("*test?file*"), "%test_file%");
+    }
+
+    #[test]
+    fn test_store_detect_format_sql() {
+        let (tmp, store) = setup_store();
+
+        // Write a config file with rules
+        let config_path = tmp.path().join("event-formats.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[rules]]
+pattern = "*gcc*"
+format = "gcc"
+
+[[rules]]
+pattern = "*cargo test*"
+format = "cargo_test_json"
+
+[[rules]]
+pattern = "pytest*"
+format = "pytest_json"
+
+[default]
+format = "auto"
+"#,
+        )
+        .unwrap();
+
+        // Test SQL-based detection
+        assert_eq!(store.detect_format("gcc -o foo foo.c").unwrap(), "gcc");
+        assert_eq!(store.detect_format("/usr/bin/gcc main.c").unwrap(), "gcc");
+        assert_eq!(
+            store.detect_format("cargo test --release").unwrap(),
+            "cargo_test_json"
+        );
+        assert_eq!(store.detect_format("pytest tests/").unwrap(), "pytest_json");
+        assert_eq!(store.detect_format("make test").unwrap(), "auto");
     }
 
     #[test]
