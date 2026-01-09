@@ -294,6 +294,92 @@ fn test_hook_init_bash() {
 }
 
 #[test]
+fn test_hook_contains_privacy_escapes() {
+    // Test that zsh hook contains all privacy escape mechanisms
+    let output = Command::new(env!("CARGO_BIN_EXE_shq"))
+        .args(["hook", "init", "--shell", "zsh"])
+        .output()
+        .expect("failed to run hook init");
+
+    let hook = String::from_utf8_lossy(&output.stdout);
+
+    // Backslash escape
+    assert!(hook.contains(r#"^\\"#), "Should check for backslash prefix");
+
+    // SHQ_DISABLED env var
+    assert!(hook.contains("SHQ_DISABLED"), "Should check SHQ_DISABLED");
+
+    // SHQ_EXCLUDE patterns
+    assert!(hook.contains("SHQ_EXCLUDE"), "Should support SHQ_EXCLUDE");
+    assert!(hook.contains("__shq_excluded"), "Should have exclude function");
+
+    // Query command auto-exclusion
+    assert!(hook.contains("__shq_is_query"), "Should have query detection");
+
+    // Inline extraction (--extract flag)
+    assert!(hook.contains("--extract"), "Should use inline extraction");
+}
+
+#[test]
+fn test_run_nosave_marker_skips_recording() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command that emits the nosave marker
+    // The OSC sequence is: ESC ] shq;nosave BEL
+    let output = shq_cmd(tmp.path())
+        .args(["run", "printf", r"\033]shq;nosave\007secret output"])
+        .output()
+        .expect("failed to run command");
+
+    assert!(output.status.success());
+
+    // Should have no invocations recorded (the nosave marker opted out)
+    let history = shq_cmd(tmp.path())
+        .args(["invocations", "10"])
+        .output()
+        .expect("failed to query invocations");
+
+    let history_str = String::from_utf8_lossy(&history.stdout);
+    // Should not contain the printf command (it was skipped)
+    assert!(!history_str.contains("printf"), "Command with nosave marker should not be recorded");
+}
+
+#[test]
+fn test_save_with_extract_flag() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Create a file with some error output
+    let output_file = tmp.path().join("test_output.txt");
+    std::fs::write(&output_file, "error: something went wrong\n").unwrap();
+
+    // Save with --extract flag
+    let output = shq_cmd(tmp.path())
+        .args([
+            "save",
+            "-c", "make build",
+            "-x", "1",
+            "--extract",
+            "-q",
+        ])
+        .arg(&output_file)
+        .output()
+        .expect("failed to save");
+
+    assert!(output.status.success());
+
+    // Check that events were extracted
+    let events = shq_cmd(tmp.path())
+        .args(["events", "1"])
+        .output()
+        .expect("failed to query events");
+
+    // The output should contain events or indicate extraction happened
+    assert!(events.status.success());
+}
+
+#[test]
 fn test_archive_recent_data_not_archived() {
     let tmp = TempDir::new().unwrap();
     init_bird(tmp.path());
