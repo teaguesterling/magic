@@ -41,21 +41,11 @@ impl Store {
     pub fn connection(&self) -> Result<Connection> {
         let conn = Connection::open(&self.config.db_path())?;
 
-        // Disable autoinstall to avoid network requests
-        conn.execute("SET autoinstall_known_extensions = false", [])?;
-
-        // Load bundled extensions (parquet, icu are bundled in DuckDB 1.0+)
+        // Load bundled extensions
         conn.execute("LOAD parquet", [])?;
         conn.execute("LOAD icu", [])?;
 
-        // Set custom extensions directory and load scalarfs
-        conn.execute(
-            &format!(
-                "SET extension_directory = '{}'",
-                self.config.extensions_dir().display()
-            ),
-            [],
-        )?;
+        // Load community extensions (uses ~/.duckdb/extensions cache)
         conn.execute("SET allow_community_extensions = true", [])?;
         conn.execute("LOAD scalarfs", [])?;
         conn.execute("LOAD duck_hunt", [])?;

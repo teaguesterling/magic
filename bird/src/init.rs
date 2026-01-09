@@ -56,8 +56,12 @@ fn create_directories(config: &Config) -> Result<()> {
 fn init_database(config: &Config) -> Result<()> {
     let conn = duckdb::Connection::open(&config.db_path())?;
 
-    // Set up custom extensions directory and install scalarfs
-    install_extensions(&conn, config)?;
+    // Load bundled extensions
+    conn.execute("LOAD parquet", [])?;
+    conn.execute("LOAD icu", [])?;
+
+    // Verify community extensions can be loaded (downloads to ~/.duckdb cache if needed)
+    verify_extensions(&conn)?;
 
     // Create seed parquet files with correct schema but no rows
     // This ensures the glob pattern always matches at least one file
@@ -175,39 +179,22 @@ fn init_database(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Install required DuckDB extensions.
-fn install_extensions(conn: &duckdb::Connection, config: &Config) -> Result<()> {
-    // Disable autoinstall to avoid network requests
-    conn.execute("SET autoinstall_known_extensions = false", [])?;
-
-    // Load bundled extensions (parquet, icu are bundled in DuckDB 1.0+)
-    conn.execute("LOAD parquet", [])?;
-    conn.execute("LOAD icu", [])?;
-
-    // Set custom extensions directory
-    conn.execute(
-        &format!(
-            "SET extension_directory = '{}'",
-            config.extensions_dir().display()
-        ),
-        [],
-    )?;
-
-    // Allow community extensions
+/// Verify extensions can be loaded (post-init sanity check).
+/// Does NOT install - just verifies the setup is correct.
+fn verify_extensions(conn: &duckdb::Connection) -> Result<()> {
     conn.execute("SET allow_community_extensions = true", [])?;
 
-    // Install scalarfs from community repository for data: URL support
-    // This provides read_blob() support for data: URIs
-    conn.execute("INSTALL scalarfs FROM community", [])?;
-    conn.execute("LOAD scalarfs", [])?;
-
-    // Install duck_hunt from community repository for log parsing
-    // This provides read_duck_hunt_log() for parsing build/test output
-    conn.execute("INSTALL duck_hunt FROM community", [])?;
-    conn.execute("LOAD duck_hunt", [])?;
-
+    // Try to load extensions - they should be in ~/.duckdb cache or already installed
+    for name in &["scalarfs", "duck_hunt"] {
+        if conn.execute(&format!("LOAD {}", name), []).is_err() {
+            // Not cached - install from community (one-time download)
+            conn.execute(&format!("INSTALL {} FROM community", name), [])?;
+            conn.execute(&format!("LOAD {}", name), [])?;
+        }
+    }
     Ok(())
 }
+
 
 /// Create the blob_registry table for tracking deduplicated blobs.
 fn create_blob_registry(conn: &duckdb::Connection) -> Result<()> {

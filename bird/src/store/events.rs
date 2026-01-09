@@ -219,35 +219,29 @@ impl Store {
             return Ok(0);
         }
 
-        // Collect content from all outputs
+        // Collect content from all outputs using DuckDB's read_blob (handles both data: and file:// URLs)
         let mut all_content = String::new();
-        for (storage_type, storage_ref) in &outputs {
-            let content = match storage_type.as_str() {
-                "inline" => {
-                    // Decode base64 from data: URL
-                    if let Some(b64_part) = storage_ref.split(',').nth(1) {
-                        use base64::Engine;
-                        base64::engine::general_purpose::STANDARD
-                            .decode(b64_part)
-                            .ok()
-                            .and_then(|bytes| String::from_utf8(bytes).ok())
-                    } else {
-                        None
-                    }
-                }
-                "blob" => {
-                    // Read from file
-                    if let Some(rel_path) = storage_ref.strip_prefix("file://") {
-                        let abs_path = self.config.data_dir().join(rel_path);
-                        std::fs::read_to_string(&abs_path).ok()
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
+        for (_storage_type, storage_ref) in &outputs {
+            // Resolve relative file:// URLs to absolute paths
+            let resolved_ref = if storage_ref.starts_with("file://") {
+                let rel_path = storage_ref.strip_prefix("file://").unwrap();
+                let abs_path = self.config.data_dir().join(rel_path);
+                format!("file://{}", abs_path.display())
+            } else {
+                storage_ref.clone()
             };
-            if let Some(c) = content {
-                all_content.push_str(&c);
+
+            // Use scalarfs read_blob for unified content access
+            let content: std::result::Result<Vec<u8>, _> = conn.query_row(
+                "SELECT content FROM read_blob(?)",
+                params![&resolved_ref],
+                |row| row.get(0),
+            );
+
+            if let Ok(bytes) = content {
+                if let Ok(text) = String::from_utf8(bytes) {
+                    all_content.push_str(&text);
+                }
             }
         }
 

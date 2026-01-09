@@ -90,6 +90,18 @@ enum Commands {
         /// Invoker type (default: shell)
         #[arg(long = "invoker-type", default_value = "shell")]
         invoker_type: String,
+
+        /// Extract events after saving (uses config default if not specified)
+        #[arg(long = "extract")]
+        extract: bool,
+
+        /// Run compaction check after saving
+        #[arg(long = "compact")]
+        compact: bool,
+
+        /// Suppress informational output
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
     },
 
     /// Show captured output from invocation(s)
@@ -274,9 +286,9 @@ enum Commands {
         #[arg(long = "count")]
         count_only: bool,
 
-        /// Maximum number of events to show
-        #[arg(short = 'l', long = "limit", default_value = "50")]
-        limit: usize,
+        /// Number of events: N (any), +N (first N), -N (last N)
+        #[arg(short = 'n', long = "lines", default_value = "50", allow_hyphen_values = true)]
+        lines: String,
 
         /// Re-parse events from original blobs (ignore cached events)
         #[arg(long = "reparse")]
@@ -285,6 +297,13 @@ enum Commands {
         /// Override format detection (e.g., gcc, pytest, cargo)
         #[arg(short = 'f', long = "format")]
         format: Option<String>,
+    },
+
+    /// Update DuckDB extensions to latest versions
+    UpdateExtensions {
+        /// Show what would be done without making changes
+        #[arg(short = 'n', long = "dry-run")]
+        dry_run: bool,
     },
 
     /// Extract events from an invocation's output
@@ -333,6 +352,19 @@ enum HookAction {
     },
 }
 
+/// Parse lines argument: N (any), +N (first N), -N (last N).
+fn parse_lines_arg(s: &str) -> (usize, commands::LimitOrder) {
+    use commands::LimitOrder;
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('+') {
+        (rest.parse().unwrap_or(50), LimitOrder::First)
+    } else if let Some(rest) = s.strip_prefix('-') {
+        (rest.parse().unwrap_or(50), LimitOrder::Last)
+    } else {
+        (s.parse().unwrap_or(50), LimitOrder::Any)
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -349,7 +381,7 @@ fn main() {
             };
             commands::run(shell_cmd.as_deref(), &cmd, extract_override, format.as_deref(), compact)
         }
-        Commands::Save { file, command, exit_code, duration_ms, stream, stdout_file, stderr_file, session_id, invoker_pid, invoker, invoker_type } => {
+        Commands::Save { file, command, exit_code, duration_ms, stream, stdout_file, stderr_file, session_id, invoker_pid, invoker, invoker_type, extract, compact, quiet } => {
             commands::save(
                 file.as_deref(),
                 &command,
@@ -362,6 +394,9 @@ fn main() {
                 invoker_pid,
                 invoker.as_deref(),
                 &invoker_type,
+                extract,
+                compact,
+                quiet,
             )
         }
         Commands::Output { query, stream, stdout_only, stderr_only, all_combined, pager, raw: _, strip, head, tail, lines } => {
@@ -396,9 +431,12 @@ fn main() {
         Commands::Hook { action } => match action {
             HookAction::Init { shell } => commands::hook_init(shell.as_deref()),
         },
-        Commands::Events { query, severity, count_only, limit, reparse, format } => {
-            commands::events(&query, severity.as_deref(), count_only, limit, reparse, format.as_deref())
+        Commands::Events { query, severity, count_only, lines, reparse, format } => {
+            // Parse lines: N (any), +N (first N), -N (last N)
+            let (limit, order) = parse_lines_arg(&lines);
+            commands::events(&query, severity.as_deref(), count_only, limit, order, reparse, format.as_deref())
         }
+        Commands::UpdateExtensions { dry_run } => commands::update_extensions(dry_run),
         Commands::ExtractEvents { selector, format, quiet, force, all, since, limit, dry_run } => {
             commands::extract_events(&selector, format.as_deref(), quiet, force, all, since.as_deref(), limit, dry_run)
         }

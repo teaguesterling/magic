@@ -6,6 +6,7 @@ use tempfile::TempDir;
 fn shq_cmd(bird_root: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_shq"));
     cmd.env("BIRD_ROOT", bird_root);
+    // Extensions use DuckDB's default cache (~/.duckdb/extensions)
     cmd
 }
 
@@ -757,7 +758,7 @@ fn test_show_no_output_found() {
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("No invocation found") || stderr.contains("No output found"),
+        stderr.contains("No matching invocation found") || stderr.contains("No output found"),
         "Should indicate no output: {}", stderr
     );
 }
@@ -913,9 +914,9 @@ fn test_events_with_last_n_filter() {
             .expect("failed to run");
     }
 
-    // Query events from last 1 invocation
+    // Query events from last 1 invocation (use query selector, -n is for event limit)
     let output = shq_cmd(tmp.path())
-        .args(["events", "-n", "1"])
+        .args(["events", "1"])
         .output()
         .expect("failed to query events");
 
@@ -933,9 +934,49 @@ fn test_events_with_limit() {
         .output()
         .expect("failed to run");
 
-    // Query events with limit
+    // Query events with limit (any N)
     let output = shq_cmd(tmp.path())
-        .args(["events", "-l", "10"])
+        .args(["events", "-n", "10"])
+        .output()
+        .expect("failed to query events");
+
+    assert!(output.status.success());
+}
+
+#[test]
+fn test_events_with_head_limit() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "test"])
+        .output()
+        .expect("failed to run");
+
+    // Query events with head limit (+N = first N)
+    let output = shq_cmd(tmp.path())
+        .args(["events", "-n", "+5"])
+        .output()
+        .expect("failed to query events");
+
+    assert!(output.status.success());
+}
+
+#[test]
+fn test_events_with_tail_limit() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "test"])
+        .output()
+        .expect("failed to run");
+
+    // Query events with tail limit (-N = last N)
+    let output = shq_cmd(tmp.path())
+        .args(["events", "-n", "-5"])
         .output()
         .expect("failed to query events");
 

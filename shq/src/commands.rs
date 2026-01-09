@@ -30,6 +30,18 @@ fn invoker_pid() -> u32 {
     std::os::unix::process::parent_id()
 }
 
+/// OSC escape sequence that commands can emit to opt out of recording.
+/// Format: ESC ] shq;nosave BEL  (or ESC ] shq;nosave ESC \)
+const NOSAVE_OSC: &[u8] = b"\x1b]shq;nosave\x07";
+const NOSAVE_OSC_ST: &[u8] = b"\x1b]shq;nosave\x1b\\";
+
+/// Check if output contains the nosave marker.
+/// Commands can emit this OSC escape sequence to opt out of being recorded.
+fn contains_nosave_marker(data: &[u8]) -> bool {
+    data.windows(NOSAVE_OSC.len()).any(|w| w == NOSAVE_OSC)
+        || data.windows(NOSAVE_OSC_ST.len()).any(|w| w == NOSAVE_OSC_ST)
+}
+
 /// Run a command and capture it to BIRD.
 ///
 /// `extract_override`: Some(true) forces extraction, Some(false) disables it, None uses config.
@@ -87,6 +99,23 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract_override: Optio
     }
     if !stderr.is_empty() {
         io::stderr().write_all(&stderr)?;
+    }
+
+    // Check for nosave marker - command opted out of recording
+    if contains_nosave_marker(&stdout) || contains_nosave_marker(&stderr) {
+        // Exit with appropriate code but don't save
+        match output {
+            Ok(o) => {
+                if !o.status.success() {
+                    std::process::exit(exit_code);
+                }
+            }
+            Err(e) => {
+                eprintln!("shq: failed to execute command: {}", e);
+                std::process::exit(127);
+            }
+        }
+        return Ok(());
     }
 
     // Ensure session exists (creates on first invocation from this shell)
@@ -175,7 +204,38 @@ pub fn save(
     explicit_invoker_pid: Option<u32>,
     explicit_invoker: Option<&str>,
     explicit_invoker_type: &str,
+    extract: bool,
+    compact: bool,
+    quiet: bool,
 ) -> bird::Result<()> {
+    use std::process::Command;
+
+    // Read content first so we can check for nosave marker
+    let (stdout_content, stderr_content, single_content) = if stdout_file.is_some() || stderr_file.is_some() {
+        let stdout = stdout_file.map(std::fs::read).transpose()?;
+        let stderr = stderr_file.map(std::fs::read).transpose()?;
+        (stdout, stderr, None)
+    } else {
+        let content = match file {
+            Some(path) => std::fs::read(path)?,
+            None => {
+                let mut buf = Vec::new();
+                io::stdin().read_to_end(&mut buf)?;
+                buf
+            }
+        };
+        (None, None, Some(content))
+    };
+
+    // Check for nosave marker - command opted out of recording
+    let has_nosave = stdout_content.as_ref().map_or(false, |c| contains_nosave_marker(c))
+        || stderr_content.as_ref().map_or(false, |c| contains_nosave_marker(c))
+        || single_content.as_ref().map_or(false, |c| contains_nosave_marker(c));
+
+    if has_nosave {
+        return Ok(());
+    }
+
     let config = Config::load()?;
     let store = Store::open(config.clone())?;
 
@@ -221,27 +281,35 @@ pub fn save(
 
     let cmd_hint = inv_record.executable.as_deref();
 
-    // Handle --stdout/--stderr mode (separate files for each stream)
-    if stdout_file.is_some() || stderr_file.is_some() {
-        if let Some(path) = stdout_file {
-            let content = std::fs::read(path)?;
-            store.store_output(inv_id, "stdout", &content, date, cmd_hint)?;
-        }
-        if let Some(path) = stderr_file {
-            let content = std::fs::read(path)?;
-            store.store_output(inv_id, "stderr", &content, date, cmd_hint)?;
-        }
-    } else {
-        // Single stream mode: read from file or stdin
-        let content = match file {
-            Some(path) => std::fs::read(path)?,
-            None => {
-                let mut buf = Vec::new();
-                io::stdin().read_to_end(&mut buf)?;
-                buf
-            }
-        };
+    // Store output content
+    if let Some(content) = stdout_content {
+        store.store_output(inv_id, "stdout", &content, date, cmd_hint)?;
+    }
+    if let Some(content) = stderr_content {
+        store.store_output(inv_id, "stderr", &content, date, cmd_hint)?;
+    }
+    if let Some(content) = single_content {
         store.store_output(inv_id, stream, &content, date, cmd_hint)?;
+    }
+
+    // Extract events if requested (uses config default or explicit flag)
+    let should_extract = extract || config.auto_extract;
+    if should_extract {
+        let count = store.extract_events(&inv_id.to_string(), None)?;
+        if !quiet && count > 0 {
+            eprintln!("shq: extracted {} events", count);
+        }
+    }
+
+    // Spawn background compaction if requested
+    if compact {
+        let session_id = sid.clone();
+        let _ = Command::new(std::env::current_exe().unwrap_or_else(|_| "shq".into()))
+            .args(["compact", "-s", &session_id, "--today", "-q"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
 
     Ok(())
@@ -277,7 +345,14 @@ pub fn output(query_str: &str, stream_filter: Option<&str>, opts: &OutputOptions
     };
 
     // Resolve invocation(s) from query
-    let invocation_id = resolve_query_to_invocation(&store, &query)?;
+    let invocation_id = match resolve_query_to_invocation(&store, &query) {
+        Ok(id) => id,
+        Err(bird::Error::NotFound(_)) => {
+            eprintln!("No matching invocation found");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     // Get outputs for the invocation (optionally filtered by stream)
     let outputs = store.get_outputs(&invocation_id, db_filter)?;
@@ -422,6 +497,47 @@ pub fn init() -> bird::Result<()> {
     init::initialize(&config)?;
     println!("BIRD initialized at {}", config.bird_root.display());
     println!("Client ID: {}", config.client_id);
+
+    Ok(())
+}
+
+/// Update DuckDB extensions to latest versions.
+pub fn update_extensions(dry_run: bool) -> bird::Result<()> {
+    let config = Config::load()?;
+    let store = Store::open(config)?;
+
+    let extensions = [
+        ("scalarfs", "data: URL support for inline blobs"),
+        ("duck_hunt", "log/output parsing for event extraction"),
+    ];
+
+    if dry_run {
+        println!("Would update the following extensions:");
+        for (name, desc) in &extensions {
+            println!("  {} - {}", name, desc);
+        }
+        return Ok(());
+    }
+
+    println!("Updating DuckDB extensions...\n");
+
+    for (name, desc) in &extensions {
+        print!("  {} ({})... ", name, desc);
+        match store.query(&format!("FORCE INSTALL {} FROM community", name)) {
+            Ok(_) => {
+                // Reload the extension
+                match store.query(&format!("LOAD {}", name)) {
+                    Ok(_) => println!("updated"),
+                    Err(e) => println!("installed but failed to load: {}", e),
+                }
+            }
+            Err(e) => println!("failed: {}", e),
+        }
+    }
+
+    println!("\nExtensions updated. New features available:");
+    println!("  - duck_hunt: compression support (.gz/.zst), duck_hunt_detect_format(),");
+    println!("               duck_hunt_diagnose_read(), severity_threshold parameter");
 
     Ok(())
 }
@@ -793,12 +909,21 @@ pub fn hook_init(shell: Option<&str>) -> bird::Result<()> {
     Ok(())
 }
 
+/// Order for limiting results.
+#[derive(Clone, Copy, Debug)]
+pub enum LimitOrder {
+    Any,   // Just limit, no specific order
+    First, // First N (head)
+    Last,  // Last N (tail)
+}
+
 /// Query parsed events from invocation outputs.
 pub fn events(
     query_str: &str,
     severity: Option<&str>,
     count_only: bool,
     limit: usize,
+    order: LimitOrder,
     reparse: bool,
     format: Option<&str>,
 ) -> bird::Result<()> {
@@ -844,8 +969,10 @@ pub fn events(
         severity: severity.map(|s| s.to_string()),
         invocation_ids: Some(inv_ids),
         limit: Some(limit),
+        // TODO: Add order support to EventFilters when needed
         ..Default::default()
     };
+    let _ = order; // Will be used when EventFilters supports ordering
 
     // Count only mode
     if count_only {
@@ -1358,9 +1485,39 @@ shell:%exit<>0~5             Last 5 failed shell commands
 
 const ZSH_HOOK: &str = r#"# shq shell integration for zsh
 # Add to ~/.zshrc: eval "$(shq hook init)"
+#
+# Privacy escapes (command not recorded):
+#   - Start command with a space: " ls -la"
+#   - Start command with backslash: "\ls -la"
+#
+# Temporary disable: export SHQ_DISABLED=1
+# Exclude patterns: export SHQ_EXCLUDE="*password*:*secret*"
 
 # Session ID based on this shell's PID (stable across commands)
 __shq_session_id="zsh-$$"
+
+# Check if command matches any exclude pattern
+__shq_excluded() {
+    [[ -z "$SHQ_EXCLUDE" ]] && return 1
+    local cmd="$1"
+    local IFS=':'
+    for pattern in $SHQ_EXCLUDE; do
+        [[ "$cmd" == $~pattern ]] && return 0
+    done
+    return 1
+}
+
+# Check if command is a shq/blq query (read-only) command - don't record these
+__shq_is_query() {
+    local cmd="$1"
+    # Skip shq query commands (output, show, invocations, history, info, events, stats, sql, quick-help)
+    [[ "$cmd" =~ ^shq[[:space:]]+(output|show|o|invocations|history|i|info|I|events|e|stats|sql|q|quick-help|\?)[[:space:]]*  ]] && return 0
+    [[ "$cmd" =~ ^shq[[:space:]]+(output|show|o|invocations|history|i|info|I|events|e|stats|sql|q|quick-help|\?)$ ]] && return 0
+    # Skip blq query commands
+    [[ "$cmd" =~ ^blq[[:space:]]+(show|list|errors|context|stats)[[:space:]]* ]] && return 0
+    [[ "$cmd" =~ ^blq[[:space:]]+(show|list|errors|context|stats)$ ]] && return 0
+    return 1
+}
 
 # Capture command before execution
 __shq_preexec() {
@@ -1376,11 +1533,23 @@ __shq_precmd() {
     # Reset for next command
     __shq_last_cmd=""
 
+    # Skip if disabled
+    [[ -n "$SHQ_DISABLED" ]] && return
+
     # Skip if no command (empty prompt)
     [[ -z "$cmd" ]] && return
 
     # Skip if command starts with space (privacy escape)
     [[ "$cmd" =~ ^[[:space:]] ]] && return
+
+    # Skip if command starts with backslash (privacy escape)
+    [[ "$cmd" =~ ^\\ ]] && return
+
+    # Skip if command matches exclude pattern
+    __shq_excluded "$cmd" && return
+
+    # Skip shq/blq query commands (prevent recursive recording)
+    __shq_is_query "$cmd" && return
 
     # Calculate duration in milliseconds
     local duration=0
@@ -1390,19 +1559,14 @@ __shq_precmd() {
     fi
     __shq_start_time=""
 
-    # Save to BIRD, extract events, and check compaction (async, non-blocking)
+    # Save to BIRD with inline extraction and compaction (async, non-blocking)
     (
         shq save -c "$cmd" -x "$exit_code" -d "$duration" \
             --session-id "$__shq_session_id" \
             --invoker-pid $$ \
             --invoker zsh \
+            --extract --compact -q \
             </dev/null \
-            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
-        # Extract events from the output (quiet, non-blocking)
-        shq extract-events -q \
-            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
-        # Quick compaction check for this session (today only, quiet)
-        shq compact -s "$__shq_session_id" --today -q \
             2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
     ) &!
 }
@@ -1411,6 +1575,12 @@ __shq_precmd() {
 # Usage: shqr <command> [args...]
 # Example: shqr make test
 shqr() {
+    # Check if disabled
+    if [[ -n "$SHQ_DISABLED" ]]; then
+        eval "$*"
+        return $?
+    fi
+
     local cmd="$*"
     local tmpdir=$(mktemp -d)
     local stdout_file="$tmpdir/stdout"
@@ -1427,24 +1597,17 @@ shqr() {
     duration=${duration%.*}
     duration=${duration:-0}
 
-    # Save to BIRD with captured output
+    # Save to BIRD with captured output, extraction, and compaction
     shq save -c "$cmd" -x "$exit_code" -d "$duration" \
         -o "$stdout_file" -e "$stderr_file" \
         --session-id "$__shq_session_id" \
         --invoker-pid $$ \
         --invoker zsh \
+        --extract --compact -q \
         2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
 
     # Cleanup
     rm -rf "$tmpdir"
-
-    # Extract events and compaction check (background, quiet)
-    (
-        shq extract-events -q \
-            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
-        shq compact -s "$__shq_session_id" --today -q \
-            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
-    ) &!
 
     return $exit_code
 }
@@ -1457,9 +1620,42 @@ add-zsh-hook precmd __shq_precmd
 
 const BASH_HOOK: &str = r#"# shq shell integration for bash
 # Add to ~/.bashrc: eval "$(shq hook init)"
+#
+# Privacy escapes (command not recorded):
+#   - Start command with a space: " ls -la"
+#   - Start command with backslash: "\ls -la"
+#
+# Temporary disable: export SHQ_DISABLED=1
+# Exclude patterns: export SHQ_EXCLUDE="*password*:*secret*"
 
 # Session ID based on this shell's PID (stable across commands)
 __shq_session_id="bash-$$"
+
+# Check if command matches any exclude pattern
+__shq_excluded() {
+    [[ -z "$SHQ_EXCLUDE" ]] && return 1
+    local cmd="$1"
+    local IFS=':'
+    for pattern in $SHQ_EXCLUDE; do
+        # Use bash pattern matching
+        if [[ "$cmd" == $pattern ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Check if command is a shq/blq query (read-only) command - don't record these
+__shq_is_query() {
+    local cmd="$1"
+    # Skip shq query commands (output, show, invocations, history, info, events, stats, sql, quick-help)
+    [[ "$cmd" =~ ^shq[[:space:]]+(output|show|o|invocations|history|i|info|I|events|e|stats|sql|q|quick-help|\?)[[:space:]]* ]] && return 0
+    [[ "$cmd" =~ ^shq[[:space:]]+(output|show|o|invocations|history|i|info|I|events|e|stats|sql|q|quick-help|\?)$ ]] && return 0
+    # Skip blq query commands
+    [[ "$cmd" =~ ^blq[[:space:]]+(show|list|errors|context|stats)[[:space:]]* ]] && return 0
+    [[ "$cmd" =~ ^blq[[:space:]]+(show|list|errors|context|stats)$ ]] && return 0
+    return 1
+}
 
 # Use DEBUG trap for preexec equivalent
 __shq_debug() {
@@ -1479,11 +1675,23 @@ __shq_prompt() {
     # Reset for next command
     __shq_last_cmd=""
 
+    # Skip if disabled
+    [[ -n "$SHQ_DISABLED" ]] && return
+
     # Skip if no command
     [[ -z "$cmd" ]] && return
 
     # Skip if command starts with space (privacy escape)
     [[ "$cmd" =~ ^[[:space:]] ]] && return
+
+    # Skip if command starts with backslash (privacy escape)
+    [[ "$cmd" =~ ^\\ ]] && return
+
+    # Skip if command matches exclude pattern
+    __shq_excluded "$cmd" && return
+
+    # Skip shq/blq query commands (prevent recursive recording)
+    __shq_is_query "$cmd" && return
 
     # Calculate duration in milliseconds
     local duration=0
@@ -1493,19 +1701,14 @@ __shq_prompt() {
     fi
     __shq_start_time=""
 
-    # Save to BIRD, extract events, and check compaction (async, background)
+    # Save to BIRD with inline extraction and compaction (async, background)
     (
         shq save -c "$cmd" -x "$exit_code" -d "$duration" \
             --session-id "$__shq_session_id" \
             --invoker-pid $$ \
             --invoker bash \
+            --extract --compact -q \
             </dev/null \
-            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
-        # Extract events from the output (quiet, non-blocking)
-        shq extract-events -q \
-            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
-        # Quick compaction check for this session (today only, quiet)
-        shq compact -s "$__shq_session_id" --today -q \
             2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
     ) &
     disown 2>/dev/null
@@ -1515,6 +1718,12 @@ __shq_prompt() {
 # Usage: shqr <command> [args...]
 # Example: shqr make test
 shqr() {
+    # Check if disabled
+    if [[ -n "$SHQ_DISABLED" ]]; then
+        eval "$*"
+        return $?
+    fi
+
     local cmd="$*"
     local tmpdir=$(mktemp -d)
     local stdout_file="$tmpdir/stdout"
@@ -1531,25 +1740,17 @@ shqr() {
     duration=${duration%.*}
     duration=${duration:-0}
 
-    # Save to BIRD with captured output
+    # Save to BIRD with captured output, extraction, and compaction
     shq save -c "$cmd" -x "$exit_code" -d "$duration" \
         -o "$stdout_file" -e "$stderr_file" \
         --session-id "$__shq_session_id" \
         --invoker-pid $$ \
         --invoker bash \
+        --extract --compact -q \
         2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
 
     # Cleanup
     rm -rf "$tmpdir"
-
-    # Extract events and compaction check (background, quiet)
-    (
-        shq extract-events -q \
-            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
-        shq compact -s "$__shq_session_id" --today -q \
-            2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
-    ) &
-    disown 2>/dev/null
 
     return $exit_code
 }
