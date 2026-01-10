@@ -13,4 +13,4 @@ pub use config::{Config, StorageMode};
 pub use error::{Error, Result};
 pub use query::{parse_query, CompareOp, FieldFilter, PathFilter, Query, QueryComponent, RangeSelector, SourceSelector};
 pub use schema::{InvocationRecord, OutputRecord, SessionRecord};
-pub use store::{ArchiveStats, AutoCompactOptions, CompactOptions, CompactStats, EventFilters, EventSummary, InvocationSummary, OutputInfo, Store};
+pub use store::{ArchiveStats, AutoCompactOptions, CompactOptions, CompactStats, EventFilters, EventSummary, InvocationBatch, InvocationSummary, OutputInfo, Store};
