@@ -6,6 +6,7 @@ use duckdb::params;
 
 use super::atomic;
 use super::{sanitize_filename, Store};
+use crate::config::StorageMode;
 use crate::schema::OutputRecord;
 use crate::{Config, Error, Result};
 
@@ -124,7 +125,19 @@ impl Store {
     }
 
     /// Write an output record to the store (low-level).
+    ///
+    /// Behavior depends on storage mode:
+    /// - Parquet: Creates a new Parquet file in the appropriate date partition
+    /// - DuckDB: Inserts directly into the outputs_table
     pub fn write_output(&self, record: &OutputRecord) -> Result<()> {
+        match self.config.storage_mode {
+            StorageMode::Parquet => self.write_output_parquet(record),
+            StorageMode::DuckDB => self.write_output_duckdb(record),
+        }
+    }
+
+    /// Write output to a Parquet file (multi-writer safe).
+    fn write_output_parquet(&self, record: &OutputRecord) -> Result<()> {
         let conn = self.connection()?;
 
         // Ensure the partition directory exists
@@ -189,6 +202,32 @@ impl Store {
 
         // Rename temp to final (atomic on POSIX)
         atomic::rename_into_place(&temp_path, &file_path)?;
+
+        Ok(())
+    }
+
+    /// Write output directly to DuckDB table.
+    fn write_output_duckdb(&self, record: &OutputRecord) -> Result<()> {
+        let conn = self.connection()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO outputs_table VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            "#,
+            params![
+                record.id.to_string(),
+                record.invocation_id.to_string(),
+                record.stream,
+                record.content_hash,
+                record.byte_length as i64,
+                record.storage_type,
+                record.storage_ref,
+                record.content_type,
+                record.date.to_string(),
+            ],
+        )?;
 
         Ok(())
     }

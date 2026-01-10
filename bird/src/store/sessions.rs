@@ -6,15 +6,27 @@ use duckdb::params;
 
 use super::atomic;
 use super::Store;
+use crate::config::StorageMode;
 use crate::schema::SessionRecord;
 use crate::Result;
 
 impl Store {
     /// Write a session record to the store.
     ///
-    /// Creates a new Parquet file in the appropriate date partition.
+    /// Behavior depends on storage mode:
+    /// - Parquet: Creates a new Parquet file in the appropriate date partition
+    /// - DuckDB: Inserts directly into the sessions_table
+    ///
     /// Sessions are written lazily on first invocation from that session.
     pub fn write_session(&self, record: &SessionRecord) -> Result<()> {
+        match self.config.storage_mode {
+            StorageMode::Parquet => self.write_session_parquet(record),
+            StorageMode::DuckDB => self.write_session_duckdb(record),
+        }
+    }
+
+    /// Write session to a Parquet file (multi-writer safe).
+    fn write_session_parquet(&self, record: &SessionRecord) -> Result<()> {
         let conn = self.connection()?;
 
         // Ensure the partition directory exists
@@ -72,6 +84,31 @@ impl Store {
 
         // Rename temp to final (atomic on POSIX)
         atomic::rename_into_place(&temp_path, &file_path)?;
+
+        Ok(())
+    }
+
+    /// Write session directly to DuckDB table.
+    fn write_session_duckdb(&self, record: &SessionRecord) -> Result<()> {
+        let conn = self.connection()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO sessions_table VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            "#,
+            params![
+                record.session_id,
+                record.client_id,
+                record.invoker,
+                record.invoker_pid,
+                record.invoker_type,
+                record.registered_at.to_rfc3339(),
+                record.cwd,
+                record.date.to_string(),
+            ],
+        )?;
 
         Ok(())
     }

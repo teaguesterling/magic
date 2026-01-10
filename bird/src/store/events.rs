@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use super::atomic;
 use super::Store;
+use crate::config::StorageMode;
 use crate::schema::EventRecord;
 use crate::{Error, Result};
 
@@ -381,32 +382,54 @@ impl Store {
             return Ok(0);
         }
 
-        // Write to parquet file
-        let filename = format!("{}--{}.parquet", invocation_id, Uuid::now_v7());
-        let file_path = partition_dir.join(&filename);
+        // Write to storage based on mode
+        match self.config.storage_mode {
+            StorageMode::Parquet => {
+                // Write to parquet file
+                let filename = format!("{}--{}.parquet", invocation_id, Uuid::now_v7());
+                let file_path = partition_dir.join(&filename);
 
-        let temp_path = atomic::temp_path(&file_path);
-        conn.execute(
-            &format!(
-                "COPY temp_events TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
-                temp_path.display()
-            ),
-            [],
-        )?;
-        conn.execute("DROP TABLE temp_events", [])?;
+                let temp_path = atomic::temp_path(&file_path);
+                conn.execute(
+                    &format!(
+                        "COPY temp_events TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+                        temp_path.display()
+                    ),
+                    [],
+                )?;
+                conn.execute("DROP TABLE temp_events", [])?;
 
-        // Rename temp to final (atomic on POSIX)
-        atomic::rename_into_place(&temp_path, &file_path)?;
+                // Rename temp to final (atomic on POSIX)
+                atomic::rename_into_place(&temp_path, &file_path)?;
+            }
+            StorageMode::DuckDB => {
+                // Insert directly into events_table
+                conn.execute_batch("INSERT INTO events_table SELECT * FROM temp_events")?;
+                conn.execute("DROP TABLE temp_events", [])?;
+            }
+        }
 
         Ok(count as usize)
     }
 
     /// Write event records to the store.
+    ///
+    /// Behavior depends on storage mode:
+    /// - Parquet: Creates Parquet files partitioned by date
+    /// - DuckDB: Inserts directly into the events_table
     pub fn write_events(&self, records: &[EventRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
 
+        match self.config.storage_mode {
+            StorageMode::Parquet => self.write_events_parquet(records),
+            StorageMode::DuckDB => self.write_events_duckdb(records),
+        }
+    }
+
+    /// Write events to Parquet files (multi-writer safe).
+    fn write_events_parquet(&self, records: &[EventRecord]) -> Result<()> {
         let conn = self.connection()?;
 
         // Group by date for partitioning
@@ -490,6 +513,40 @@ impl Store {
             conn.execute("DROP TABLE temp_events", [])?;
 
             atomic::rename_into_place(&temp_path, &file_path)?;
+        }
+
+        Ok(())
+    }
+
+    /// Write events directly to DuckDB table.
+    fn write_events_duckdb(&self, records: &[EventRecord]) -> Result<()> {
+        let conn = self.connection()?;
+
+        for record in records {
+            conn.execute(
+                r#"
+                INSERT INTO events_table VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                "#,
+                params![
+                    record.id.to_string(),
+                    record.invocation_id.to_string(),
+                    record.client_id,
+                    record.hostname,
+                    record.event_type,
+                    record.severity,
+                    record.ref_file,
+                    record.ref_line,
+                    record.ref_column,
+                    record.message,
+                    record.error_code,
+                    record.test_name,
+                    record.status,
+                    record.format_used,
+                    record.date.to_string(),
+                ],
+            )?;
         }
 
         Ok(())
@@ -699,7 +756,19 @@ impl Store {
     }
 
     /// Delete events for an invocation (for re-extraction).
+    ///
+    /// Behavior depends on storage mode:
+    /// - Parquet: Deletes parquet files containing the events
+    /// - DuckDB: Deletes rows from events_table
     pub fn delete_events_for_invocation(&self, invocation_id: &str) -> Result<usize> {
+        match self.config.storage_mode {
+            StorageMode::Parquet => self.delete_events_parquet(invocation_id),
+            StorageMode::DuckDB => self.delete_events_duckdb(invocation_id),
+        }
+    }
+
+    /// Delete events from parquet files.
+    fn delete_events_parquet(&self, invocation_id: &str) -> Result<usize> {
         // Since we're using parquet files, we need to find and delete the files
         // This is a simplified approach - in production you might want to rewrite
         // the parquet files without these records
@@ -748,6 +817,29 @@ impl Store {
         }
 
         Ok(deleted)
+    }
+
+    /// Delete events from DuckDB table.
+    fn delete_events_duckdb(&self, invocation_id: &str) -> Result<usize> {
+        let conn = self.connection()?;
+
+        // Count events before deletion
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events_table WHERE invocation_id = ?",
+                params![invocation_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if count > 0 {
+            conn.execute(
+                "DELETE FROM events_table WHERE invocation_id = ?",
+                params![invocation_id],
+            )?;
+        }
+
+        Ok(count as usize)
     }
 
     /// Get invocations that have outputs but no events extracted yet.

@@ -2,6 +2,7 @@
 
 use std::fs;
 
+use crate::config::StorageMode;
 use crate::{Config, Error, Result};
 
 /// Initialize a new BIRD installation.
@@ -33,17 +34,24 @@ pub fn initialize(config: &Config) -> Result<()> {
 
 /// Create the BIRD directory structure.
 fn create_directories(config: &Config) -> Result<()> {
-    let dirs = [
+    // Common directories for both modes
+    let mut dirs = vec![
         config.bird_root.join("db"),
-        config.recent_dir().join("invocations"),
-        config.recent_dir().join("outputs"),
-        config.recent_dir().join("sessions"),
-        config.recent_dir().join("events"),
         config.blobs_dir(), // blobs/content
         config.archive_dir().join("blobs/content"),
         config.extensions_dir(),
         config.sql_dir(),
     ];
+
+    // Parquet mode needs partition directories
+    if config.storage_mode == StorageMode::Parquet {
+        dirs.extend([
+            config.recent_dir().join("invocations"),
+            config.recent_dir().join("outputs"),
+            config.recent_dir().join("sessions"),
+            config.recent_dir().join("events"),
+        ]);
+    }
 
     for dir in &dirs {
         fs::create_dir_all(dir)?;
@@ -63,11 +71,7 @@ fn init_database(config: &Config) -> Result<()> {
     // Verify community extensions can be loaded (downloads to ~/.duckdb cache if needed)
     verify_extensions(&conn)?;
 
-    // Create seed parquet files with correct schema but no rows
-    // This ensures the glob pattern always matches at least one file
-    create_seed_files(&conn, config)?;
-
-    // Create blob_registry table
+    // Create blob_registry table (used by both modes)
     create_blob_registry(&conn)?;
 
     // Set file search path so views use relative paths
@@ -77,7 +81,29 @@ fn init_database(config: &Config) -> Result<()> {
         [],
     )?;
 
-    // Create views that read from Parquet files using glob patterns
+    // Mode-specific initialization
+    match config.storage_mode {
+        StorageMode::Parquet => {
+            // Create seed parquet files with correct schema but no rows
+            // This ensures the glob pattern always matches at least one file
+            create_seed_files(&conn, config)?;
+            create_parquet_views(&conn)?;
+        }
+        StorageMode::DuckDB => {
+            // Create tables for direct storage
+            create_duckdb_tables(&conn)?;
+            create_duckdb_views(&conn)?;
+        }
+    }
+
+    // Create helper views (same for both modes, depend on base views)
+    create_helper_views(&conn)?;
+
+    Ok(())
+}
+
+/// Create views that read from Parquet files (for Parquet mode).
+fn create_parquet_views(conn: &duckdb::Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         -- Invocations view: reads all invocation parquet files
@@ -110,6 +136,107 @@ fn init_database(config: &Config) -> Result<()> {
             filename = true
         );
 
+        -- Events view: reads all event parquet files (parsed log entries)
+        CREATE OR REPLACE VIEW events AS
+        SELECT * EXCLUDE (filename)
+        FROM read_parquet(
+            'recent/events/**/*.parquet',
+            union_by_name = true,
+            hive_partitioning = true,
+            filename = true
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Create tables for direct storage (for DuckDB mode).
+fn create_duckdb_tables(conn: &duckdb::Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        -- Invocations table
+        CREATE TABLE IF NOT EXISTS invocations_table (
+            id UUID,
+            session_id VARCHAR,
+            timestamp TIMESTAMP,
+            duration_ms BIGINT,
+            cwd VARCHAR,
+            cmd VARCHAR,
+            executable VARCHAR,
+            exit_code INTEGER,
+            format_hint VARCHAR,
+            client_id VARCHAR,
+            hostname VARCHAR,
+            username VARCHAR,
+            date DATE
+        );
+
+        -- Outputs table
+        CREATE TABLE IF NOT EXISTS outputs_table (
+            id UUID,
+            invocation_id UUID,
+            stream VARCHAR,
+            content_hash VARCHAR,
+            byte_length BIGINT,
+            storage_type VARCHAR,
+            storage_ref VARCHAR,
+            content_type VARCHAR,
+            date DATE
+        );
+
+        -- Sessions table
+        CREATE TABLE IF NOT EXISTS sessions_table (
+            session_id VARCHAR,
+            client_id VARCHAR,
+            invoker VARCHAR,
+            invoker_pid INTEGER,
+            invoker_type VARCHAR,
+            registered_at TIMESTAMP,
+            cwd VARCHAR,
+            date DATE
+        );
+
+        -- Events table
+        CREATE TABLE IF NOT EXISTS events_table (
+            id UUID,
+            invocation_id UUID,
+            client_id VARCHAR,
+            hostname VARCHAR,
+            event_type VARCHAR,
+            severity VARCHAR,
+            ref_file VARCHAR,
+            ref_line INTEGER,
+            ref_column INTEGER,
+            message VARCHAR,
+            error_code VARCHAR,
+            test_name VARCHAR,
+            status VARCHAR,
+            format_used VARCHAR,
+            date DATE
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Create views that read from tables (for DuckDB mode).
+fn create_duckdb_views(conn: &duckdb::Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        -- Views simply select from tables
+        CREATE OR REPLACE VIEW invocations AS SELECT * FROM invocations_table;
+        CREATE OR REPLACE VIEW outputs AS SELECT * FROM outputs_table;
+        CREATE OR REPLACE VIEW sessions AS SELECT * FROM sessions_table;
+        CREATE OR REPLACE VIEW events AS SELECT * FROM events_table;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Create helper views (same for both modes).
+fn create_helper_views(conn: &duckdb::Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
         -- Recent invocations helper view
         CREATE OR REPLACE VIEW recent_invocations AS
         SELECT *
@@ -153,16 +280,6 @@ fn init_database(config: &Config) -> Result<()> {
         FROM sessions
         GROUP BY client_id;
 
-        -- Events view: reads all event parquet files (parsed log entries)
-        CREATE OR REPLACE VIEW events AS
-        SELECT * EXCLUDE (filename)
-        FROM read_parquet(
-            'recent/events/**/*.parquet',
-            union_by_name = true,
-            hive_partitioning = true,
-            filename = true
-        );
-
         -- Events with invocation context (joined view)
         CREATE OR REPLACE VIEW events_with_context AS
         SELECT
@@ -175,7 +292,6 @@ fn init_database(config: &Config) -> Result<()> {
         JOIN invocations i ON e.invocation_id = i.id;
         "#,
     )?;
-
     Ok(())
 }
 

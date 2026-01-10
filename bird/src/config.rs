@@ -6,11 +6,52 @@
 //! 3. Default: ~/.local/share/bird
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
+
+/// Storage mode for BIRD data.
+///
+/// - **Parquet**: Multi-writer safe using atomic file creation. Suitable for
+///   concurrent shell hooks (shq). Requires periodic compaction.
+/// - **DuckDB**: Single-writer using direct table inserts. Simpler but requires
+///   serialized writes. Suitable for sequential CLI tools (blq).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageMode {
+    /// Write to Parquet files (multi-writer safe, requires compaction)
+    #[default]
+    Parquet,
+    /// Write directly to DuckDB tables (single-writer, no compaction needed)
+    DuckDB,
+}
+
+impl std::fmt::Display for StorageMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageMode::Parquet => write!(f, "parquet"),
+            StorageMode::DuckDB => write!(f, "duckdb"),
+        }
+    }
+}
+
+impl FromStr for StorageMode {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "parquet" => Ok(StorageMode::Parquet),
+            "duckdb" => Ok(StorageMode::DuckDB),
+            _ => Err(Error::Config(format!(
+                "Invalid storage mode '{}': expected 'parquet' or 'duckdb'",
+                s
+            ))),
+        }
+    }
+}
 
 /// BIRD configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +74,12 @@ pub struct Config {
     /// Automatically extract events after `shq run` commands.
     #[serde(default)]
     pub auto_extract: bool,
+
+    /// Storage mode for writing data.
+    /// - parquet: Multi-writer safe, requires compaction (default)
+    /// - duckdb: Single-writer, no compaction needed
+    #[serde(default)]
+    pub storage_mode: StorageMode,
 }
 
 fn default_client_id() -> String {
@@ -63,6 +110,19 @@ impl Config {
             hot_days: default_hot_days(),
             inline_threshold: default_inline_threshold(),
             auto_extract: false,
+            storage_mode: StorageMode::default(),
+        }
+    }
+
+    /// Create a new config with DuckDB storage mode.
+    pub fn with_duckdb_mode(bird_root: impl Into<PathBuf>) -> Self {
+        Self {
+            bird_root: bird_root.into(),
+            client_id: default_client_id(),
+            hot_days: default_hot_days(),
+            inline_threshold: default_inline_threshold(),
+            auto_extract: false,
+            storage_mode: StorageMode::DuckDB,
         }
     }
 

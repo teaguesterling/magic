@@ -9,7 +9,7 @@ pub mod query;
 pub mod schema;
 pub mod store;
 
-pub use config::Config;
+pub use config::{Config, StorageMode};
 pub use error::{Error, Result};
 pub use query::{parse_query, CompareOp, FieldFilter, PathFilter, Query, QueryComponent, RangeSelector, SourceSelector};
 pub use schema::{InvocationRecord, OutputRecord, SessionRecord};

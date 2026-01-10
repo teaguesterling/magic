@@ -6,6 +6,7 @@ use duckdb::params;
 
 use super::atomic;
 use super::{sanitize_filename, Store};
+use crate::config::StorageMode;
 use crate::schema::InvocationRecord;
 use crate::Result;
 
@@ -22,8 +23,18 @@ pub struct InvocationSummary {
 impl Store {
     /// Write an invocation record to the store.
     ///
-    /// Creates a new Parquet file in the appropriate date partition.
+    /// Behavior depends on storage mode:
+    /// - Parquet: Creates a new Parquet file in the appropriate date partition
+    /// - DuckDB: Inserts directly into the invocations_table
     pub fn write_invocation(&self, record: &InvocationRecord) -> Result<()> {
+        match self.config.storage_mode {
+            StorageMode::Parquet => self.write_invocation_parquet(record),
+            StorageMode::DuckDB => self.write_invocation_duckdb(record),
+        }
+    }
+
+    /// Write invocation to a Parquet file (multi-writer safe).
+    fn write_invocation_parquet(&self, record: &InvocationRecord) -> Result<()> {
         let conn = self.connection()?;
         let date = record.date();
 
@@ -98,6 +109,37 @@ impl Store {
 
         // Rename temp to final (atomic on POSIX)
         atomic::rename_into_place(&temp_path, &file_path)?;
+
+        Ok(())
+    }
+
+    /// Write invocation directly to DuckDB table.
+    fn write_invocation_duckdb(&self, record: &InvocationRecord) -> Result<()> {
+        let conn = self.connection()?;
+        let date = record.date();
+
+        conn.execute(
+            r#"
+            INSERT INTO invocations_table VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            "#,
+            params![
+                record.id.to_string(),
+                record.session_id,
+                record.timestamp.to_rfc3339(),
+                record.duration_ms,
+                record.cwd,
+                record.cmd,
+                record.executable,
+                record.exit_code,
+                record.format_hint,
+                record.client_id,
+                record.hostname,
+                record.username,
+                date.to_string(),
+            ],
+        )?;
 
         Ok(())
     }
@@ -293,5 +335,108 @@ mod tests {
             "No temp files should remain in {:?}",
             inv_dir
         );
+    }
+
+    // DuckDB mode tests
+
+    fn setup_store_duckdb() -> (TempDir, Store) {
+        let tmp = TempDir::new().unwrap();
+        let config = Config::with_duckdb_mode(tmp.path());
+        initialize(&config).unwrap();
+        let store = Store::open(config).unwrap();
+        (tmp, store)
+    }
+
+    #[test]
+    fn test_duckdb_mode_write_and_count_invocation() {
+        let (_tmp, store) = setup_store_duckdb();
+
+        let record = InvocationRecord::new(
+            "test-session",
+            "make test",
+            "/home/user/project",
+            0,
+            "test@client",
+        );
+
+        store.write_invocation(&record).unwrap();
+
+        let count = store.invocation_count().unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_duckdb_mode_write_and_query_invocation() {
+        let (_tmp, store) = setup_store_duckdb();
+
+        let record = InvocationRecord::new(
+            "test-session",
+            "cargo build",
+            "/home/user/project",
+            0,
+            "test@client",
+        )
+        .with_duration(1500);
+
+        store.write_invocation(&record).unwrap();
+
+        // Query using SQL
+        let result = store
+            .query("SELECT cmd, exit_code, duration_ms FROM invocations")
+            .unwrap();
+
+        assert_eq!(result.columns, vec!["cmd", "exit_code", "duration_ms"]);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], "cargo build");
+        assert_eq!(result.rows[0][1], "0");
+        assert_eq!(result.rows[0][2], "1500");
+    }
+
+    #[test]
+    fn test_duckdb_mode_recent_invocations() {
+        let (_tmp, store) = setup_store_duckdb();
+
+        // Write a few invocations
+        for i in 0..3 {
+            let record = InvocationRecord::new(
+                "test-session",
+                format!("command-{}", i),
+                "/home/user",
+                i,
+                "test@client",
+            );
+            store.write_invocation(&record).unwrap();
+        }
+
+        let recent = store.recent_invocations(10).unwrap();
+        assert_eq!(recent.len(), 3);
+    }
+
+    #[test]
+    fn test_duckdb_mode_no_parquet_files() {
+        let (tmp, store) = setup_store_duckdb();
+
+        let record = InvocationRecord::new(
+            "test-session",
+            "test",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&record).unwrap();
+
+        // Check that no parquet files were created in recent/invocations
+        let invocations_dir = tmp.path().join("db/data/recent/invocations");
+        if invocations_dir.exists() {
+            let parquet_files: Vec<_> = std::fs::read_dir(&invocations_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_str().unwrap_or("").ends_with(".parquet"))
+                .collect();
+            assert!(
+                parquet_files.is_empty(),
+                "DuckDB mode should not create parquet files"
+            );
+        }
     }
 }
