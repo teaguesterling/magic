@@ -200,16 +200,7 @@ fn sanitize_filename(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::init::initialize;
     use tempfile::TempDir;
-
-    fn setup_store() -> (TempDir, Store) {
-        let tmp = TempDir::new().unwrap();
-        let config = Config::with_root(tmp.path());
-        initialize(&config).unwrap();
-        let store = Store::open(config).unwrap();
-        (tmp, store)
-    }
 
     #[test]
     fn test_store_open_uninitialized_fails() {

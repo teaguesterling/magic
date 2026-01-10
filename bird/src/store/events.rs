@@ -109,13 +109,11 @@ fn pattern_matches(pattern: &str, text: &str) -> bool {
         return pattern == text;
     }
 
-    let mut pos = 0;
-
     // First part must match at start (if not empty)
     if !parts[0].is_empty() && !text.starts_with(parts[0]) {
         return false;
     }
-    pos = parts[0].len();
+    let mut pos = parts[0].len();
 
     // Middle parts must appear in order
     for part in &parts[1..parts.len() - 1] {
