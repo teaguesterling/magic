@@ -4,7 +4,7 @@ use std::io::{self, Read};
 use std::process::Command;
 use std::time::Instant;
 
-use bird::{init, parse_query, CompactOptions, Config, EventFilters, InvocationBatch, InvocationRecord, Query, SessionRecord, Store};
+use bird::{init, parse_query, CompactOptions, Config, EventFilters, InvocationBatch, InvocationRecord, Query, SessionRecord, StorageMode, Store};
 
 /// Generate a session ID for grouping related invocations.
 fn session_id() -> String {
@@ -483,17 +483,24 @@ fn strip_ansi_escapes(input: &[u8]) -> Vec<u8> {
     output
 }
 
-pub fn init() -> bird::Result<()> {
-    let config = Config::default_location()?;
+pub fn init(mode: &str) -> bird::Result<()> {
+    // Parse storage mode
+    let storage_mode: StorageMode = mode.parse()?;
+
+    let mut config = Config::default_location()?;
 
     if init::is_initialized(&config) {
         println!("BIRD already initialized at {}", config.bird_root.display());
         return Ok(());
     }
 
+    // Set storage mode before initialization
+    config.storage_mode = storage_mode;
+
     init::initialize(&config)?;
     println!("BIRD initialized at {}", config.bird_root.display());
     println!("Client ID: {}", config.client_id);
+    println!("Storage mode: {}", config.storage_mode);
 
     Ok(())
 }

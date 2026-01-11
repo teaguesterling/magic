@@ -16,7 +16,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize BIRD database
-    Init,
+    Init {
+        /// Storage mode: parquet (multi-writer, needs compaction) or duckdb (single-writer, simpler)
+        #[arg(short = 'm', long = "mode", default_value = "parquet")]
+        mode: String,
+    },
 
     /// Run a command and capture it to BIRD
     #[command(visible_alias = "r")]
@@ -369,7 +373,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Init => commands::init(),
+        Commands::Init { mode } => commands::init(&mode),
         Commands::Run { shell_cmd, extract, no_extract, format, compact, cmd } => {
             // Resolve extract behavior: --extract forces on, --no-extract forces off, otherwise use config
             let extract_override = if extract {
