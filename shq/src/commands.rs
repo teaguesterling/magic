@@ -1743,6 +1743,167 @@ add-zsh-hook preexec __shq_preexec
 add-zsh-hook precmd __shq_precmd
 "#;
 
+// Format hints management
+
+/// List format hints (user-defined and optionally built-in).
+pub fn format_hints_list(show_builtin: bool, show_user: bool, filter: Option<&str>) -> bird::Result<()> {
+    let config = Config::load()?;
+    let store = Store::open(config)?;
+
+    let hints = store.load_format_hints()?;
+
+    // Helper to check if a hint matches the filter
+    let matches_filter = |pattern: &str, format: &str| -> bool {
+        match filter {
+            None => true,
+            Some(f) => {
+                let f_lower = f.to_lowercase();
+                pattern.to_lowercase().contains(&f_lower) || format.to_lowercase().contains(&f_lower)
+            }
+        }
+    };
+
+    // Show user-defined hints
+    if show_user {
+        let user_hints: Vec<_> = hints.hints()
+            .iter()
+            .filter(|h| matches_filter(&h.pattern, &h.format))
+            .collect();
+
+        if user_hints.is_empty() {
+            if filter.is_some() {
+                println!("No user-defined format hints matching filter.");
+            } else {
+                println!("No user-defined format hints.");
+            }
+        } else {
+            println!("User-defined format hints:");
+            println!("{:<6} {:<30} {}", "PRI", "PATTERN", "FORMAT");
+            println!("{}", "-".repeat(60));
+            for hint in user_hints {
+                println!("{:<6} {:<30} {}", hint.priority, hint.pattern, hint.format);
+            }
+        }
+        println!();
+    }
+
+    // Show built-in formats from duck_hunt
+    if show_builtin {
+        match store.list_builtin_formats() {
+            Ok(formats) => {
+                let filtered: Vec<_> = formats.iter()
+                    .filter(|f| matches_filter(&f.pattern, &f.format))
+                    .collect();
+
+                if filtered.is_empty() {
+                    if filter.is_some() {
+                        println!("No built-in formats matching filter.");
+                    } else {
+                        println!("No built-in formats available.");
+                    }
+                } else {
+                    println!("Available formats (from duck_hunt):");
+                    println!("{:<6} {:<20} {}", "PRI", "FORMAT", "DESCRIPTION");
+                    println!("{}", "-".repeat(70));
+                    for fmt in filtered {
+                        // pattern field contains description for builtin formats
+                        let desc = if fmt.pattern.len() > 45 {
+                            format!("{}...", &fmt.pattern[..42])
+                        } else {
+                            fmt.pattern.clone()
+                        };
+                        println!("{:<6} {:<20} {}", fmt.priority, fmt.format, desc);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: Could not list built-in formats: {}", e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Add a format hint.
+pub fn format_hints_add(pattern: &str, format: &str, priority: Option<i32>) -> bird::Result<()> {
+    let config = Config::load()?;
+    let store = Store::open(config)?;
+
+    let mut hints = store.load_format_hints()?;
+
+    let priority = priority.unwrap_or(bird::format_hints::DEFAULT_PRIORITY);
+    let hint = bird::FormatHint::with_priority(pattern, format, priority);
+
+    // Check if pattern already exists
+    if hints.get(pattern).is_some() {
+        println!("Updating existing pattern: {}", pattern);
+    }
+
+    hints.add(hint);
+    store.save_format_hints(&hints)?;
+
+    println!("Added: {} -> {} (priority {})", pattern, format, priority);
+    Ok(())
+}
+
+/// Remove a format hint by pattern.
+pub fn format_hints_remove(pattern: &str) -> bird::Result<()> {
+    let config = Config::load()?;
+    let store = Store::open(config)?;
+
+    let mut hints = store.load_format_hints()?;
+
+    if hints.remove(pattern) {
+        store.save_format_hints(&hints)?;
+        println!("Removed: {}", pattern);
+    } else {
+        println!("Pattern not found: {}", pattern);
+    }
+
+    Ok(())
+}
+
+/// Check which format would be detected for a command.
+pub fn format_hints_check(cmd: &str) -> bird::Result<()> {
+    use bird::FormatSource;
+
+    let config = Config::load()?;
+    let store = Store::open(config)?;
+
+    let result = store.check_format(cmd)?;
+
+    println!("Command: {}", cmd);
+    println!("Format:  {}", result.format);
+
+    match result.source {
+        FormatSource::UserDefined { pattern, priority } => {
+            println!("Source:  user-defined (pattern: {}, priority: {})", pattern, priority);
+        }
+        FormatSource::Builtin { pattern, priority } => {
+            println!("Source:  built-in (pattern: {}, priority: {})", pattern, priority);
+        }
+        FormatSource::Default => {
+            println!("Source:  default (no pattern matched)");
+        }
+    }
+
+    Ok(())
+}
+
+/// Set the default format.
+pub fn format_hints_set_default(format: &str) -> bird::Result<()> {
+    let config = Config::load()?;
+    let store = Store::open(config)?;
+
+    let mut hints = store.load_format_hints()?;
+    hints.set_default_format(format);
+    store.save_format_hints(&hints)?;
+
+    println!("Default format set to: {}", format);
+    Ok(())
+}
+
 const BASH_HOOK: &str = r#"# shq shell integration for bash
 # Add to ~/.bashrc: eval "$(shq hook init)"
 #

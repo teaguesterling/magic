@@ -230,9 +230,14 @@ impl Config {
             .join(format!("{}--{}.bin", hash, sanitized_cmd))
     }
 
-    /// Path to the event-formats.toml config file.
+    /// Path to the event-formats.toml config file (legacy).
     pub fn event_formats_path(&self) -> PathBuf {
         self.bird_root.join("event-formats.toml")
+    }
+
+    /// Path to the format-hints.toml config file.
+    pub fn format_hints_path(&self) -> PathBuf {
+        self.bird_root.join("format-hints.toml")
     }
 
     /// Path to events parquet files for a given date.

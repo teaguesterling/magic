@@ -279,6 +279,13 @@ enum Commands {
         action: HookAction,
     },
 
+    /// Manage format detection hints
+    #[command(name = "format-hints", visible_alias = "fh")]
+    FormatHints {
+        #[command(subcommand)]
+        action: FormatHintsAction,
+    },
+
     /// Query parsed events (errors, warnings, test results) from invocation outputs
     #[command(visible_alias = "e")]
     Events {
@@ -360,6 +367,54 @@ enum HookAction {
     },
 }
 
+#[derive(Subcommand)]
+enum FormatHintsAction {
+    /// List format hints (user-defined and built-in)
+    List {
+        /// Filter by format name or pattern (substring match)
+        filter: Option<String>,
+
+        /// Show only user-defined hints
+        #[arg(short = 'u', long)]
+        user_only: bool,
+
+        /// Show only built-in hints from duck_hunt
+        #[arg(short = 'b', long)]
+        builtin_only: bool,
+    },
+
+    /// Add a format hint
+    Add {
+        /// Glob pattern to match (e.g., "*mycompiler*", "custom-build*")
+        pattern: String,
+
+        /// Format name (e.g., gcc, pytest, cargo_build)
+        format: String,
+
+        /// Priority (higher wins, default: 500)
+        #[arg(short = 'p', long)]
+        priority: Option<i32>,
+    },
+
+    /// Remove a format hint by pattern
+    Remove {
+        /// Pattern to remove
+        pattern: String,
+    },
+
+    /// Check which format would be detected for a command
+    Check {
+        /// Command to check
+        command: String,
+    },
+
+    /// Set the default format (when no patterns match)
+    SetDefault {
+        /// Default format (e.g., auto, text)
+        format: String,
+    },
+}
+
 /// Parse lines argument: N (any), +N (first N), -N (last N).
 fn parse_lines_arg(s: &str) -> (usize, commands::LimitOrder) {
     use commands::LimitOrder;
@@ -438,6 +493,19 @@ fn main() {
         }
         Commands::Hook { action } => match action {
             HookAction::Init { shell } => commands::hook_init(shell.as_deref()),
+        },
+        Commands::FormatHints { action } => match action {
+            FormatHintsAction::List { filter, user_only, builtin_only } => {
+                let show_builtin = !user_only;
+                let show_user = !builtin_only;
+                commands::format_hints_list(show_builtin, show_user, filter.as_deref())
+            },
+            FormatHintsAction::Add { pattern, format, priority } => {
+                commands::format_hints_add(&pattern, &format, priority)
+            },
+            FormatHintsAction::Remove { pattern } => commands::format_hints_remove(&pattern),
+            FormatHintsAction::Check { command } => commands::format_hints_check(&command),
+            FormatHintsAction::SetDefault { format } => commands::format_hints_set_default(&format),
         },
         Commands::Events { query, severity, count_only, lines, reparse, format } => {
             // Parse lines: N (any), +N (first N), -N (last N)

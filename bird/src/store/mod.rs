@@ -28,6 +28,9 @@ pub use events::{EventFilters, EventSummary, FormatConfig, FormatRule};
 pub use invocations::InvocationSummary;
 pub use outputs::OutputInfo;
 
+// Re-export format detection types (defined below)
+// BuiltinFormat, FormatMatch, FormatSource are defined at the bottom of this file
+
 /// A batch of related records to write atomically.
 ///
 /// Use this when you want to write an invocation along with its outputs,
@@ -466,6 +469,116 @@ impl Store {
 
         Ok(())
     }
+
+    /// Load format hints from the config file.
+    pub fn load_format_hints(&self) -> Result<crate::FormatHints> {
+        let path = self.config.format_hints_path();
+
+        // Try new format-hints.toml first
+        if path.exists() {
+            return crate::FormatHints::load(&path);
+        }
+
+        // Fall back to legacy event-formats.toml
+        let legacy_path = self.config.event_formats_path();
+        if legacy_path.exists() {
+            return crate::FormatHints::load(&legacy_path);
+        }
+
+        Ok(crate::FormatHints::new())
+    }
+
+    /// Save format hints to the config file.
+    pub fn save_format_hints(&self, hints: &crate::FormatHints) -> Result<()> {
+        hints.save(&self.config.format_hints_path())
+    }
+
+    /// Detect format for a command using format hints.
+    ///
+    /// Priority:
+    /// 1. User-defined format hints (by priority)
+    /// 2. Default format from config (or "auto")
+    ///
+    /// Note: duck_hunt detects formats from content analysis, not command names.
+    /// Use format hints to map commands to formats, then duck_hunt parses the output.
+    pub fn detect_format_for_command(&self, cmd: &str) -> Result<String> {
+        let hints = self.load_format_hints()?;
+        Ok(hints.detect(cmd).to_string())
+    }
+
+    /// Get list of duck_hunt built-in formats.
+    ///
+    /// Note: duck_hunt detects formats from content analysis, not command patterns.
+    /// This lists available format names that can be used with duck_hunt parsing.
+    pub fn list_builtin_formats(&self) -> Result<Vec<BuiltinFormat>> {
+        let conn = self.connection()?;
+
+        let mut stmt = conn.prepare(
+            "SELECT format, description, priority FROM duck_hunt_formats() ORDER BY priority DESC, format"
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(BuiltinFormat {
+                format: row.get(0)?,
+                pattern: row.get::<_, String>(1)?, // description as "pattern" for display
+                priority: row.get(2)?,
+            })
+        })?;
+
+        let results: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+        Ok(results)
+    }
+
+    /// Check which format would be detected for a command.
+    /// Returns the format name and source (user-defined or default).
+    ///
+    /// Note: duck_hunt detects formats from content, not command names.
+    /// This only checks user-defined format hints.
+    pub fn check_format(&self, cmd: &str) -> Result<FormatMatch> {
+        let hints = self.load_format_hints()?;
+
+        // Check user-defined hints
+        for hint in hints.hints() {
+            if crate::format_hints::pattern_matches(&hint.pattern, cmd) {
+                return Ok(FormatMatch {
+                    format: hint.format.clone(),
+                    source: FormatSource::UserDefined {
+                        pattern: hint.pattern.clone(),
+                        priority: hint.priority,
+                    },
+                });
+            }
+        }
+
+        // No match - use default
+        Ok(FormatMatch {
+            format: hints.default_format().to_string(),
+            source: FormatSource::Default,
+        })
+    }
+}
+
+/// A built-in format from duck_hunt.
+#[derive(Debug, Clone)]
+pub struct BuiltinFormat {
+    pub format: String,
+    pub pattern: String,
+    pub priority: i32,
+}
+
+/// Result of format detection.
+#[derive(Debug, Clone)]
+pub struct FormatMatch {
+    pub format: String,
+    pub source: FormatSource,
+}
+
+/// Source of a format match.
+#[derive(Debug, Clone)]
+pub enum FormatSource {
+    UserDefined { pattern: String, priority: i32 },
+    Builtin { pattern: String, priority: i32 },
+    Default,
 }
 
 /// Result of a SQL query.
