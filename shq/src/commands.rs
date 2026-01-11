@@ -686,8 +686,9 @@ pub fn stats() -> bird::Result<()> {
     println!("BIRD Statistics");
     println!("===============");
     println!();
-    println!("Root:      {}", config.bird_root.display());
-    println!("Client ID: {}", config.client_id);
+    println!("Root:         {}", config.bird_root.display());
+    println!("Client ID:    {}", config.client_id);
+    println!("Storage mode: {}", config.storage_mode);
     println!();
 
     let inv_count = store.invocation_count()?;
