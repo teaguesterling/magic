@@ -4,7 +4,7 @@ use std::io::{self, Read};
 use std::process::Command;
 use std::time::Instant;
 
-use bird::{init, parse_query, CompactOptions, Config, EventFilters, InvocationRecord, Query, SessionRecord, Store};
+use bird::{init, parse_query, CompactOptions, Config, EventFilters, InvocationBatch, InvocationRecord, Query, SessionRecord, Store};
 
 /// Generate a session ID for grouping related invocations.
 fn session_id() -> String {
@@ -118,7 +118,7 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract_override: Optio
         return Ok(());
     }
 
-    // Ensure session exists (creates on first invocation from this shell)
+    // Create session and invocation records
     let sid = session_id();
     let session = SessionRecord::new(
         &sid,
@@ -127,9 +127,7 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract_override: Optio
         invoker_pid(),
         "shell",
     );
-    store.ensure_session(&session)?;
 
-    // Create and store the invocation record
     let record = InvocationRecord::new(
         &sid,
         &cmd_str,
@@ -140,18 +138,19 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract_override: Optio
     .with_duration(duration_ms);
 
     let inv_id = record.id;
-    let date = record.date();
 
-    store.write_invocation(&record)?;
+    // Build batch with all related records
+    let mut batch = InvocationBatch::new(record).with_session(session);
 
-    // Store stdout and stderr separately (routes to inline or blob based on size)
-    let cmd_hint = record.executable.as_deref();
     if !stdout.is_empty() {
-        store.store_output(inv_id, "stdout", &stdout, date, cmd_hint)?;
+        batch = batch.with_output("stdout", stdout);
     }
     if !stderr.is_empty() {
-        store.store_output(inv_id, "stderr", &stderr, date, cmd_hint)?;
+        batch = batch.with_output("stderr", stderr);
     }
+
+    // Write everything atomically
+    store.write_batch(&batch)?;
 
     // Extract events if enabled (via flag or config)
     let should_extract = extract_override.unwrap_or(config.auto_extract);
@@ -253,7 +252,7 @@ pub fn save(
         .map(|s| s.to_string())
         .unwrap_or_else(invoker_name);
 
-    // Ensure session exists
+    // Create session and invocation records
     let session = SessionRecord::new(
         &sid,
         &config.client_id,
@@ -261,9 +260,7 @@ pub fn save(
         inv_pid,
         explicit_invoker_type,
     );
-    store.ensure_session(&session)?;
 
-    // Create invocation record
     let mut inv_record = InvocationRecord::new(
         &sid,
         command,
@@ -275,22 +272,22 @@ pub fn save(
         inv_record = inv_record.with_duration(ms);
     }
     let inv_id = inv_record.id;
-    let date = inv_record.date();
 
-    store.write_invocation(&inv_record)?;
+    // Build batch with all related records
+    let mut batch = InvocationBatch::new(inv_record).with_session(session);
 
-    let cmd_hint = inv_record.executable.as_deref();
-
-    // Store output content
     if let Some(content) = stdout_content {
-        store.store_output(inv_id, "stdout", &content, date, cmd_hint)?;
+        batch = batch.with_output("stdout", content);
     }
     if let Some(content) = stderr_content {
-        store.store_output(inv_id, "stderr", &content, date, cmd_hint)?;
+        batch = batch.with_output("stderr", content);
     }
     if let Some(content) = single_content {
-        store.store_output(inv_id, stream, &content, date, cmd_hint)?;
+        batch = batch.with_output(stream, content);
     }
+
+    // Write everything atomically
+    store.write_batch(&batch)?;
 
     // Extract events if requested (uses config default or explicit flag)
     let should_extract = extract || config.auto_extract;
@@ -1369,37 +1366,39 @@ pub fn rerun(query_str: &str, dry_run: bool, no_capture: bool) -> bird::Result<(
         let exit_code = output.status.code().unwrap_or(-1);
 
         // Save to BIRD
-        let store = Store::open(Config::load()?)?;
+        let config = Config::load()?;
+        let store = Store::open(config.clone())?;
         let sid = session_id();
+
         let session = SessionRecord::new(
             &sid,
-            &Config::load()?.client_id,
+            &config.client_id,
             &invoker_name(),
             invoker_pid(),
             "shell",
         );
-        store.ensure_session(&session)?;
 
         let record = InvocationRecord::new(
             &sid,
             cmd,
             cwd,
             exit_code,
-            &Config::load()?.client_id,
+            &config.client_id,
         )
         .with_duration(duration_ms);
 
-        let inv_id = record.id;
-        let date = record.date();
-        store.write_invocation(&record)?;
+        // Build batch with all related records
+        let mut batch = InvocationBatch::new(record).with_session(session);
 
-        let cmd_hint = record.executable.as_deref();
         if !output.stdout.is_empty() {
-            store.store_output(inv_id, "stdout", &output.stdout, date, cmd_hint)?;
+            batch = batch.with_output("stdout", output.stdout.clone());
         }
         if !output.stderr.is_empty() {
-            store.store_output(inv_id, "stderr", &output.stderr, date, cmd_hint)?;
+            batch = batch.with_output("stderr", output.stderr.clone());
         }
+
+        // Write everything atomically
+        store.write_batch(&batch)?;
 
         if !output.status.success() {
             std::process::exit(exit_code);
