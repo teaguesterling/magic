@@ -679,25 +679,143 @@ pub fn sql(query: &str) -> bird::Result<()> {
     Ok(())
 }
 
-pub fn stats() -> bird::Result<()> {
+/// Statistics about the BIRD store.
+#[derive(serde::Serialize)]
+pub struct BirdStats {
+    pub root: String,
+    pub client_id: String,
+    pub storage_mode: String,
+    pub invocations: InvocationStats,
+    pub sessions: SessionStats,
+    pub events: EventStats,
+}
+
+#[derive(serde::Serialize)]
+pub struct InvocationStats {
+    pub total: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last: Option<LastInvocation>,
+}
+
+#[derive(serde::Serialize)]
+pub struct LastInvocation {
+    pub id: String,
+    pub cmd: String,
+    pub exit_code: i32,
+    pub timestamp: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct SessionStats {
+    pub total: i64,
+}
+
+#[derive(serde::Serialize)]
+pub struct EventStats {
+    pub total: i64,
+    pub errors: i64,
+    pub warnings: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<LastError>,
+}
+
+#[derive(serde::Serialize)]
+pub struct LastError {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<i32>,
+}
+
+pub fn stats(format: &str) -> bird::Result<()> {
     let config = Config::load()?;
     let store = Store::open(config.clone())?;
 
-    println!("BIRD Statistics");
-    println!("===============");
-    println!();
-    println!("Root:         {}", config.bird_root.display());
-    println!("Client ID:    {}", config.client_id);
-    println!("Storage mode: {}", config.storage_mode);
-    println!();
-
+    // Gather stats
     let inv_count = store.invocation_count()?;
     let session_count = store.session_count()?;
-    println!("Total invocations: {}", inv_count);
-    println!("Total sessions:    {}", session_count);
+    let last_inv = store.last_invocation()?;
 
-    if let Some(last) = store.last_invocation()? {
-        println!("Last invocation:   {} (exit {})", last.cmd, last.exit_code);
+    let event_count = store.event_count(&EventFilters::default())?;
+    let error_count = store.event_count(&EventFilters {
+        severity: Some("error".to_string()),
+        ..Default::default()
+    })?;
+    let warning_count = store.event_count(&EventFilters {
+        severity: Some("warning".to_string()),
+        ..Default::default()
+    })?;
+
+    let last_error_event = store.query_events(&EventFilters {
+        severity: Some("error".to_string()),
+        limit: Some(1),
+        ..Default::default()
+    })?;
+
+    // Build stats struct
+    let stats = BirdStats {
+        root: config.bird_root.display().to_string(),
+        client_id: config.client_id.clone(),
+        storage_mode: config.storage_mode.to_string(),
+        invocations: InvocationStats {
+            total: inv_count,
+            last: last_inv.map(|inv| LastInvocation {
+                id: inv.id.clone(),
+                cmd: inv.cmd.clone(),
+                exit_code: inv.exit_code,
+                timestamp: inv.timestamp.clone(),
+            }),
+        },
+        sessions: SessionStats {
+            total: session_count,
+        },
+        events: EventStats {
+            total: event_count,
+            errors: error_count,
+            warnings: warning_count,
+            last_error: last_error_event.first().map(|err| LastError {
+                id: err.id.clone(),
+                message: err.message.clone(),
+                file: err.ref_file.clone(),
+                line: err.ref_line,
+            }),
+        },
+    };
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&stats).unwrap());
+        }
+        _ => {
+            println!("BIRD Statistics");
+            println!("===============");
+            println!();
+            println!("Root:         {}", stats.root);
+            println!("Client ID:    {}", stats.client_id);
+            println!("Storage mode: {}", stats.storage_mode);
+            println!();
+            println!("Total invocations: {}", stats.invocations.total);
+            println!("Total sessions:    {}", stats.sessions.total);
+            if let Some(ref inv) = stats.invocations.last {
+                println!("Last command:      {} (exit {})", inv.cmd, inv.exit_code);
+            }
+            println!();
+            println!("Total events:      {}", stats.events.total);
+            println!("  Errors:          {}", stats.events.errors);
+            println!("  Warnings:        {}", stats.events.warnings);
+            if let Some(ref err) = stats.events.last_error {
+                let location = match (&err.file, err.line) {
+                    (Some(f), Some(l)) => format!(" at {}:{}", f, l),
+                    (Some(f), None) => format!(" in {}", f),
+                    _ => String::new(),
+                };
+                let msg = err.message.as_deref().unwrap_or("-");
+                println!("  Last error:      {}{}", truncate_string(msg, 40), location);
+            }
+        }
     }
 
     Ok(())

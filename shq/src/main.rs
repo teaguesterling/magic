@@ -209,7 +209,11 @@ enum Commands {
     QuickHelp,
 
     /// Show statistics
-    Stats,
+    Stats {
+        /// Output format: table, json
+        #[arg(short = 'f', long = "format", default_value = "table")]
+        format: String,
+    },
 
     /// Move old data from recent to archive
     Archive {
@@ -427,7 +431,7 @@ fn main() {
         Commands::Rerun { query, dry_run, no_capture } => commands::rerun(&query, dry_run, no_capture),
         Commands::Sql { query } => commands::sql(&query),
         Commands::QuickHelp => commands::quick_help(),
-        Commands::Stats => commands::stats(),
+        Commands::Stats { format } => commands::stats(&format),
         Commands::Archive { days, dry_run, extract_first } => commands::archive(days, dry_run, extract_first),
         Commands::Compact { file_threshold, recompact_threshold, consolidate, extract_first, session, today_only, quiet, recent_only, archive_only, dry_run } => {
             commands::compact(file_threshold, recompact_threshold, consolidate, extract_first, session.as_deref(), today_only, quiet, recent_only, archive_only, dry_run)
