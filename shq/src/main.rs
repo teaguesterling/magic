@@ -292,6 +292,36 @@ enum Commands {
         action: RemoteAction,
     },
 
+    /// Push local data to a remote
+    Push {
+        /// Remote to push to (uses default if not specified)
+        #[arg(short, long)]
+        remote: Option<String>,
+
+        /// Only push data since this date or duration (e.g., "7d", "2024-01-15")
+        #[arg(short, long)]
+        since: Option<String>,
+
+        /// Show what would be pushed without actually pushing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Pull data from a remote to local
+    Pull {
+        /// Remote to pull from (uses default if not specified)
+        #[arg(short, long)]
+        remote: Option<String>,
+
+        /// Only pull data from this client
+        #[arg(short, long)]
+        client: Option<String>,
+
+        /// Only pull data since this date or duration (e.g., "7d", "2024-01-15")
+        #[arg(short, long)]
+        since: Option<String>,
+    },
+
     /// Query parsed events (errors, warnings, test results) from invocation outputs
     #[command(visible_alias = "e")]
     Events {
@@ -575,6 +605,12 @@ fn main() {
             RemoteAction::Test { name } => commands::remote_test(name.as_deref()),
             RemoteAction::Attach { name } => commands::remote_attach(&name),
             RemoteAction::Status => commands::remote_status(),
+        },
+        Commands::Push { remote, since, dry_run } => {
+            commands::push(remote.as_deref(), since.as_deref(), dry_run)
+        },
+        Commands::Pull { remote, client, since } => {
+            commands::pull(remote.as_deref(), client.as_deref(), since.as_deref())
         },
         Commands::Events { query, severity, count_only, lines, reparse, format } => {
             // Parse lines: N (any), +N (first N), -N (last N)

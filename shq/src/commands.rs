@@ -4,7 +4,10 @@ use std::io::{self, Read};
 use std::process::Command;
 use std::time::Instant;
 
-use bird::{init, parse_query, CompactOptions, Config, EventFilters, InvocationBatch, InvocationRecord, Query, SessionRecord, StorageMode, Store};
+use bird::{
+    init, parse_query, CompactOptions, Config, EventFilters, InvocationBatch, InvocationRecord,
+    Query, SessionRecord, StorageMode, Store, BIRD_INVOCATION_UUID_VAR, BIRD_PARENT_CLIENT_VAR,
+};
 
 /// Generate a session ID for grouping related invocations.
 fn session_id() -> String {
@@ -79,6 +82,14 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract_override: Optio
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
+    // Generate invocation ID upfront so we can pass it to child processes
+    // This allows nested BIRD clients (e.g., blq inside shq run) to use the same UUID
+    let invocation_id = uuid::Uuid::now_v7();
+
+    // Set environment variables for nested BIRD clients
+    command.env(BIRD_INVOCATION_UUID_VAR, invocation_id.to_string());
+    command.env(BIRD_PARENT_CLIENT_VAR, "shq");
+
     // Execute the command and capture output
     let start = Instant::now();
     let output = command.output();
@@ -128,7 +139,9 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract_override: Optio
         "shell",
     );
 
-    let record = InvocationRecord::new(
+    // Use the pre-generated invocation ID (which was passed to child process)
+    let record = InvocationRecord::with_id(
+        invocation_id,
         &sid,
         &cmd_str,
         &cwd,
@@ -2087,6 +2100,78 @@ pub fn remote_status() -> bird::Result<()> {
             println!("  {} ({}, {})", remote.name, remote.remote_type, remote.mode);
         }
     }
+
+    Ok(())
+}
+
+// Push/Pull commands
+
+/// Push local data to a remote.
+pub fn push(remote: Option<&str>, since: Option<&str>, dry_run: bool) -> bird::Result<()> {
+    use bird::{parse_since, PushOptions};
+
+    let config = Config::load()?;
+    let store = Store::open(config.clone())?;
+
+    // Resolve remote
+    let remote_name = remote
+        .map(String::from)
+        .or_else(|| config.sync.default_remote.clone())
+        .ok_or_else(|| bird::Error::Config(
+            "No remote specified and no default remote configured. Use --remote <name> or set sync.default_remote in config.".to_string()
+        ))?;
+
+    let remote_config = config.get_remote(&remote_name)
+        .ok_or_else(|| bird::Error::Config(format!("Remote '{}' not found", remote_name)))?;
+
+    // Parse since date
+    let since_date = since.map(parse_since).transpose()?;
+
+    let opts = PushOptions {
+        since: since_date,
+        dry_run,
+    };
+
+    let stats = store.push(remote_config, opts)?;
+
+    if dry_run {
+        println!("Would push to '{}': {}", remote_name, stats);
+    } else {
+        println!("Pushed to '{}': {}", remote_name, stats);
+    }
+
+    Ok(())
+}
+
+/// Pull data from a remote to local.
+pub fn pull(remote: Option<&str>, client: Option<&str>, since: Option<&str>) -> bird::Result<()> {
+    use bird::{parse_since, PullOptions};
+
+    let config = Config::load()?;
+    let store = Store::open(config.clone())?;
+
+    // Resolve remote
+    let remote_name = remote
+        .map(String::from)
+        .or_else(|| config.sync.default_remote.clone())
+        .ok_or_else(|| bird::Error::Config(
+            "No remote specified and no default remote configured. Use --remote <name> or set sync.default_remote in config.".to_string()
+        ))?;
+
+    let remote_config = config.get_remote(&remote_name)
+        .ok_or_else(|| bird::Error::Config(format!("Remote '{}' not found", remote_name)))?;
+
+    // Parse since date
+    let since_date = since.map(parse_since).transpose()?;
+
+    let opts = PullOptions {
+        since: since_date,
+        client_id: client.map(String::from),
+    };
+
+    let stats = store.pull(remote_config, opts)?;
+
+    println!("Pulled from '{}': {}", remote_name, stats);
 
     Ok(())
 }

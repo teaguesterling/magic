@@ -1,54 +1,66 @@
-# BIRD Specification v2 (Content-Addressed Storage)
+# BIRD Specification v3 (Dual Storage Backends + Remote Sync)
 
 **BIRD**: Buffer and Invocation Record Database
 
-BIRD is the database backend for shq, using DuckDB and Parquet for efficient storage and querying of shell command history. This version adds **content-addressed blob storage** for automatic deduplication.
+BIRD is the database backend for shq, using DuckDB for queries and either Parquet files or DuckDB tables for storage. This version adds **dual storage backends** and **remote sync** capabilities.
 
 ## Overview
 
 BIRD stores every shell command execution as:
-- **Command metadata**: timestamp, exit code, duration, working directory
-- **Output streams**: stdout and stderr (with smart content-addressed storage for large outputs)
-- **Parsed events**: Errors, warnings, and other structured log data
+- **Invocation metadata**: timestamp, exit code, duration, working directory
+- **Session context**: shell/invoker information, client identity
+- **Output streams**: stdout and stderr (with content-addressed storage for large outputs)
+- **Parsed events**: Errors, warnings, and structured diagnostics from build tools
 
-Data is organized by date for efficient querying and archival. Large outputs (≥1MB) are deduplicated via content-addressed storage.
+### Key Features
+
+- **Dual storage backends**: Choose parquet (multi-writer safe) or duckdb (simpler, single-writer)
+- **Content-addressed blobs**: Automatic deduplication for large outputs (70-90% savings)
+- **Remote sync**: Push/pull data to S3, MotherDuck, PostgreSQL, or file-based remotes
+- **Event parsing**: Extract structured diagnostics from build output (gcc, cargo, pytest, etc.)
+- **Date partitioning**: Efficient archival and time-based queries
 
 ## Directory Structure
 
 ```
 $BIRD_ROOT/                          # Default: ~/.local/share/bird
 ├── db/
-│   ├── bird.duckdb                  # Pre-configured views and macros
+│   ├── bird.duckdb                  # DuckDB database (views, tables, or both)
 │   ├── data/
 │   │   ├── recent/                  # Last 14 days (hot data)
-│   │   │   ├── commands/
+│   │   │   ├── invocations/         # Command execution records
 │   │   │   │   └── date=YYYY-MM-DD/
 │   │   │   │       └── <session>--<exec>--<uuid>.parquet
-│   │   │   ├── outputs/
+│   │   │   ├── outputs/             # stdout/stderr content
 │   │   │   │   └── date=YYYY-MM-DD/
 │   │   │   │       └── <session>--<exec>--<uuid>.parquet
+│   │   │   ├── sessions/            # Shell/invoker sessions
+│   │   │   │   └── date=YYYY-MM-DD/
+│   │   │   │       └── <session>--<invoker>--<uuid>.parquet
+│   │   │   ├── events/              # Parsed diagnostics
+│   │   │   │   └── date=YYYY-MM-DD/
+│   │   │   │       └── <session>--<format>--<uuid>.parquet
 │   │   │   └── blobs/
 │   │   │       └── content/         # Content-addressed pool
 │   │   │           ├── ab/
-│   │   │           │   └── abc123def456...789.bin.gz
-│   │   │           ├── cd/
-│   │   │           │   └── cde456789012...345.bin.gz
+│   │   │           │   └── <hash>--<cmd-hint>.bin
 │   │   │           └── ...          # 256 subdirs (00-ff)
 │   │   └── archive/                 # >14 days (cold data)
-│   │       └── by-week/
-│   │           ├── commands/
-│   │           │   └── client=<n>/year=YYYY/week=WW/*.parquet
-│   │           ├── outputs/
-│   │           │   └── client=<n>/year=YYYY/week=WW/*.parquet
-│   │           └── blobs/
-│   │               └── content/     # Global content pool (archived)
-│   │                   ├── ab/
-│   │                   └── cd/
+│   │       ├── invocations/
+│   │       │   └── client=<n>/year=YYYY/week=WW/*.parquet
+│   │       ├── outputs/
+│   │       │   └── client=<n>/year=YYYY/week=WW/*.parquet
+│   │       ├── sessions/
+│   │       │   └── client=<n>/year=YYYY/week=WW/*.parquet
+│   │       ├── events/
+│   │       │   └── client=<n>/year=YYYY/week=WW/*.parquet
+│   │       └── blobs/
+│   │           └── content/         # Archived content pool
 │   └── sql/
-│       ├── init.sql                 # Complete initialization
 │       ├── views.sql                # View definitions
 │       └── macros.sql               # Macro definitions
-├── config.toml                      # Configuration
+├── config.toml                      # Configuration (including remotes)
+├── format-hints.toml                # Format detection hints
 └── errors.log                       # Capture error log
 ```
 
@@ -56,154 +68,229 @@ $BIRD_ROOT/                          # Default: ~/.local/share/bird
 
 - **db/**: Contains both data and database objects
 - **db/data/**: Separates data from metadata (bird.duckdb, SQL files)
-- **recent/**: Optimized for fast access, date-partitioned
-- **archive/**: Optimized for compression, organized by client/year/week
+- **recent/**: Hot tier - optimized for fast writes and queries (last 14 days)
+- **archive/**: Cold tier - optimized for compression, organized by client/year/week
 - **blobs/content/**: Content-addressed blob storage with automatic deduplication
   - Subdirectories: First 2 hex chars of hash (`ab/`, `cd/`, etc.)
   - Prevents filesystem slowdown with >10k files/directory
   - Same blob shared by multiple commands → **70-90% storage savings** for CI workloads
-  - See **CONTENT_ADDRESSED_BLOBS.md** for full design
+
+## Storage Backends
+
+BIRD supports two storage backends, selected at initialization:
+
+| Mode | CLI Flag | Write Pattern | Compaction | Best For |
+|------|----------|---------------|------------|----------|
+| **Parquet** | `--mode parquet` (default) | Multi-writer safe (atomic files) | Required | Concurrent shells |
+| **DuckDB** | `--mode duckdb` | Single-writer (table inserts) | Not needed | Single-shell usage |
+
+**Key insight**: Reading always goes through DuckDB views, regardless of storage mode.
+
+### Parquet Mode (Default)
+
+Each write creates a unique Parquet file with atomic rename:
+
+```
+invocations/date=2024-01-15/zsh-12345--make--01937a2b.parquet
+```
+
+**Pros:**
+- Multiple shells can write simultaneously (no locks)
+- Natural date partitioning
+- Easy to inspect with external tools
+
+**Cons:**
+- Requires periodic compaction to merge small files
+- Many small files until compacted
+
+### DuckDB Mode
+
+Writes go directly to DuckDB tables:
+
+```sql
+INSERT INTO invocations_table VALUES (...);
+```
+
+**Pros:**
+- Simpler implementation
+- No compaction needed
+- Single file for all data
+
+**Cons:**
+- Must serialize writes (connect/disconnect pattern)
+- Not suitable for concurrent shell hooks
 
 ## Schema
 
-### Commands Table (Parquet)
+### Invocations Table
+
+A captured command/process execution.
 
 ```sql
-CREATE TABLE commands (
+CREATE TABLE invocations (
     -- Identity
-    id                UUID PRIMARY KEY,
-    session_id        TEXT NOT NULL,           -- Session identifier
-    
+    id                UUID PRIMARY KEY,        -- UUIDv7 (time-ordered)
+    session_id        VARCHAR NOT NULL,        -- References sessions.session_id
+
     -- Timing
     timestamp         TIMESTAMP NOT NULL,
     duration_ms       BIGINT,
-    
+
     -- Context
-    cwd               TEXT NOT NULL,
-    env_hash          TEXT,                     -- Hash of environment
-    
+    cwd               VARCHAR NOT NULL,        -- Working directory
+
     -- Command
-    cmd               TEXT NOT NULL,
-    executable        TEXT,                     -- Extracted executable name
-    args              TEXT[],                   -- Parsed arguments (if available)
-    
+    cmd               VARCHAR NOT NULL,        -- Full command string
+    executable        VARCHAR,                 -- Extracted executable name
+
     -- Result
-    exit_code         INT NOT NULL,
-    
+    exit_code         INTEGER NOT NULL,
+
     -- Format detection
-    format_hint       TEXT,                     -- Detected format (gcc, pytest, etc.)
-    
-    -- Output references
-    stdout_file       TEXT,                     -- Path to stdout redirect
-    stderr_file       TEXT,                     -- Path to stderr redirect
-    has_stdout        BOOLEAN DEFAULT FALSE,
-    has_stderr        BOOLEAN DEFAULT FALSE,
-    
-    -- Metadata
-    client_id         TEXT NOT NULL,            -- Client identifier
-    hostname          TEXT,
-    username          TEXT,
-    
+    format_hint       VARCHAR,                 -- Detected format (gcc, cargo, pytest)
+
+    -- Client identity
+    client_id         VARCHAR NOT NULL,        -- user@hostname
+    hostname          VARCHAR,
+    username          VARCHAR,
+
     -- Partitioning
-    date              DATE GENERATED ALWAYS AS (CAST(timestamp AS DATE))
+    date              DATE NOT NULL
 );
 ```
 
-### Outputs Table (Parquet) - Updated for Content-Addressing
+### Sessions Table
+
+A shell or process that captures invocations.
+
+```sql
+CREATE TABLE sessions (
+    -- Identity
+    session_id        VARCHAR PRIMARY KEY,     -- e.g., "zsh-12345"
+    client_id         VARCHAR NOT NULL,        -- user@hostname
+
+    -- Invoker information
+    invoker           VARCHAR NOT NULL,        -- e.g., "zsh", "bash", "shq"
+    invoker_pid       INTEGER NOT NULL,
+    invoker_type      VARCHAR NOT NULL,        -- "shell", "cli", "hook", "script"
+
+    -- Timing
+    registered_at     TIMESTAMP NOT NULL,
+
+    -- Context
+    cwd               VARCHAR,                 -- Initial working directory
+
+    -- Partitioning
+    date              DATE NOT NULL
+);
+```
+
+### Outputs Table
+
+Captured stdout/stderr from an invocation.
 
 ```sql
 CREATE TABLE outputs (
     -- Identity
-    id                UUID PRIMARY KEY,
-    command_id        UUID NOT NULL,            -- References commands.id
-    
+    id                UUID PRIMARY KEY,        -- UUIDv7
+    invocation_id     UUID NOT NULL,           -- References invocations.id
+
+    -- Stream
+    stream            VARCHAR NOT NULL,        -- 'stdout', 'stderr', or 'combined'
+
     -- Content identification
-    content_hash      TEXT NOT NULL,            -- BLAKE3 hash (hex)
+    content_hash      VARCHAR NOT NULL,        -- BLAKE3 hash (hex, 64 chars)
     byte_length       BIGINT NOT NULL,
-    
+
     -- Storage location (polymorphic)
-    storage_type      TEXT NOT NULL,            -- 'inline', 'blob', 'tarfs', 'archive'
-    storage_ref       TEXT NOT NULL,            -- URI to content
-    
+    storage_type      VARCHAR NOT NULL,        -- 'inline' or 'blob'
+    storage_ref       VARCHAR NOT NULL,        -- URI to content (see below)
+
     -- Content metadata
-    stream            TEXT NOT NULL,            -- 'stdout' or 'stderr'
-    content_type      TEXT,                     -- MIME type or format hint
-    encoding          TEXT DEFAULT 'utf-8',
-    
-    -- Status
-    compressed        BOOLEAN DEFAULT FALSE,
-    truncated         BOOLEAN DEFAULT FALSE,
-    
+    content_type      VARCHAR,                 -- MIME type or format hint
+
     -- Partitioning
     date              DATE NOT NULL
 );
-
-CREATE INDEX idx_outputs_hash ON outputs(content_hash);
-CREATE INDEX idx_outputs_storage ON outputs(storage_type);
 ```
 
-**Key changes:**
-- `content_hash`: BLAKE3 hash of content (deduplication key)
-- `storage_type`: How content is stored ('inline', 'blob', 'tarfs', 'archive')
-- `storage_ref`: URI to actual content
-- Removed `content` BLOB column (now in storage_ref)
-- Removed `file_ref` (now unified as storage_ref)
+**Storage Reference Formats:**
 
-### Blob Registry Table (DuckDB)
+| Type | Format | Example |
+|------|--------|---------|
+| Inline (small) | `data:` URI | `data:application/octet-stream;base64,SGVsbG8=` |
+| Local blob | `file:` relative path | `file:ab/abc123--make.bin` |
+| S3 blob | Full S3 URL | `s3://bucket/blobs/ab/abc123--make.bin` |
+
+### Events Table
+
+Parsed diagnostics from invocation output (errors, warnings, test results).
 
 ```sql
-CREATE TABLE blob_registry (
+CREATE TABLE events (
     -- Identity
-    content_hash      TEXT PRIMARY KEY,        -- BLAKE3 hash
-    byte_length       BIGINT NOT NULL,
-    compression       TEXT DEFAULT 'gzip',     -- gzip, zstd, none
-    
-    -- Reference tracking
-    ref_count         INT DEFAULT 0,           -- How many outputs reference this
-    first_seen        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_accessed     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    -- Storage location
-    storage_tier      TEXT,                    -- 'recent', 'archive'
-    storage_path      TEXT,                    -- Relative path from BIRD_ROOT
-    
-    -- Integrity
-    verified_at       TIMESTAMP,               -- Last integrity check
-    corrupt           BOOLEAN DEFAULT FALSE
-);
+    id                UUID PRIMARY KEY,        -- UUIDv7
+    invocation_id     UUID NOT NULL,           -- References invocations.id
 
-CREATE INDEX idx_blob_registry_refs ON blob_registry(ref_count);
-CREATE INDEX idx_blob_registry_tier ON blob_registry(storage_tier);
-CREATE INDEX idx_blob_registry_accessed ON blob_registry(last_accessed);
+    -- Client identity (denormalized for cross-client queries)
+    client_id         VARCHAR NOT NULL,
+    hostname          VARCHAR,
+
+    -- Event classification
+    event_type        VARCHAR,                 -- 'diagnostic', 'test_result', etc.
+    severity          VARCHAR,                 -- 'error', 'warning', 'info', 'note'
+
+    -- Source location
+    ref_file          VARCHAR,                 -- Source file path
+    ref_line          INTEGER,                 -- Line number
+    ref_column        INTEGER,                 -- Column number
+
+    -- Content
+    message           VARCHAR,                 -- Error/warning message
+    error_code        VARCHAR,                 -- e.g., "E0308", "W0401"
+
+    -- Test-specific fields
+    test_name         VARCHAR,                 -- Test name (for test results)
+    status            VARCHAR,                 -- 'passed', 'failed', 'skipped'
+
+    -- Parsing metadata
+    format_used       VARCHAR NOT NULL,        -- Parser format (gcc, cargo, pytest)
+
+    -- Partitioning
+    date              DATE NOT NULL
+);
 ```
 
-**Purpose:**
-- Central registry of all blobs
-- Tracks reference counts for garbage collection
-- Enables integrity verification
-- Supports storage tier migration
+## Output Storage
 
-## Storage Modes
+### Inline Storage (Small Outputs)
 
-### Small Outputs (<1MB): Inline Storage
+Outputs under `inline_threshold` (default: 4KB) are stored as base64 data URIs:
 
-```sql
-content_hash:  'abc123def...'
+```
 storage_type:  'inline'
 storage_ref:   'data:application/octet-stream;base64,SGVsbG8gV29ybGQK'
 ```
 
 **Benefits:**
 - No separate file needed
-- Fast queries (data in parquet)
+- Fast queries (data in parquet/table)
 - Simple backups
 
-### Large Outputs (≥1MB): Content-Addressed Blob
+### Blob Storage (Large Outputs)
 
-```sql
-content_hash:  'abc123def...'
+Large outputs are stored as content-addressed files:
+
+```
 storage_type:  'blob'
-storage_ref:   'file://recent/blobs/content/ab/abc123def.bin.gz'
+storage_ref:   'file:ab/abc123def--make.bin'
+```
+
+**Filename format:**
+```
+{hash[0:2]}/{hash}--{cmd-hint}.bin
+
+Example: ab/abc123def456789...--make-test.bin
 ```
 
 **Benefits:**
@@ -211,44 +298,38 @@ storage_ref:   'file://recent/blobs/content/ab/abc123def.bin.gz'
 - 70-90% storage savings for repetitive CI workloads
 - Integrity verification via hash
 
-**Filename format:**
-```
-recent/blobs/content/{hash[0:2]}/{hash}.bin.gz
+### Blob Resolution
 
-Example:
-recent/blobs/content/ab/abc123def456789abcdef0123456789abcdef0123456789.bin.gz
-```
-
-### Compacted: Tarfs (Not Applicable to Blobs)
-
-Blobs use content-addressing and don't need compaction. Only parquet files are compacted.
-
-### Archived: Global Content Pool
+Blobs can exist in multiple locations (local, archive, remote S3). BIRD uses a `blob_roots` list for resolution:
 
 ```sql
-content_hash:  'abc123def...'
-storage_type:  'archive'
-storage_ref:   'file://archive/blobs/content/ab/abc123def.bin.gz'
-```
+-- Set at connection time
+SET VARIABLE blob_roots = [
+    '/home/user/.local/share/bird/db/data/recent/blobs/content',
+    's3://team-bucket/bird/blobs'
+];
 
-Blobs move to archive pool when all referencing commands are archived.
+-- Resolve storage_ref across all roots
+SELECT resolve_storage_ref(storage_ref) FROM outputs;
+```
 
 ## Filename Formats
 
-### Commands/Outputs (Recent and Archive)
+### Parquet Files (Invocations, Outputs, Sessions, Events)
 
 ```
-<session>--<executable>--<uuid>.parquet
+<session>--<hint>--<uuid>.parquet
 ```
 
 **Components:**
 - `<session>`: Session identifier (sanitized, max 32 chars)
-- `<executable>`: Executable name from command (sanitized, max 64 chars)
+- `<hint>`: Executable name or format name (sanitized, max 64 chars)
 - `<uuid>`: UUIDv7 (timestamp-ordered, collision-free)
 
-**Example:**
+**Examples:**
 ```
-laptop-12345--make--01937a2b-3c4d-7e8f-9012-3456789abcde.parquet
+zsh-12345--make--01937a2b-3c4d-7e8f-9012-3456789abcde.parquet
+zsh-12345--cargo--01937a2c-1234-5678-9abc-def012345678.parquet
 ```
 
 ### Compacted Files
@@ -259,140 +340,135 @@ laptop-12345--make--01937a2b-3c4d-7e8f-9012-3456789abcde.parquet
 
 **Example:**
 ```
-laptop-12345--__compacted-0__--01937b5e-6f7a-8b9c-0123-456789abcdef.parquet
+zsh-12345--__compacted-0__--01937b5e-6f7a-8b9c-0123-456789abcdef.parquet
 ```
+
+The compaction generation `N` increments each time a partition is compacted.
 
 ### Content-Addressed Blobs
 
 ```
-{hash[0:2]}/{hash}.bin.gz
+{hash[0:2]}/{hash}--{cmd-hint}.bin
 ```
 
 **Format:**
-- First 2 hex chars as subdirectory
+- First 2 hex chars as subdirectory (prevents filesystem slowdown)
 - BLAKE3 hash (64 hex chars)
-- `.bin.gz` extension (gzip compressed binary)
+- Command hint for human readability
+- `.bin` extension (uncompressed by default)
 
 **Example:**
 ```
-ab/abc123def456789abcdef0123456789abcdef0123456789abcdef0123456789.bin.gz
+ab/abc123def456789abcdef0123456789abcdef0123456789abcdef0123456789--make-test.bin
 ```
 
-**Why not UUIDs?**
-- Hash = content, enabling automatic deduplication
-- Same output → same filename → reuse existing file
-- Huge storage savings for CI workloads
+## Remote Storage
 
-## Capture Flow (with Deduplication)
+BIRD supports syncing data to remote databases for backup, sharing, and cross-machine access.
 
-```rust
-pub fn capture_output(&mut self, data: &[u8], stream: &str) -> Result<OutputId> {
-    // 1. Compute content hash
-    let hash = blake3::hash(data);
-    let hash_hex = hash.to_hex();
-    
-    // 2. Size-based routing
-    let (storage_type, storage_ref) = if data.len() < SIZE_THRESHOLD {
-        // Small: inline with data: URI
-        ("inline", format!("data:;base64,{}", base64::encode(data)))
-    } else {
-        // Large: check if blob exists (deduplication!)
-        if let Some(path) = self.check_blob_exists(&hash_hex)? {
-            // DEDUP HIT: Increment ref count, reuse path
-            self.increment_ref_count(&hash_hex)?;
-            ("blob", format!("file://{}", path))
-        } else {
-            // DEDUP MISS: Write new blob
-            let path = self.write_blob(&hash_hex, data)?;
-            self.register_blob(&hash_hex, data.len(), &path)?;
-            ("blob", format!("file://{}", path))
-        }
-    };
-    
-    // 3. Insert output record
-    self.db.execute(
-        "INSERT INTO outputs 
-            (id, command_id, stream, content_hash, byte_length, storage_type, storage_ref, date)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        params![uuid, cmd_id, stream, &hash_hex, data.len(), storage_type, storage_ref, date]
-    )?;
-    
-    Ok(output_id)
-}
+### Remote Types
+
+| Type | URI Format | Description |
+|------|------------|-------------|
+| `file` | `/path/to/bird.duckdb` | Local or network file |
+| `s3` | `s3://bucket/path/bird.duckdb` | S3-compatible storage |
+| `motherduck` | `md:database_name` | MotherDuck cloud |
+| `postgres` | `postgres:dbname=...` | PostgreSQL database |
+
+### Configuration
+
+Remotes are configured in `config.toml`:
+
+```toml
+[[remotes]]
+name = "team"
+type = "s3"
+uri = "s3://team-bucket/bird/bird.duckdb"
+credential_provider = "credential_chain"
+auto_attach = true
+
+[[remotes]]
+name = "backup"
+type = "file"
+uri = "/mnt/backup/bird.duckdb"
+mode = "read_only"
+auto_attach = false
+
+[sync]
+default_remote = "team"
+sync_invocations = true
+sync_outputs = true
+sync_events = true
 ```
 
-**Key insight:** Same hash → reuse existing file → storage savings!
+### Querying Remotes
 
-## Compaction (Updated)
-
-### Parquet Files: Yes (As Before)
-
-**When:**
-- Date partition exceeds threshold (default: 100 files)
-- Triggered hourly or manually
-
-**How:**
-- Oldest 50% of files merged into `__compacted-N__` file
-- Applies to commands/ and outputs/ directories
-
-**See:** BLOB_COMPACTION_SUMMARY.md for details
-
-### Blob Files: No Compaction Needed!
-
-**Why not?**
-- Content-addressed blobs are already deduplicated
-- No date partitioning (blobs are timeless, referenced by hash)
-- Compaction benefit comes from merging small parquets, not blob files
-
-**What happens instead:**
-- Blobs stay in content pool indefinitely
-- Garbage collection removes unreferenced blobs (optional)
-- Archival moves old blobs to archive pool (preserves dedup)
-
-## Garbage Collection (Optional)
-
-### When to GC?
-
-Blobs can accumulate if commands are deleted but blobs remain.
-
-### Strategy 1: Never Delete (MVP)
-
-```
-✅ Simplest
-✅ Storage is cheap  
-✅ Content-addressing already saves 70-90%
-❌ Disk usage grows over time
-```
-
-### Strategy 2: Reference Counting
+Remotes are attached as DuckDB schemas using `ATTACH`:
 
 ```sql
--- Find orphaned blobs
-SELECT content_hash, storage_path, ref_count
-FROM blob_registry
-WHERE ref_count = 0
-  AND last_accessed < NOW() - INTERVAL '30 days';
+-- Auto-attached remotes available as schemas
+SELECT * FROM "remote_team".invocations WHERE client_id = 'alice@laptop';
 
--- Delete (after grace period)
-DELETE FROM blob_registry WHERE ref_count = 0 AND ...;
+-- Query across local and remote
+SELECT * FROM invocations
+UNION ALL
+SELECT * FROM "remote_team".invocations;
 ```
 
-**Recommended for production.**
+### Push/Pull Sync
 
-### Strategy 3: Mark-and-Sweep (Batch)
+Data sync uses `INSERT INTO ... SELECT` with anti-join to avoid duplicates:
 
-```sql
--- Mark: Find all referenced hashes
-CREATE TEMP TABLE referenced AS
-SELECT DISTINCT content_hash FROM outputs;
+```bash
+# Push local data to remote
+shq push --remote team              # Push all new data
+shq push --remote team --since 7d   # Push last 7 days
+shq push --remote team --dry-run    # Preview what would be pushed
 
--- Sweep: Delete unreferenced
-DELETE FROM blob_registry
-WHERE content_hash NOT IN (SELECT * FROM referenced)
-  AND last_accessed < NOW() - INTERVAL '30 days';
+# Pull remote data to local
+shq pull --remote team                    # Pull all new data
+shq pull --remote team --client bob@work  # Pull specific client
 ```
 
-**Recommended for migrations.**
+**Sync order matters** - data is synced in dependency order:
+1. Sessions (referenced by invocations)
+2. Invocations (referenced by outputs/events)
+3. Outputs
+4. Events
+
+## Compaction
+
+### When to Compact
+
+Compaction merges many small parquet files into fewer large ones:
+
+- **Trigger**: When a session has more than N files (default: 50) in a date partition
+- **Automatic**: Shell hooks run background compaction after each command
+- **Manual**: `shq compact` for full compaction
+
+### How Compaction Works
+
+1. Find sessions with file count exceeding threshold
+2. Read all files for that session/date into memory
+3. Write consolidated file with `__compacted-N__` naming
+4. Delete original files
+
+**Note:** Blobs are never compacted - they're already deduplicated by content hash.
+
+## Archival
+
+Move old data from recent tier to archive tier:
+
+```bash
+shq archive              # Archive data older than 14 days (default)
+shq archive --days 30    # Archive data older than 30 days
+shq archive --dry-run    # Preview what would be archived
+```
+
+Archive tier uses different partitioning optimized for cold storage:
+- Organized by `client/year/week` instead of `date`
+- Larger consolidated files
+- Blobs move to archive pool when all referencing invocations are archived
 
 ## Performance Targets
 
@@ -477,62 +553,176 @@ If dedup check fails:
 - Write new blob (safe fallback)
 - Some duplication acceptable vs blocking
 
-## Migration from UUID Blobs
-
-For existing BIRD installations:
-
-```bash
-bird migrate-to-content-addressed
-
-# Process:
-# 1. Hash all existing blobs
-# 2. Move to content-addressed paths  
-# 3. Update outputs.file_ref → outputs.storage_ref
-# 4. Populate blob_registry
-# 5. Remove old managed/ directory
-```
-
-**See:** CONTENT_ADDRESSED_BLOBS.md for migration details
-
 ## Configuration
 
+Configuration is stored in `$BIRD_ROOT/config.toml`:
+
 ```toml
-[storage]
-threshold_bytes = 1048576     # 1MB (inline vs blob)
-compression = "gzip"          # gzip, zstd, none
-compression_level = 6         # 1-9 for gzip
+# Client identity
+client_id = "user@hostname"
 
-[deduplication]
-enabled = true                # Enable content-addressing
-hash_algorithm = "blake3"     # blake3, sha256
+# Storage settings
+storage_mode = "parquet"      # "parquet" or "duckdb"
+hot_days = 14                 # Days before archiving
+inline_threshold = 4096       # Bytes (inline vs blob)
+auto_extract = false          # Auto-extract events after shq run
 
-[garbage_collection]
-enabled = false               # Disable for MVP
-strategy = "ref_counting"     # ref_counting, mark_sweep
-grace_period_days = 30        # Keep orphaned blobs for 30 days
+# Remote storage
+[[remotes]]
+name = "team"
+type = "s3"
+uri = "s3://bucket/bird/bird.duckdb"
+credential_provider = "credential_chain"
+auto_attach = true
+
+[[remotes]]
+name = "backup"
+type = "file"
+uri = "/mnt/backup/bird.duckdb"
+mode = "read_only"
+auto_attach = false
+
+# Sync settings
+[sync]
+default_remote = "team"
+sync_invocations = true
+sync_outputs = true
+sync_events = true
+sync_blobs = false            # Blob sync not yet implemented
 ```
 
-## Summary of Changes
+### Environment Variables
 
-| Aspect | Old (UUID) | New (Content-Addressed) |
-|--------|-----------|-------------------------|
-| **Blob filename** | `{uuid}.bin.zst` | `{hash[0:2]}/{hash}.bin.gz` |
-| **Duplication** | Every output unique | Identical outputs shared |
-| **Directory** | `managed/` | `blobs/content/` with subdirs |
-| **Schema** | `file_ref` column | `content_hash` + `storage_ref` + `storage_type` |
-| **Registry** | None | `blob_registry` table |
-| **Compression** | zstd | gzip (DuckDB compatible) |
-| **Compaction** | Tar archives | Not needed (already deduped) |
-| **Storage** | O(n) commands | O(unique content) |
-| **Savings** | 0% | **70-90% for CI workloads** |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BIRD_ROOT` | `~/.local/share/bird` | Base directory for BIRD data |
+| `SHQ_DISABLED` | unset | Set to `1` to disable all capture |
+| `SHQ_EXCLUDE` | unset | Colon-separated patterns to exclude |
+| `BIRD_INVOCATION_UUID` | unset | Shared invocation UUID for nested clients |
+| `BIRD_PARENT_CLIENT` | unset | Name of parent BIRD client (e.g., "shq") |
 
-## References
+## Multi-Client Integration
 
-- **CONTENT_ADDRESSED_BLOBS.md** - Complete design document
-- **STORAGE_LIFECYCLE.md** - Updated lifecycle with deduplication
-- **BLOB_COMPACTION_SUMMARY.md** - Why blobs don't need compaction
-- **COMPRESSION_DECISION.md** - Why gzip not zstd
+BIRD supports multiple clients (shq, blq, etc.) that can invoke each other. To avoid duplicate recording of the same invocation across databases, clients share a common UUID.
+
+### Nested Invocations
+
+When a BIRD client runs a command that invokes another BIRD client:
+
+```bash
+# shq captures this invocation and sets env vars for child
+$ shq run blq run cargo test
+
+# Child process receives:
+#   BIRD_INVOCATION_UUID=<shared-uuid>
+#   BIRD_PARENT_CLIENT=shq
+```
+
+**Protocol:**
+1. Parent client generates invocation UUID before spawning child
+2. Parent sets `BIRD_INVOCATION_UUID` to the UUID string
+3. Parent sets `BIRD_PARENT_CLIENT` to its own name (e.g., "shq", "blq")
+4. Child client checks for `BIRD_INVOCATION_UUID` and uses it if present
+5. Both clients record with the same UUID, enabling deduplication
+
+**Implementation (Rust):**
+```rust
+// Check for inherited UUID
+let id = std::env::var("BIRD_INVOCATION_UUID")
+    .ok()
+    .and_then(|s| Uuid::parse_str(&s).ok())
+    .unwrap_or_else(Uuid::now_v7);
+```
+
+**Implementation (Python):**
+```python
+import os
+import uuid
+
+inv_uuid = os.environ.get("BIRD_INVOCATION_UUID")
+if inv_uuid:
+    invocation_id = uuid.UUID(inv_uuid)
+else:
+    invocation_id = uuid.uuid4()  # or uuid7
+```
+
+## Project Detection
+
+BIRD clients can detect project-level databases by looking for `.bird/` directories.
+
+### Directory Structure
+
+```
+/home/user/projects/myapp/
+├── .bird/                    # Project-level BIRD
+│   ├── bird.duckdb          # Project database (CI builds, etc.)
+│   ├── config.toml          # Project sync config
+│   └── blobs/content/       # Project blobs
+├── src/
+└── ...
+```
+
+### Detection Algorithm
+
+Walk up from current directory looking for `.bird/`:
+
+```rust
+fn find_project(start: &Path) -> Option<ProjectInfo> {
+    let mut current = start.to_path_buf();
+    loop {
+        let bird_dir = current.join(".bird");
+        if bird_dir.is_dir() {
+            return Some(ProjectInfo {
+                root: current,
+                bird_dir,
+                db_path: bird_dir.join("bird.duckdb"),
+            });
+        }
+        if !current.pop() { break; }
+    }
+    None
+}
+```
+
+### Dynamic Attachment
+
+User-level clients (shq) can attach project databases as read-only:
+
+```sql
+-- Automatic when in project directory
+ATTACH '/path/to/project/.bird/bird.duckdb' AS project (READ_ONLY);
+
+-- Query project data alongside user data
+SELECT * FROM project.invocations;  -- CI builds
+SELECT * FROM invocations;          -- Local commands
+```
+
+## Format Hints
+
+Format hints help BIRD detect the output format for event parsing:
+
+```toml
+# $BIRD_ROOT/format-hints.toml
+
+# Pattern-based hints
+[[hints]]
+pattern = "make*"
+format = "gcc"
+
+[[hints]]
+pattern = "cargo *"
+format = "cargo"
+
+[[hints]]
+pattern = "pytest*"
+format = "pytest"
+
+# Default format for unknown commands
+default_format = "auto"
+```
+
+Supported formats: `gcc`, `cargo`, `pytest`, `eslint`, `tsc`, `go`, `auto`
 
 ---
 
-*Version 2: Content-addressed storage for automatic deduplication* 🎯
+*Version 3: Dual storage backends + remote sync* 🎯

@@ -32,6 +32,16 @@ Before using shq, initialize the BIRD database:
 shq init
 ```
 
+**Storage Mode Options:**
+
+```bash
+# Default: Parquet mode (multi-writer safe, for concurrent shells)
+shq init
+
+# DuckDB mode (single-writer, simpler, no compaction needed)
+shq init --mode duckdb
+```
+
 This creates the directory structure at `~/.local/share/bird/`:
 
 ```
@@ -158,6 +168,41 @@ shq q "SELECT * FROM invocations_today"
 ```bash
 # Show database statistics
 shq stats
+
+# JSON output (for scripting)
+shq stats --json
+```
+
+### Events (Parsed Errors/Warnings)
+
+BIRD automatically parses build output for structured events:
+
+```bash
+shq e              # Show events from recent commands
+shq e %/cargo/~5   # Events from last 5 cargo commands
+shq e -s error     # Only errors (filter by severity)
+shq e --count      # Count events by severity
+```
+
+### Extract Events
+
+Manually extract/re-extract events from outputs:
+
+```bash
+shq extract-events         # Extract from last command
+shq extract-events --all   # Backfill all commands without events
+shq extract-events -f gcc  # Force specific format
+```
+
+### Format Hints
+
+Configure format detection for build tools:
+
+```bash
+shq format-hints list              # Show configured hints
+shq format-hints add "make*" gcc   # Use gcc parser for make commands
+shq format-hints remove "make*"    # Remove a hint
+shq format-hints set-default cargo # Set default format for unknown commands
 ```
 
 ## Data Lifecycle
@@ -195,26 +240,94 @@ shq compact --dry-run
 !!! note "Automatic Compaction"
     Shell hooks automatically run background compaction after each command, so manual compaction is rarely needed.
 
+## Remote Storage
+
+Sync your command history across machines using remote DuckDB databases:
+
+### Configure Remotes
+
+```bash
+# Add a remote (S3, local file, MotherDuck, or PostgreSQL)
+shq remote add team --type s3 --uri s3://bucket/bird.duckdb
+shq remote add backup --type file --uri /mnt/backup/bird.duckdb --read-only
+
+# List configured remotes
+shq remote list
+
+# Test remote connectivity
+shq remote test team
+```
+
+### Push/Pull Data
+
+```bash
+# Push local data to remote
+shq push --remote team
+
+# Push only recent data
+shq push --remote team --since 7d
+
+# Preview what would be pushed
+shq push --remote team --dry-run
+
+# Pull data from remote
+shq pull --remote team
+
+# Pull specific client's data
+shq pull --remote team --client laptop@user
+```
+
+### Remote Types
+
+| Type | URI Format | Description |
+|------|------------|-------------|
+| `file` | `/path/to/bird.duckdb` | Local or network file |
+| `s3` | `s3://bucket/path/bird.duckdb` | S3-compatible storage |
+| `motherduck` | `md:database_name` | MotherDuck cloud |
+| `postgres` | `postgres:dbname=...` | PostgreSQL database |
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BIRD_ROOT` | `~/.local/share/bird` | Base directory for BIRD data |
 
-## Privacy
+## Privacy & Tracking Control
 
-Commands starting with a space or backslash are not captured:
+Multiple ways to exclude commands from capture:
+
+### Caller Opt-Out (Shell-Level)
 
 ```bash
-# Not captured (leading space)
+# Leading space - not captured
  echo "secret password"
 
-# Not captured (leading backslash)
+# Leading backslash - not captured
 \curl -H "Authorization: $TOKEN" api.example.com
-
-# Captured normally
-echo "public command"
 ```
+
+### Environment Variables
+
+```bash
+# Disable all capture
+export SHQ_DISABLED=1
+
+# Exclude by pattern (colon-separated)
+export SHQ_EXCLUDE="*password*:*secret*:*token*"
+```
+
+### Command Opt-Out (OSC Escape)
+
+Programs can signal they don't want to be tracked:
+
+```bash
+# In your script:
+printf '\e]shq;nosave\a'  # Disable capture for this command
+```
+
+### Auto-Excluded Commands
+
+Query commands (`shq i`, `shq o`, `shq sql`, etc.) are automatically excluded to prevent recursion.
 
 ## Troubleshooting
 

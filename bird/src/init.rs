@@ -87,6 +87,10 @@ fn init_database(config: &Config) -> Result<()> {
             // Create seed parquet files with correct schema but no rows
             // This ensures the glob pattern always matches at least one file
             create_seed_files(&conn, config)?;
+            // Create tables too - used for pull operations (remote sync)
+            // Normal writes go to parquet, but pull inserts into tables
+            create_duckdb_tables(&conn)?;
+            // Views UNION parquet files with tables
             create_parquet_views(&conn)?;
         }
         StorageMode::DuckDB => {
@@ -103,10 +107,14 @@ fn init_database(config: &Config) -> Result<()> {
 }
 
 /// Create views that read from Parquet files (for Parquet mode).
+///
+/// Views UNION parquet files with tables. Normal writes go to parquet files,
+/// but pull operations insert into tables. This allows remote sync to work
+/// in parquet mode.
 fn create_parquet_views(conn: &duckdb::Connection) -> Result<()> {
     conn.execute_batch(
         r#"
-        -- Invocations view: reads all invocation parquet files
+        -- Invocations view: parquet files UNION pulled records in table
         CREATE OR REPLACE VIEW invocations AS
         SELECT * EXCLUDE (filename)
         FROM read_parquet(
@@ -114,9 +122,11 @@ fn create_parquet_views(conn: &duckdb::Connection) -> Result<()> {
             union_by_name = true,
             hive_partitioning = true,
             filename = true
-        );
+        )
+        UNION ALL
+        SELECT * FROM invocations_table;
 
-        -- Outputs view: reads all output parquet files
+        -- Outputs view: parquet files UNION pulled records
         CREATE OR REPLACE VIEW outputs AS
         SELECT * EXCLUDE (filename)
         FROM read_parquet(
@@ -124,9 +134,11 @@ fn create_parquet_views(conn: &duckdb::Connection) -> Result<()> {
             union_by_name = true,
             hive_partitioning = true,
             filename = true
-        );
+        )
+        UNION ALL
+        SELECT * FROM outputs_table;
 
-        -- Sessions view: reads all session parquet files
+        -- Sessions view: parquet files UNION pulled records
         CREATE OR REPLACE VIEW sessions AS
         SELECT * EXCLUDE (filename)
         FROM read_parquet(
@@ -134,9 +146,11 @@ fn create_parquet_views(conn: &duckdb::Connection) -> Result<()> {
             union_by_name = true,
             hive_partitioning = true,
             filename = true
-        );
+        )
+        UNION ALL
+        SELECT * FROM sessions_table;
 
-        -- Events view: reads all event parquet files (parsed log entries)
+        -- Events view: parquet files UNION pulled records
         CREATE OR REPLACE VIEW events AS
         SELECT * EXCLUDE (filename)
         FROM read_parquet(
@@ -144,7 +158,9 @@ fn create_parquet_views(conn: &duckdb::Connection) -> Result<()> {
             union_by_name = true,
             hive_partitioning = true,
             filename = true
-        );
+        )
+        UNION ALL
+        SELECT * FROM events_table;
         "#,
     )?;
     Ok(())

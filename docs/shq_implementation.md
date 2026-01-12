@@ -5,44 +5,93 @@ This document specifies the implementation of the `shq` executable (not the shel
 ## Overview
 
 The `shq` binary provides:
-- Command capture (`run`, `save`)
-- Query interface (`sql`, `show`, `history`)
-- Statistics (`stats`)
-- Database management (`init`, `compact`, `archive`)
-- Shell integration (`hook init`)
+- **Command capture**: `run`, `save` - execute and record commands
+- **Query interface**: `invocations`, `output`, `info`, `events`, `sql` - query history
+- **Command replay**: `rerun` - re-execute previous commands
+- **Event parsing**: `events`, `extract-events`, `format-hints` - structured diagnostics
+- **Database management**: `init`, `compact`, `archive`, `stats` - storage lifecycle
+- **Remote sync**: `remote`, `push`, `pull` - multi-machine data sharing
+- **Shell integration**: `hook init` - zsh/bash hooks
 
 ## Command Structure
 
 ```
 shq <command> [options]
 
-Commands:
-  init                Initialize BIRD database
-  run <cmd>           Run command with capture
-  save                Save command (used by shell hooks)
-  show [selector]     Show output from a previous command
-  history             Show recent command history
-  sql <query>         Execute SQL query
-  stats               Show statistics
-  archive             Move old data from recent to archive tier
-  compact             Compact parquet files to reduce storage and improve queries
-  hook init           Generate shell integration code for zsh/bash
+Commands (with aliases):
+  init                     Initialize BIRD database
+  run, r <cmd>             Run command with capture
+  save                     Save command (used by shell hooks)
+  invocations, i [query]   Show recent invocations (command history)
+  output, o [query]        Show output from a command
+  info, I [query]          Show detailed invocation info
+  rerun, R [query]         Re-run a previous command
+  events, e [query]        Show parsed events (errors, warnings)
+  sql, q <query>           Execute SQL query
+  stats                    Show database statistics
+  archive                  Move old data to archive tier
+  compact                  Compact parquet files
+  extract-events           Extract events from outputs
+  format-hints             Manage format detection hints
+  remote                   Manage remote storage
+  push                     Push data to remote
+  pull                     Pull data from remote
+  hook init                Generate shell integration code
+  ?                        Quick reference card
 ```
 
-### Show Options
+### Query Micro-Language
+
+Many commands accept a query selector with this syntax:
 
 ```
-shq show [selector] [options]
+%[filter]~[limit]
+
+Filters:
+  %exit<>0         Failed commands (exit code != 0)
+  %/pattern/       Command matching regex
+  %cwd~path        Commands in directory
+  %h~2             From 2 hours ago
+  %d~3             From 3 days ago
+
+Examples:
+  shq i %exit<>0~10      # Last 10 failed commands
+  shq o %/cargo/~1       # Output of last cargo command
+  shq e %/make/~5        # Events from last 5 make commands
+```
+
+### Output Options
+
+```
+shq output [query] [options]
+shq o [query] [options]
 
 Options:
-  -O, --stdout        Show only stdout
+  -O, --stdout        Show only stdout (default)
   -E, --stderr        Show only stderr
-  -A, --all           Combine all streams to stdout
-  -P, --pager         Pipe output through pager
+  -A, --all           Combine all streams
+  --raw               Raw output (no formatting)
   --strip             Strip ANSI escape codes
-  --head N            Show first N lines
-  -t, --tail N        Show last N lines
-  -n, --lines N       Limit output to N lines (same as --head)
+```
+
+### Info Options
+
+```
+shq info [query] [options]
+shq I [query] [options]
+
+Options:
+  -f, --format FMT    Output format: table (default), json, yaml
+```
+
+### Rerun Options
+
+```
+shq rerun [query] [options]
+shq R [query] [options]
+
+Options:
+  -n, --dry-run       Show command without running
 ```
 
 ## Core Implementation
@@ -468,121 +517,102 @@ pub fn cmd_show(reference: &str, config: &Config) -> Result<()> {
 }
 ```
 
-### `shq events [options]` (Planned for v0.6)
+### `shq events [query] [options]`
 
-*This command is planned for the v0.6 release with duck_hunt integration.*
+Show parsed events (errors, warnings, test results) from invocation outputs.
 
-```rust
-// Future implementation - parse build outputs for structured events
-pub fn cmd_events(options: &EventsOptions, config: &Config) -> Result<()> {
-    let db_path = ensure_bird_db()?;
-    let conn = Connection::open(db_path)?;
-    
-    // Get last invocation with parsed output
-    let query = "
-        SELECT i.id, i.cmd, o.storage_type, o.storage_ref, o.content_hash, i.format_hint
-        FROM invocations i
-        JOIN outputs o ON i.id = o.invocation_id
-        WHERE i.timestamp = (SELECT MAX(timestamp) FROM invocations)
-        AND o.stream = 'stdout'
-    ";
-    
-    let mut stmt = conn.prepare(query)?;
-    let mut rows = stmt.query([])?;
-    
-    if let Some(row) = rows.next()? {
-        let storage_type: String = row.get(2)?;
-        let storage_ref: String = row.get(3)?;
-        let content_hash: String = row.get(4)?;
-        let format_hint: Option<String> = row.get(5)?;
-        
-        if let Some(format) = format_hint {
-            // Resolve storage reference to file path
-            let file_path = resolve_storage_ref(&storage_type, &storage_ref, &content_hash)?;
-            
-            // Parse with duck_hunt
-            let events = parse_with_duck_hunt(&file_path, &format)?;
-            
-            // Filter by severity if requested
-            let filtered = if let Some(severity) = &options.severity {
-                events.into_iter()
-                    .filter(|e| &e.severity == severity)
-                    .collect()
-            } else {
-                events
-            };
-            
-            // Display
-            print_events(&filtered, options.format.as_deref().unwrap_or("table"));
-        } else {
-            eprintln!("No format hint for this command");
-        }
-    } else {
-        eprintln!("No recent command found");
-    }
-    
-    Ok(())
-}
+```
+shq events [query] [options]
+shq e [query] [options]
 
-fn resolve_storage_ref(storage_type: &str, storage_ref: &str, _hash: &str) -> Result<String> {
-    match storage_type {
-        "inline" => {
-            // data: URI - need to decode and write to temp file
-            if storage_ref.starts_with("data:") {
-                let b64_data = storage_ref.split(',').nth(1)
-                    .ok_or_else(|| anyhow!("Invalid data: URI"))?;
-                let decoded = base64::decode(b64_data)?;
-                
-                // Write to temp file for duck_hunt
-                let temp_path = format!("/tmp/shq-output-{}.tmp", _hash);
-                fs::write(&temp_path, decoded)?;
-                Ok(temp_path)
-            } else {
-                Err(anyhow!("Unknown inline storage format"))
-            }
-        },
-        "blob" | "archive" => {
-            // file:// URI - extract path
-            if storage_ref.starts_with("file://") {
-                let rel_path = &storage_ref[7..];
-                let bird_root = get_bird_root()?;
-                let full_path = bird_root.join("db/data").join(rel_path);
-                Ok(full_path.display().to_string())
-            } else {
-                Err(anyhow!("Unknown blob storage format"))
-            }
-        },
-        _ => Err(anyhow!("Unknown storage type: {}", storage_type))
-    }
-}
+Options:
+  -s, --severity SEV  Filter by severity (error, warning, info, note)
+  --count             Show event counts by severity
+  -f, --format FMT    Output format: table (default), json
+```
 
-fn parse_with_duck_hunt(file_path: &str, format: &str) -> Result<Vec<Event>> {
-    // Call duck_hunt parser
-    let conn = Connection::open(":memory:")?;
-    conn.execute("INSTALL duck_hunt", [])?;
-    conn.execute("LOAD duck_hunt", [])?;
-    
-    let query = format!(
-        "SELECT * FROM read_duck_hunt_log('{}', '{}')",
-        file_path, format
-    );
-    
-    let mut stmt = conn.prepare(&query)?;
-    let mut rows = stmt.query([])?;
-    
-    let mut events = Vec::new();
-    while let Some(row) = rows.next()? {
-        events.push(Event {
-            severity: row.get("severity")?,
-            message: row.get("message")?,
-            file: row.get("file").ok(),
-            line: row.get("line").ok(),
-            column: row.get("column").ok(),
-        });
-    }
-    
-    Ok(events)
-}
+Events are parsed using the duck_hunt extension with format detection.
+
+**Examples:**
+```bash
+shq e                    # Events from recent commands
+shq e %/cargo/~5         # Events from last 5 cargo commands
+shq e -s error           # Only errors
+shq e --count            # Summary counts
+```
+
+### `shq extract-events [options]`
+
+Manually extract or re-extract events from invocation outputs.
+
+```
+shq extract-events [options]
+
+Options:
+  --all               Backfill all invocations without events
+  -f, --format FMT    Force specific format (gcc, cargo, pytest, etc.)
+```
+
+**Examples:**
+```bash
+shq extract-events           # Extract from last command
+shq extract-events --all     # Backfill all commands
+shq extract-events -f gcc    # Force gcc format
+```
+
+### `shq format-hints <subcommand>`
+
+Configure format detection hints for event parsing.
+
+```
+shq format-hints list                  # Show configured hints
+shq format-hints add "make*" gcc       # Add hint for make commands
+shq format-hints remove "make*"        # Remove a hint
+shq format-hints set-default cargo     # Set default format
+```
+
+### `shq remote <subcommand>`
+
+Manage remote storage configurations.
+
+```
+shq remote add <name> --type <type> --uri <uri> [options]
+shq remote list
+shq remote test <name>
+shq remote remove <name>
+
+Options for 'add':
+  --type TYPE              Remote type: s3, file, motherduck, postgres
+  --uri URI                Remote URI
+  --read-only              Mark as read-only
+  --credential-provider P  S3 credential provider (e.g., credential_chain)
+  --no-auto-attach         Don't auto-attach on connection
+```
+
+### `shq push [options]`
+
+Push local data to a remote.
+
+```
+shq push [options]
+
+Options:
+  -r, --remote NAME   Remote to push to (uses default if not specified)
+  -s, --since SPEC    Only push data since date/duration (e.g., "7d", "2024-01-15")
+  -n, --dry-run       Show what would be pushed
+```
+
+### `shq pull [options]`
+
+Pull data from a remote.
+
+```
+shq pull [options]
+
+Options:
+  -r, --remote NAME   Remote to pull from (uses default if not specified)
+  -c, --client ID     Only pull data from this client
+  -s, --since SPEC    Only pull data since date/duration
 ```
 
 ## Error Handling Implementation
@@ -660,43 +690,37 @@ pub fn ensure_bird_db() -> Result<PathBuf> {
 
 ## Database Management Commands
 
-### `shq init`
+### `shq init [options]`
+
+Initialize the BIRD database.
+
+```
+shq init [options]
+
+Options:
+  --mode MODE    Storage mode: parquet (default) or duckdb
+```
+
+**Storage modes:**
+- `parquet`: Multi-writer safe, requires compaction. Best for concurrent shells.
+- `duckdb`: Single-writer, no compaction needed. Simpler for single-shell usage.
 
 ```rust
-pub fn cmd_init(config: &Config) -> Result<()> {
+pub fn cmd_init(mode: StorageMode) -> Result<()> {
     let bird_root = get_bird_root()?;
-    
+
     // Create directory structure
-    create_dir_all(bird_root.join("data/recent/invocations"))?;
-    create_dir_all(bird_root.join("data/recent/outputs"))?;
-    create_dir_all(bird_root.join("data/recent/sessions"))?;
-    create_dir_all(bird_root.join("data/archive"))?;
-    create_dir_all(bird_root.join("blobs/content"))?;
-    create_dir_all(bird_root.join("extensions"))?;
-    create_dir_all(bird_root.join("sql"))?;
-    
-    // Copy SQL files
-    fs::write(
-        bird_root.join("db/sql/views.sql"),
-        include_str!("../sql/views.sql")
-    )?;
-    fs::write(
-        bird_root.join("db/sql/macros.sql"),
-        include_str!("../sql/macros.sql")
-    )?;
-    
-    // Initialize bird.duckdb
-    ensure_bird_db()?;
-    
-    // Generate client ID if not exists
-    if config.client_id.is_empty() {
-        let hostname = gethostname::gethostname().to_string_lossy().to_string();
-        let random = rand::thread_rng().gen_range(10000..99999);
-        let client_id = format!("{}-{}", hostname, random);
-        // Save to config...
-    }
-    
-    println!("✓ BIRD initialized at {}", bird_root.display());
+    create_dir_all(bird_root.join("db/data/recent/invocations"))?;
+    create_dir_all(bird_root.join("db/data/recent/outputs"))?;
+    create_dir_all(bird_root.join("db/data/recent/sessions"))?;
+    create_dir_all(bird_root.join("db/data/recent/events"))?;
+    create_dir_all(bird_root.join("db/data/recent/blobs/content"))?;
+    create_dir_all(bird_root.join("db/data/archive"))?;
+
+    // Initialize database with mode-specific views
+    let store = Store::init(bird_root, mode)?;
+
+    println!("BIRD initialized at {} (mode: {})", bird_root.display(), mode);
     Ok(())
 }
 ```

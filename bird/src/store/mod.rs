@@ -7,6 +7,7 @@ mod compact;
 mod events;
 mod invocations;
 mod outputs;
+mod remote;
 mod sessions;
 
 use std::fs;
@@ -27,6 +28,7 @@ pub use compact::{ArchiveStats, AutoCompactOptions, CompactOptions, CompactStats
 pub use events::{EventFilters, EventSummary, FormatConfig, FormatRule};
 pub use invocations::InvocationSummary;
 pub use outputs::OutputInfo;
+pub use remote::{parse_since, PullOptions, PullStats, PushOptions, PushStats};
 
 // Re-export format detection types (defined below)
 // BuiltinFormat, FormatMatch, FormatSource are defined at the bottom of this file
@@ -122,6 +124,12 @@ impl Store {
             [],
         )?;
 
+        // Ensure tables exist for parquet mode (migration for existing installations)
+        // This allows pull operations to work by inserting into tables
+        if self.config.storage_mode == crate::StorageMode::Parquet {
+            self.ensure_tables_for_pull(&conn)?;
+        }
+
         // Set up S3 credentials for blob resolution (before blob_roots is used)
         // This needs to happen before setup_blob_resolution so that S3 globs work
         self.setup_s3_credentials(&conn)?;
@@ -135,7 +143,126 @@ impl Store {
             self.create_unified_schema(&conn)?;
         }
 
+        // Attach project database if we're in a project directory
+        if attach_remotes {
+            self.attach_project_db(&conn)?;
+        }
+
         Ok(conn)
+    }
+
+    /// Attach project-level `.bird/` database if we're in a project directory.
+    ///
+    /// The project database is attached as read-only under schema "project".
+    /// This allows queries like `SELECT * FROM project.invocations`.
+    fn attach_project_db(&self, conn: &Connection) -> Result<()> {
+        use crate::project::find_current_project;
+
+        let Some(project) = find_current_project() else {
+            return Ok(()); // Not in a project
+        };
+
+        if !project.is_initialized() {
+            return Ok(()); // Project not initialized
+        }
+
+        // Don't attach if project DB is the same as user DB
+        if project.db_path == self.config.db_path() {
+            return Ok(());
+        }
+
+        // Attach as read-only
+        let attach_sql = format!(
+            "ATTACH '{}' AS project (READ_ONLY)",
+            project.db_path.display()
+        );
+
+        if let Err(e) = conn.execute(&attach_sql, []) {
+            // Log but don't fail - project DB might be locked or inaccessible
+            eprintln!("Note: Could not attach project database: {}", e);
+        }
+
+        Ok(())
+    }
+
+    /// Ensure tables exist in parquet mode for pull operations.
+    ///
+    /// This is a migration for existing parquet mode installations that
+    /// were created before pull support was added.
+    fn ensure_tables_for_pull(&self, conn: &Connection) -> Result<()> {
+        // Check if tables already exist
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM duckdb_tables() WHERE table_name = 'sessions_table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if table_exists {
+            return Ok(());
+        }
+
+        // Create tables (same as init.rs create_duckdb_tables)
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS invocations_table (
+                id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
+                cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
+                format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR, date DATE
+            );
+            CREATE TABLE IF NOT EXISTS outputs_table (
+                id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
+                byte_length BIGINT, storage_type VARCHAR, storage_ref VARCHAR,
+                content_type VARCHAR, date DATE
+            );
+            CREATE TABLE IF NOT EXISTS sessions_table (
+                session_id VARCHAR, client_id VARCHAR, invoker VARCHAR, invoker_pid INTEGER,
+                invoker_type VARCHAR, registered_at TIMESTAMP, cwd VARCHAR, date DATE
+            );
+            CREATE TABLE IF NOT EXISTS events_table (
+                id UUID, invocation_id UUID, client_id VARCHAR, hostname VARCHAR,
+                event_type VARCHAR, severity VARCHAR, ref_file VARCHAR, ref_line INTEGER,
+                ref_column INTEGER, message VARCHAR, error_code VARCHAR, test_name VARCHAR,
+                status VARCHAR, format_used VARCHAR, date DATE
+            );
+            "#,
+        )?;
+
+        // Update views to UNION parquet with tables
+        conn.execute_batch(
+            r#"
+            CREATE OR REPLACE VIEW invocations AS
+            SELECT * EXCLUDE (filename) FROM read_parquet(
+                'recent/invocations/**/*.parquet',
+                union_by_name = true, hive_partitioning = true, filename = true
+            )
+            UNION ALL SELECT * FROM invocations_table;
+
+            CREATE OR REPLACE VIEW outputs AS
+            SELECT * EXCLUDE (filename) FROM read_parquet(
+                'recent/outputs/**/*.parquet',
+                union_by_name = true, hive_partitioning = true, filename = true
+            )
+            UNION ALL SELECT * FROM outputs_table;
+
+            CREATE OR REPLACE VIEW sessions AS
+            SELECT * EXCLUDE (filename) FROM read_parquet(
+                'recent/sessions/**/*.parquet',
+                union_by_name = true, hive_partitioning = true, filename = true
+            )
+            UNION ALL SELECT * FROM sessions_table;
+
+            CREATE OR REPLACE VIEW events AS
+            SELECT * EXCLUDE (filename) FROM read_parquet(
+                'recent/events/**/*.parquet',
+                union_by_name = true, hive_partitioning = true, filename = true
+            )
+            UNION ALL SELECT * FROM events_table;
+            "#,
+        )?;
+
+        Ok(())
     }
 
     /// Set up S3 credentials for all remotes that use S3.

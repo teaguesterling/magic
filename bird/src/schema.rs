@@ -44,8 +44,24 @@ pub struct InvocationRecord {
     pub username: Option<String>,
 }
 
+/// Environment variable for sharing invocation UUID between nested BIRD clients.
+///
+/// When set, nested BIRD clients (e.g., `shq run blq run ...`) will use this UUID
+/// instead of generating a new one, allowing the invocation to be deduplicated
+/// across databases.
+pub const BIRD_INVOCATION_UUID_VAR: &str = "BIRD_INVOCATION_UUID";
+
+/// Environment variable for the parent BIRD client name.
+///
+/// When set, indicates which BIRD client initiated this invocation.
+/// Used to avoid duplicate recording in nested scenarios.
+pub const BIRD_PARENT_CLIENT_VAR: &str = "BIRD_PARENT_CLIENT";
+
 impl InvocationRecord {
-    /// Create a new invocation record with a fresh UUIDv7.
+    /// Create a new invocation record.
+    ///
+    /// If `BIRD_INVOCATION_UUID` is set in the environment, uses that UUID
+    /// to enable deduplication across nested BIRD clients.
     pub fn new(
         session_id: impl Into<String>,
         cmd: impl Into<String>,
@@ -54,8 +70,16 @@ impl InvocationRecord {
         client_id: impl Into<String>,
     ) -> Self {
         let cmd = cmd.into();
+
+        // Check for inherited invocation UUID from parent BIRD client
+        let id = if let Ok(uuid_str) = std::env::var(BIRD_INVOCATION_UUID_VAR) {
+            Uuid::parse_str(&uuid_str).unwrap_or_else(|_| Uuid::now_v7())
+        } else {
+            Uuid::now_v7()
+        };
+
         Self {
-            id: Uuid::now_v7(),
+            id,
             session_id: session_id.into(),
             timestamp: Utc::now(),
             duration_ms: None,
@@ -68,6 +92,45 @@ impl InvocationRecord {
             hostname: gethostname::gethostname().to_str().map(|s| s.to_string()),
             username: std::env::var("USER").ok(),
         }
+    }
+
+    /// Create a new invocation record with an explicit UUID.
+    ///
+    /// Use this when you need to control the UUID (e.g., for testing or
+    /// when the UUID is provided externally).
+    pub fn with_id(
+        id: Uuid,
+        session_id: impl Into<String>,
+        cmd: impl Into<String>,
+        cwd: impl Into<String>,
+        exit_code: i32,
+        client_id: impl Into<String>,
+    ) -> Self {
+        let cmd = cmd.into();
+        Self {
+            id,
+            session_id: session_id.into(),
+            timestamp: Utc::now(),
+            duration_ms: None,
+            cwd: cwd.into(),
+            executable: extract_executable(&cmd),
+            cmd,
+            exit_code,
+            format_hint: None,
+            client_id: client_id.into(),
+            hostname: gethostname::gethostname().to_str().map(|s| s.to_string()),
+            username: std::env::var("USER").ok(),
+        }
+    }
+
+    /// Check if this invocation was inherited from a parent BIRD client.
+    pub fn is_inherited() -> bool {
+        std::env::var(BIRD_INVOCATION_UUID_VAR).is_ok()
+    }
+
+    /// Get the parent BIRD client name, if any.
+    pub fn parent_client() -> Option<String> {
+        std::env::var(BIRD_PARENT_CLIENT_VAR).ok()
     }
 
     /// Set the duration.
