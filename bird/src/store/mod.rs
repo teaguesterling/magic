@@ -122,6 +122,10 @@ impl Store {
             [],
         )?;
 
+        // Set up S3 credentials for blob resolution (before blob_roots is used)
+        // This needs to happen before setup_blob_resolution so that S3 globs work
+        self.setup_s3_credentials(&conn)?;
+
         // Set up blob resolution across local and remote storage
         self.setup_blob_resolution(&conn)?;
 
@@ -134,7 +138,45 @@ impl Store {
         Ok(conn)
     }
 
-    /// Set up blob_roots variable and resolve_blob_path macro for multi-location blob resolution.
+    /// Set up S3 credentials for all remotes that use S3.
+    /// This is called early so that blob resolution can access S3 paths.
+    fn setup_s3_credentials(&self, conn: &Connection) -> Result<()> {
+        // Check if any remote uses S3
+        let has_s3 = self.config.remotes.iter().any(|r| {
+            r.remote_type == crate::config::RemoteType::S3
+        });
+
+        if !has_s3 {
+            return Ok(());
+        }
+
+        // Load httpfs for S3 support
+        conn.execute("LOAD httpfs", [])?;
+
+        // Set up credentials for each S3 remote
+        for remote in &self.config.remotes {
+            if remote.remote_type == crate::config::RemoteType::S3 {
+                if let Some(provider) = &remote.credential_provider {
+                    let secret_sql = format!(
+                        "CREATE SECRET IF NOT EXISTS \"bird_{}\" (TYPE s3, PROVIDER {})",
+                        remote.name, provider
+                    );
+                    if let Err(e) = conn.execute(&secret_sql, []) {
+                        eprintln!("Warning: Failed to create S3 secret for {}: {}", remote.name, e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set up blob_roots variable and blob resolution macros.
+    ///
+    /// Storage refs use URI schemes to indicate type:
+    /// - `data:`, `data+varchar:`, `data+blob:` - inline content (scalarfs)
+    /// - `file:path` - relative path, resolved against blob_roots
+    /// - Absolute paths (`s3://`, `/path/`) - used directly
     fn setup_blob_resolution(&self, conn: &Connection) -> Result<()> {
         let blob_roots = self.config.blob_roots();
 
@@ -148,14 +190,35 @@ impl Store {
         // Set blob_roots variable
         conn.execute(&format!("SET VARIABLE blob_roots = [{}]", roots_sql), [])?;
 
-        // Create macro for blob path resolution by content hash
-        // Uses list comprehension to generate glob patterns for each root
+        // Helper: check if ref is inline data (scalarfs data: protocol)
         conn.execute(
-            r#"
-            CREATE OR REPLACE MACRO resolve_blob_path(hash) AS (
-                [format('{}/{}*', root, hash) FOR root IN getvariable('blob_roots')]
-            )
-            "#,
+            r#"CREATE OR REPLACE MACRO is_inline_data(ref) AS (
+                ref[:5] = 'data:' OR ref[:5] = 'data+'
+            )"#,
+            [],
+        )?;
+
+        // Helper: check if ref is a relative file: path
+        conn.execute(
+            r#"CREATE OR REPLACE MACRO is_file_ref(ref) AS (
+                ref[:5] = 'file:'
+            )"#,
+            [],
+        )?;
+
+        // Resolve storage ref to list of paths for pathvariable:
+        // - Inline data: pass through as single-element list
+        // - file: refs: expand to glob patterns across all blob_roots
+        // - Other (absolute paths): pass through
+        conn.execute(
+            r#"CREATE OR REPLACE MACRO resolve_storage_ref(ref) AS (
+                CASE
+                    WHEN is_inline_data(ref) THEN [ref]
+                    WHEN is_file_ref(ref) THEN
+                        [format('{}/{}*', root, ref[6:]) FOR root IN getvariable('blob_roots')]
+                    ELSE [ref]
+                END
+            )"#,
             [],
         )?;
 
@@ -163,26 +226,9 @@ impl Store {
     }
 
     /// Attach configured remotes to the connection.
+    /// Note: S3 credentials are already set up by setup_s3_credentials().
     fn attach_remotes(&self, conn: &Connection) -> Result<()> {
-        // Load httpfs for S3/HTTPS support
-        conn.execute("LOAD httpfs", [])?;
-
         for remote in self.config.auto_attach_remotes() {
-            // Set up credentials if needed
-            if let Some(provider) = &remote.credential_provider {
-                if remote.remote_type == crate::config::RemoteType::S3 {
-                    // Create S3 secret with credential provider
-                    // Quote the secret name to handle special characters
-                    let secret_sql = format!(
-                        "CREATE SECRET IF NOT EXISTS \"bird_{}\" (TYPE s3, PROVIDER {})",
-                        remote.name, provider
-                    );
-                    if let Err(e) = conn.execute(&secret_sql, []) {
-                        eprintln!("Warning: Failed to create secret for {}: {}", remote.name, e);
-                    }
-                }
-            }
-
             // Attach the remote database
             let attach_sql = remote.attach_sql();
             if let Err(e) = conn.execute(&attach_sql, []) {
