@@ -1904,6 +1904,193 @@ pub fn format_hints_set_default(format: &str) -> bird::Result<()> {
     Ok(())
 }
 
+// Remote management commands
+
+/// Add a remote storage connection.
+pub fn remote_add(
+    name: &str,
+    remote_type: &str,
+    uri: &str,
+    read_only: bool,
+    credential_provider: Option<&str>,
+    auto_attach: bool,
+) -> bird::Result<()> {
+    use bird::{RemoteConfig, RemoteMode, RemoteType};
+    use std::str::FromStr;
+
+    let mut config = Config::load()?;
+
+    let rtype = RemoteType::from_str(remote_type)?;
+    let mut remote = RemoteConfig::new(name, rtype, uri);
+
+    if read_only {
+        remote.mode = RemoteMode::ReadOnly;
+    }
+    if let Some(provider) = credential_provider {
+        remote.credential_provider = Some(provider.to_string());
+    }
+    remote.auto_attach = auto_attach;
+
+    // Check if updating existing
+    let updating = config.get_remote(name).is_some();
+
+    config.add_remote(remote);
+    config.save()?;
+
+    if updating {
+        println!("Updated remote: {}", name);
+    } else {
+        println!("Added remote: {}", name);
+    }
+    println!("  Type: {}", remote_type);
+    println!("  URI:  {}", uri);
+    println!("  Mode: {}", if read_only { "read-only" } else { "read-write" });
+    if let Some(provider) = credential_provider {
+        println!("  Credentials: {}", provider);
+    }
+    println!("  Auto-attach: {}", auto_attach);
+
+    Ok(())
+}
+
+/// List configured remotes.
+pub fn remote_list() -> bird::Result<()> {
+    let config = Config::load()?;
+
+    if config.remotes.is_empty() {
+        println!("No remotes configured.");
+        println!();
+        println!("Add a remote with:");
+        println!("  shq remote add <name> --type s3 --uri s3://bucket/path/bird.duckdb");
+        return Ok(());
+    }
+
+    println!("{:<12} {:<12} {:<10} {:<8} {}", "NAME", "TYPE", "MODE", "ATTACH", "URI");
+    println!("{}", "-".repeat(70));
+
+    for remote in &config.remotes {
+        println!(
+            "{:<12} {:<12} {:<10} {:<8} {}",
+            remote.name,
+            remote.remote_type,
+            remote.mode,
+            if remote.auto_attach { "auto" } else { "manual" },
+            remote.uri
+        );
+    }
+
+    Ok(())
+}
+
+/// Remove a remote configuration.
+pub fn remote_remove(name: &str) -> bird::Result<()> {
+    let mut config = Config::load()?;
+
+    if config.remove_remote(name) {
+        config.save()?;
+        println!("Removed remote: {}", name);
+    } else {
+        println!("Remote not found: {}", name);
+    }
+
+    Ok(())
+}
+
+/// Test connection to a remote.
+pub fn remote_test(name: Option<&str>) -> bird::Result<()> {
+    let config = Config::load()?;
+    let store = Store::open(config.clone())?;
+
+    let remotes_to_test: Vec<_> = if let Some(n) = name {
+        match config.get_remote(n) {
+            Some(r) => vec![r],
+            None => {
+                println!("Remote not found: {}", n);
+                return Ok(());
+            }
+        }
+    } else {
+        config.remotes.iter().collect()
+    };
+
+    if remotes_to_test.is_empty() {
+        println!("No remotes configured.");
+        return Ok(());
+    }
+
+    for remote in remotes_to_test {
+        print!("Testing {}... ", remote.name);
+        match store.test_remote(remote) {
+            Ok(()) => println!("OK"),
+            Err(e) => println!("FAILED: {}", e),
+        }
+    }
+
+    Ok(())
+}
+
+/// Manually attach a remote (shows SQL to run).
+pub fn remote_attach(name: &str) -> bird::Result<()> {
+    let config = Config::load()?;
+
+    match config.get_remote(name) {
+        Some(remote) => {
+            println!("To attach this remote in SQL:");
+            println!();
+            if remote.credential_provider.is_some() {
+                println!("LOAD httpfs;");
+                println!(
+                    "CREATE SECRET IF NOT EXISTS \"bird_{}\" (TYPE s3, PROVIDER credential_chain);",
+                    remote.name
+                );
+            }
+            println!("{};", remote.attach_sql());
+            println!();
+            println!("Then query with: SELECT * FROM {}.invocations LIMIT 10;", remote.quoted_schema_name());
+        }
+        None => {
+            println!("Remote not found: {}", name);
+        }
+    }
+
+    Ok(())
+}
+
+/// Show remote sync status.
+pub fn remote_status() -> bird::Result<()> {
+    let config = Config::load()?;
+
+    println!("Sync Configuration:");
+    println!("  Default remote:    {}", config.sync.default_remote.as_deref().unwrap_or("(none)"));
+    println!("  Push on compact:   {}", config.sync.push_on_compact);
+    println!("  Push on archive:   {}", config.sync.push_on_archive);
+    println!("  Sync invocations:  {}", config.sync.sync_invocations);
+    println!("  Sync outputs:      {}", config.sync.sync_outputs);
+    println!("  Sync events:       {}", config.sync.sync_events);
+    println!("  Sync blobs:        {}", config.sync.sync_blobs);
+    if config.sync.sync_blobs {
+        println!("  Blob min size:     {} bytes", config.sync.blob_sync_min_bytes);
+    }
+    println!();
+
+    println!("Blob Roots (search order):");
+    for (i, root) in config.blob_roots().iter().enumerate() {
+        println!("  {}. {}", i + 1, root);
+    }
+    println!();
+
+    if config.remotes.is_empty() {
+        println!("No remotes configured.");
+    } else {
+        println!("Configured Remotes:");
+        for remote in &config.remotes {
+            println!("  {} ({}, {})", remote.name, remote.remote_type, remote.mode);
+        }
+    }
+
+    Ok(())
+}
+
 const BASH_HOOK: &str = r#"# shq shell integration for bash
 # Add to ~/.bashrc: eval "$(shq hook init)"
 #

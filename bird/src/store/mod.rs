@@ -97,6 +97,11 @@ impl Store {
 
     /// Get a DuckDB connection to the store.
     pub fn connection(&self) -> Result<Connection> {
+        self.connection_with_options(true)
+    }
+
+    /// Get a DuckDB connection with optional remote attachment.
+    pub fn connection_with_options(&self, attach_remotes: bool) -> Result<Connection> {
         let conn = Connection::open(&self.config.db_path())?;
 
         // Load bundled extensions
@@ -117,7 +122,154 @@ impl Store {
             [],
         )?;
 
+        // Set up blob resolution across local and remote storage
+        self.setup_blob_resolution(&conn)?;
+
+        // Attach remotes and create unified schema if requested
+        if attach_remotes && !self.config.remotes.is_empty() {
+            self.attach_remotes(&conn)?;
+            self.create_unified_schema(&conn)?;
+        }
+
         Ok(conn)
+    }
+
+    /// Set up blob_roots variable and resolve_blob_path macro for multi-location blob resolution.
+    fn setup_blob_resolution(&self, conn: &Connection) -> Result<()> {
+        let blob_roots = self.config.blob_roots();
+
+        // Format as SQL array literal
+        let roots_sql: String = blob_roots
+            .iter()
+            .map(|r| format!("'{}'", r.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Set blob_roots variable
+        conn.execute(&format!("SET VARIABLE blob_roots = [{}]", roots_sql), [])?;
+
+        // Create macro for blob path resolution by content hash
+        // Uses list comprehension to generate glob patterns for each root
+        conn.execute(
+            r#"
+            CREATE OR REPLACE MACRO resolve_blob_path(hash) AS (
+                [format('{}/{}*', root, hash) FOR root IN getvariable('blob_roots')]
+            )
+            "#,
+            [],
+        )?;
+
+        Ok(())
+    }
+
+    /// Attach configured remotes to the connection.
+    fn attach_remotes(&self, conn: &Connection) -> Result<()> {
+        // Load httpfs for S3/HTTPS support
+        conn.execute("LOAD httpfs", [])?;
+
+        for remote in self.config.auto_attach_remotes() {
+            // Set up credentials if needed
+            if let Some(provider) = &remote.credential_provider {
+                if remote.remote_type == crate::config::RemoteType::S3 {
+                    // Create S3 secret with credential provider
+                    // Quote the secret name to handle special characters
+                    let secret_sql = format!(
+                        "CREATE SECRET IF NOT EXISTS \"bird_{}\" (TYPE s3, PROVIDER {})",
+                        remote.name, provider
+                    );
+                    if let Err(e) = conn.execute(&secret_sql, []) {
+                        eprintln!("Warning: Failed to create secret for {}: {}", remote.name, e);
+                    }
+                }
+            }
+
+            // Attach the remote database
+            let attach_sql = remote.attach_sql();
+            if let Err(e) = conn.execute(&attach_sql, []) {
+                eprintln!("Warning: Failed to attach remote {}: {}", remote.name, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create unified 'bird_all' schema with UNION views across main + all remotes.
+    /// Named 'bird_all' to avoid conflict with SQL keyword 'ALL'.
+    fn create_unified_schema(&self, conn: &Connection) -> Result<()> {
+        conn.execute("CREATE SCHEMA IF NOT EXISTS bird_all", [])?;
+
+        // Tables to create unified views for
+        let tables = ["invocations", "outputs", "sessions", "events"];
+
+        for table in &tables {
+            let mut union_parts = vec![format!(
+                "SELECT *, 'local' as _remote FROM main.{}",
+                table
+            )];
+
+            for remote in self.config.auto_attach_remotes() {
+                union_parts.push(format!(
+                    "SELECT *, '{}' as _remote FROM {}.{}",
+                    remote.name,
+                    remote.quoted_schema_name(),
+                    table
+                ));
+            }
+
+            let view_sql = format!(
+                "CREATE OR REPLACE VIEW bird_all.{} AS {}",
+                table,
+                union_parts.join(" UNION ALL BY NAME ")
+            );
+
+            if let Err(e) = conn.execute(&view_sql, []) {
+                eprintln!("Warning: Failed to create unified view for {}: {}", table, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Manually attach a specific remote.
+    pub fn attach_remote(&self, conn: &Connection, remote: &crate::RemoteConfig) -> Result<()> {
+        // Load httpfs if needed
+        conn.execute("LOAD httpfs", [])?;
+
+        // Set up credentials
+        if let Some(provider) = &remote.credential_provider {
+            if remote.remote_type == crate::config::RemoteType::S3 {
+                let secret_sql = format!(
+                    "CREATE SECRET IF NOT EXISTS \"bird_{}\" (TYPE s3, PROVIDER {})",
+                    remote.name, provider
+                );
+                conn.execute(&secret_sql, [])?;
+            }
+        }
+
+        // Attach
+        conn.execute(&remote.attach_sql(), [])?;
+        Ok(())
+    }
+
+    /// Detach a remote.
+    pub fn detach_remote(&self, conn: &Connection, name: &str) -> Result<()> {
+        conn.execute(&format!("DETACH \"remote_{}\"", name), [])?;
+        Ok(())
+    }
+
+    /// Test connection to a remote. Returns Ok if successful.
+    pub fn test_remote(&self, remote: &crate::RemoteConfig) -> Result<()> {
+        let conn = self.connection_with_options(false)?;
+        self.attach_remote(&conn, remote)?;
+
+        // Try a simple query
+        let test_sql = format!(
+            "SELECT 1 FROM {}.invocations LIMIT 1",
+            remote.quoted_schema_name()
+        );
+        conn.execute(&test_sql, [])?;
+
+        Ok(())
     }
 
     /// Get config reference.

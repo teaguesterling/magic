@@ -53,6 +53,205 @@ impl FromStr for StorageMode {
     }
 }
 
+/// Type of remote storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteType {
+    /// S3-compatible object storage (s3://, gs://)
+    S3,
+    /// MotherDuck cloud database (md:)
+    MotherDuck,
+    /// PostgreSQL database
+    Postgres,
+    /// Local or network file path
+    File,
+}
+
+impl std::fmt::Display for RemoteType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoteType::S3 => write!(f, "s3"),
+            RemoteType::MotherDuck => write!(f, "motherduck"),
+            RemoteType::Postgres => write!(f, "postgres"),
+            RemoteType::File => write!(f, "file"),
+        }
+    }
+}
+
+impl FromStr for RemoteType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "s3" | "gcs" => Ok(RemoteType::S3),
+            "motherduck" | "md" => Ok(RemoteType::MotherDuck),
+            "postgres" | "postgresql" | "pg" => Ok(RemoteType::Postgres),
+            "file" | "local" => Ok(RemoteType::File),
+            _ => Err(Error::Config(format!(
+                "Invalid remote type '{}': expected 's3', 'motherduck', 'postgres', or 'file'",
+                s
+            ))),
+        }
+    }
+}
+
+/// Access mode for remote storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteMode {
+    /// Read and write access
+    #[default]
+    ReadWrite,
+    /// Read-only access
+    ReadOnly,
+}
+
+impl std::fmt::Display for RemoteMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoteMode::ReadWrite => write!(f, "read_write"),
+            RemoteMode::ReadOnly => write!(f, "read_only"),
+        }
+    }
+}
+
+/// Configuration for a remote storage location.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// Remote name (used as schema name: remote_{name})
+    pub name: String,
+
+    /// Type of remote storage
+    #[serde(rename = "type")]
+    pub remote_type: RemoteType,
+
+    /// URI for the remote (e.g., s3://bucket/path/bird.duckdb, md:database_name)
+    pub uri: String,
+
+    /// Access mode (read_write or read_only)
+    #[serde(default)]
+    pub mode: RemoteMode,
+
+    /// Credential provider for S3 (e.g., "credential_chain", "config")
+    #[serde(default)]
+    pub credential_provider: Option<String>,
+
+    /// Whether to auto-attach on connection open
+    #[serde(default = "default_true")]
+    pub auto_attach: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl RemoteConfig {
+    /// Create a new remote config.
+    pub fn new(name: impl Into<String>, remote_type: RemoteType, uri: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            remote_type,
+            uri: uri.into(),
+            mode: RemoteMode::default(),
+            credential_provider: None,
+            auto_attach: true,
+        }
+    }
+
+    /// Set read-only mode.
+    pub fn read_only(mut self) -> Self {
+        self.mode = RemoteMode::ReadOnly;
+        self
+    }
+
+    /// Get the DuckDB schema name for this remote.
+    pub fn schema_name(&self) -> String {
+        format!("remote_{}", self.name)
+    }
+
+    /// Get the quoted DuckDB schema name for this remote (for use in SQL).
+    pub fn quoted_schema_name(&self) -> String {
+        format!("\"remote_{}\"", self.name)
+    }
+
+    /// Generate the ATTACH SQL statement for this remote.
+    pub fn attach_sql(&self) -> String {
+        let mode_clause = match self.mode {
+            RemoteMode::ReadOnly => " (READ_ONLY)",
+            RemoteMode::ReadWrite => "",
+        };
+
+        let type_clause = match self.remote_type {
+            RemoteType::Postgres => " (TYPE postgres)",
+            _ => "",
+        };
+
+        format!(
+            "ATTACH '{}' AS {}{}{}",
+            self.uri,
+            self.quoted_schema_name(),
+            type_clause,
+            mode_clause
+        )
+    }
+
+    /// Get the base URL for blob storage (for S3/GCS remotes).
+    pub fn blob_base_url(&self) -> Option<String> {
+        match self.remote_type {
+            RemoteType::S3 => {
+                // Extract bucket/prefix from URI, append /blobs
+                // e.g., s3://bucket/path/bird.duckdb -> s3://bucket/path/blobs
+                if let Some(stripped) = self.uri.strip_suffix(".duckdb") {
+                    Some(format!("{}/blobs", stripped))
+                } else {
+                    Some(format!("{}/blobs", self.uri.trim_end_matches('/')))
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Sync configuration for push/pull operations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncConfig {
+    /// Default remote for push/pull operations.
+    #[serde(default)]
+    pub default_remote: Option<String>,
+
+    /// Push data after compact operations.
+    #[serde(default)]
+    pub push_on_compact: bool,
+
+    /// Push data before archive operations.
+    #[serde(default)]
+    pub push_on_archive: bool,
+
+    /// Sync invocations table.
+    #[serde(default = "default_true")]
+    pub sync_invocations: bool,
+
+    /// Sync outputs table.
+    #[serde(default = "default_true")]
+    pub sync_outputs: bool,
+
+    /// Sync events table.
+    #[serde(default = "default_true")]
+    pub sync_events: bool,
+
+    /// Sync blob content files.
+    #[serde(default)]
+    pub sync_blobs: bool,
+
+    /// Minimum blob size to sync (bytes). Smaller blobs stay inline.
+    #[serde(default = "default_blob_sync_min")]
+    pub blob_sync_min_bytes: usize,
+}
+
+fn default_blob_sync_min() -> usize {
+    1024 // 1KB
+}
+
 /// BIRD configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -80,6 +279,14 @@ pub struct Config {
     /// - duckdb: Single-writer, no compaction needed
     #[serde(default)]
     pub storage_mode: StorageMode,
+
+    /// Remote storage configurations.
+    #[serde(default)]
+    pub remotes: Vec<RemoteConfig>,
+
+    /// Sync configuration for push/pull operations.
+    #[serde(default)]
+    pub sync: SyncConfig,
 }
 
 fn default_client_id() -> String {
@@ -111,6 +318,8 @@ impl Config {
             inline_threshold: default_inline_threshold(),
             auto_extract: false,
             storage_mode: StorageMode::default(),
+            remotes: Vec::new(),
+            sync: SyncConfig::default(),
         }
     }
 
@@ -123,6 +332,8 @@ impl Config {
             inline_threshold: default_inline_threshold(),
             auto_extract: false,
             storage_mode: StorageMode::DuckDB,
+            remotes: Vec::new(),
+            sync: SyncConfig::default(),
         }
     }
 
@@ -245,6 +456,46 @@ impl Config {
         self.recent_dir()
             .join("events")
             .join(format!("date={}", date))
+    }
+
+    // Remote management helpers
+
+    /// Get a remote by name.
+    pub fn get_remote(&self, name: &str) -> Option<&RemoteConfig> {
+        self.remotes.iter().find(|r| r.name == name)
+    }
+
+    /// Add a remote configuration.
+    pub fn add_remote(&mut self, remote: RemoteConfig) {
+        // Remove existing remote with same name
+        self.remotes.retain(|r| r.name != remote.name);
+        self.remotes.push(remote);
+    }
+
+    /// Remove a remote by name. Returns true if removed.
+    pub fn remove_remote(&mut self, name: &str) -> bool {
+        let len_before = self.remotes.len();
+        self.remotes.retain(|r| r.name != name);
+        self.remotes.len() < len_before
+    }
+
+    /// Get all blob roots for multi-location resolution.
+    /// Returns local blobs dir first, then remote blob URLs.
+    pub fn blob_roots(&self) -> Vec<String> {
+        let mut roots = vec![self.blobs_dir().to_string_lossy().to_string()];
+
+        for remote in &self.remotes {
+            if let Some(blob_url) = remote.blob_base_url() {
+                roots.push(blob_url);
+            }
+        }
+
+        roots
+    }
+
+    /// Get remotes that should be auto-attached.
+    pub fn auto_attach_remotes(&self) -> Vec<&RemoteConfig> {
+        self.remotes.iter().filter(|r| r.auto_attach).collect()
     }
 }
 

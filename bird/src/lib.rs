@@ -10,7 +10,7 @@ pub mod query;
 pub mod schema;
 pub mod store;
 
-pub use config::{Config, StorageMode};
+pub use config::{Config, RemoteConfig, RemoteMode, RemoteType, StorageMode, SyncConfig};
 pub use error::{Error, Result};
 pub use format_hints::{FormatHint, FormatHints};
 pub use query::{parse_query, CompareOp, FieldFilter, PathFilter, Query, QueryComponent, RangeSelector, SourceSelector};

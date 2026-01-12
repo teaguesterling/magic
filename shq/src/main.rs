@@ -286,6 +286,12 @@ enum Commands {
         action: FormatHintsAction,
     },
 
+    /// Manage remote storage connections
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
+
     /// Query parsed events (errors, warnings, test results) from invocation outputs
     #[command(visible_alias = "e")]
     Events {
@@ -415,6 +421,59 @@ enum FormatHintsAction {
     },
 }
 
+#[derive(Subcommand)]
+enum RemoteAction {
+    /// Add a remote storage connection
+    Add {
+        /// Name for this remote (e.g., team, backup, ci)
+        name: String,
+
+        /// Remote type: s3, motherduck, postgres, or file
+        #[arg(short = 't', long = "type")]
+        remote_type: String,
+
+        /// URI for the remote (e.g., s3://bucket/path/bird.duckdb, md:database_name)
+        #[arg(short = 'u', long)]
+        uri: String,
+
+        /// Mount as read-only
+        #[arg(long)]
+        read_only: bool,
+
+        /// Credential provider for S3 (e.g., credential_chain)
+        #[arg(long)]
+        credential_provider: Option<String>,
+
+        /// Don't auto-attach on connection open
+        #[arg(long)]
+        no_auto_attach: bool,
+    },
+
+    /// List configured remotes
+    List,
+
+    /// Remove a remote configuration
+    Remove {
+        /// Name of the remote to remove
+        name: String,
+    },
+
+    /// Test connection to a remote
+    Test {
+        /// Name of the remote to test (tests all if not specified)
+        name: Option<String>,
+    },
+
+    /// Manually attach a remote (for current session only)
+    Attach {
+        /// Name of the remote to attach
+        name: String,
+    },
+
+    /// Show sync status
+    Status,
+}
+
 /// Parse lines argument: N (any), +N (first N), -N (last N).
 fn parse_lines_arg(s: &str) -> (usize, commands::LimitOrder) {
     use commands::LimitOrder;
@@ -506,6 +565,16 @@ fn main() {
             FormatHintsAction::Remove { pattern } => commands::format_hints_remove(&pattern),
             FormatHintsAction::Check { command } => commands::format_hints_check(&command),
             FormatHintsAction::SetDefault { format } => commands::format_hints_set_default(&format),
+        },
+        Commands::Remote { action } => match action {
+            RemoteAction::Add { name, remote_type, uri, read_only, credential_provider, no_auto_attach } => {
+                commands::remote_add(&name, &remote_type, &uri, read_only, credential_provider.as_deref(), !no_auto_attach)
+            },
+            RemoteAction::List => commands::remote_list(),
+            RemoteAction::Remove { name } => commands::remote_remove(&name),
+            RemoteAction::Test { name } => commands::remote_test(name.as_deref()),
+            RemoteAction::Attach { name } => commands::remote_attach(&name),
+            RemoteAction::Status => commands::remote_status(),
         },
         Commands::Events { query, severity, count_only, lines, reparse, format } => {
             // Parse lines: N (any), +N (first N), -N (last N)
