@@ -19,6 +19,6 @@ pub use query::{parse_query, CompareOp, FieldFilter, PathFilter, Query, QueryCom
 pub use schema::{InvocationRecord, OutputRecord, SessionRecord, BIRD_INVOCATION_UUID_VAR, BIRD_PARENT_CLIENT_VAR};
 pub use store::{
     parse_since, ArchiveStats, AutoCompactOptions, BuiltinFormat, CompactOptions, CompactStats,
-    EventFilters, EventSummary, FormatMatch, FormatSource, InvocationBatch, InvocationSummary,
-    OutputInfo, PullOptions, PullStats, PushOptions, PushStats, Store,
+    ConnectionOptions, EventFilters, EventSummary, FormatMatch, FormatSource, InvocationBatch,
+    InvocationSummary, OutputInfo, PullOptions, PullStats, PushOptions, PushStats, Store,
 };

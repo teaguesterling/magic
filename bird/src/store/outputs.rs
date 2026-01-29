@@ -128,7 +128,7 @@ impl Store {
     ///
     /// Behavior depends on storage mode:
     /// - Parquet: Creates a new Parquet file in the appropriate date partition
-    /// - DuckDB: Inserts directly into the outputs_table
+    /// - DuckDB: Inserts directly into the local.outputs
     pub fn write_output(&self, record: &OutputRecord) -> Result<()> {
         match self.config.storage_mode {
             StorageMode::Parquet => self.write_output_parquet(record),
@@ -212,7 +212,7 @@ impl Store {
 
         conn.execute(
             r#"
-            INSERT INTO outputs_table VALUES (
+            INSERT INTO local.outputs VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             "#,

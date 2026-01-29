@@ -15,13 +15,82 @@ use std::fs;
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
 use duckdb::{
     params,
-    types::{TimeUnit, ValueRef},
+    types::{TimeUnit, Value, ValueRef},
     Connection,
 };
 
 use crate::config::StorageMode;
 use crate::schema::{EventRecord, InvocationRecord, SessionRecord};
 use crate::{Config, Error, Result};
+
+/// Format a DuckDB Value to a human-readable string.
+/// Handles complex types like List, Array, Map, and Struct recursively.
+fn format_value(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::TinyInt(n) => n.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::HugeInt(n) => n.to_string(),
+        Value::UTinyInt(n) => n.to_string(),
+        Value::USmallInt(n) => n.to_string(),
+        Value::UInt(n) => n.to_string(),
+        Value::UBigInt(n) => n.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Double(f) => f.to_string(),
+        Value::Decimal(d) => d.to_string(),
+        Value::Timestamp(_, micros) => {
+            DateTime::<Utc>::from_timestamp_micros(*micros)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| format!("<timestamp {}>", micros))
+        }
+        Value::Text(s) => s.clone(),
+        Value::Blob(b) => format!("<blob {} bytes>", b.len()),
+        Value::Date32(days) => {
+            NaiveDate::from_ymd_opt(1970, 1, 1)
+                .and_then(|epoch| epoch.checked_add_signed(TimeDelta::days(*days as i64)))
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| format!("<date {}>", days))
+        }
+        Value::Time64(_, micros) => {
+            let secs = (*micros / 1_000_000) as u32;
+            let micro_part = (*micros % 1_000_000) as u32;
+            NaiveTime::from_num_seconds_from_midnight_opt(secs, micro_part * 1000)
+                .map(|t| t.format("%H:%M:%S").to_string())
+                .unwrap_or_else(|| format!("<time {}>", micros))
+        }
+        Value::Interval { months, days, nanos } => {
+            format!("{} months {} days {} ns", months, days, nanos)
+        }
+        // Complex types
+        Value::List(items) => {
+            let formatted: Vec<String> = items.iter().map(format_value).collect();
+            format!("[{}]", formatted.join(", "))
+        }
+        Value::Array(items) => {
+            let formatted: Vec<String> = items.iter().map(format_value).collect();
+            format!("[{}]", formatted.join(", "))
+        }
+        Value::Map(map) => {
+            let formatted: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{}: {}", format_value(k), format_value(v)))
+                .collect();
+            format!("{{{}}}", formatted.join(", "))
+        }
+        Value::Struct(fields) => {
+            let formatted: Vec<String> = fields
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, format_value(v)))
+                .collect();
+            format!("{{{}}}", formatted.join(", "))
+        }
+        Value::Enum(s) => s.clone(),
+        _ => "<unknown>".to_string(),
+    }
+}
 
 // Re-export types from submodules
 pub use compact::{ArchiveStats, AutoCompactOptions, CompactOptions, CompactStats};
@@ -83,6 +152,71 @@ impl InvocationBatch {
     }
 }
 
+/// Options for creating a database connection.
+///
+/// Controls what gets loaded and attached when opening a connection.
+/// Use this for explicit control over connection behavior.
+///
+/// # Connection Stages
+///
+/// 1. **Extensions** (always): parquet, icu, scalarfs, duck_hunt
+/// 2. **Blob resolution** (always): S3 credentials, blob_roots macro
+/// 3. **Migration** (optional): Upgrade existing installations to new schema
+/// 4. **Remotes** (optional): Attach remote databases, rebuild remotes.* views
+/// 5. **Project** (optional): Attach project-local database if in a project
+/// 6. **CWD views** (optional): Rebuild cwd.* views for current directory
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionOptions {
+    /// Attach configured remotes (default: true).
+    /// When true, remote databases are attached and remotes.* views are rebuilt
+    /// to include the attached data.
+    pub attach_remotes: bool,
+
+    /// Attach project database if in a project directory (default: true).
+    pub attach_project: bool,
+
+    /// Rebuild cwd.* views for current working directory (default: true).
+    /// These views filter main.* data to entries matching the current directory.
+    pub create_ephemeral_views: bool,
+
+    /// Run migration for existing installations (default: false).
+    /// Only enable this for explicit upgrade operations.
+    pub run_migration: bool,
+}
+
+impl ConnectionOptions {
+    /// Create options for a full connection (default behavior).
+    pub fn full() -> Self {
+        Self {
+            attach_remotes: true,
+            attach_project: true,
+            create_ephemeral_views: true,
+            run_migration: false,
+        }
+    }
+
+    /// Create options for a minimal connection (no attachments).
+    /// Useful for write operations that don't need remote data.
+    pub fn minimal() -> Self {
+        Self {
+            attach_remotes: false,
+            attach_project: false,
+            create_ephemeral_views: false,
+            run_migration: false,
+        }
+    }
+
+    /// Create options for a migration/upgrade connection.
+    pub fn for_migration() -> Self {
+        Self {
+            attach_remotes: false,
+            attach_project: false,
+            create_ephemeral_views: false,
+            run_migration: true,
+        }
+    }
+}
+
 /// A BIRD store for reading and writing records.
 pub struct Store {
     config: Config,
@@ -97,20 +231,35 @@ impl Store {
         Ok(Self { config })
     }
 
-    /// Get a DuckDB connection to the store.
+    /// Get a DuckDB connection with full features (attachments, ephemeral views).
     pub fn connection(&self) -> Result<Connection> {
-        self.connection_with_options(true)
+        self.connect(ConnectionOptions::full())
     }
 
-    /// Get a DuckDB connection with optional remote attachment.
+    /// Get a DuckDB connection with optional remote attachment (legacy API).
     pub fn connection_with_options(&self, attach_remotes: bool) -> Result<Connection> {
+        let opts = if attach_remotes {
+            ConnectionOptions::full()
+        } else {
+            ConnectionOptions::minimal()
+        };
+        self.connect(opts)
+    }
+
+    /// Get a DuckDB connection with explicit options.
+    ///
+    /// This is the main connection method. Use `ConnectionOptions` to control:
+    /// - Whether remotes are attached
+    /// - Whether project database is attached
+    /// - Whether ephemeral views are created
+    /// - Whether migration should run
+    pub fn connect(&self, opts: ConnectionOptions) -> Result<Connection> {
         let conn = Connection::open(&self.config.db_path())?;
 
-        // Load bundled extensions
+        // ===== Always load required extensions =====
+        // These are required for basic functionality
         conn.execute("LOAD parquet", [])?;
         conn.execute("LOAD icu", [])?;
-
-        // Load community extensions (uses ~/.duckdb/extensions cache)
         conn.execute("SET allow_community_extensions = true", [])?;
         conn.execute("LOAD scalarfs", [])?;
         conn.execute("LOAD duck_hunt", [])?;
@@ -124,28 +273,31 @@ impl Store {
             [],
         )?;
 
-        // Ensure tables exist for parquet mode (migration for existing installations)
-        // This allows pull operations to work by inserting into tables
-        if self.config.storage_mode == crate::StorageMode::Parquet {
-            self.ensure_tables_for_pull(&conn)?;
+        // ===== Optional: Run migration for existing installations =====
+        if opts.run_migration {
+            self.migrate_to_new_schema(&conn)?;
         }
 
-        // Set up S3 credentials for blob resolution (before blob_roots is used)
-        // This needs to happen before setup_blob_resolution so that S3 globs work
+        // ===== Always set up blob resolution =====
+        // S3 credentials needed before blob_roots is used
         self.setup_s3_credentials(&conn)?;
-
-        // Set up blob resolution across local and remote storage
         self.setup_blob_resolution(&conn)?;
 
-        // Attach remotes and create unified schema if requested
-        if attach_remotes && !self.config.remotes.is_empty() {
+        // ===== Optional: Attach remotes and create access macros =====
+        if opts.attach_remotes && !self.config.remotes.is_empty() {
             self.attach_remotes(&conn)?;
-            self.create_unified_schema(&conn)?;
+            self.create_remote_macros(&conn)?;
         }
 
-        // Attach project database if we're in a project directory
-        if attach_remotes {
+        // ===== Optional: Attach project database =====
+        if opts.attach_project {
             self.attach_project_db(&conn)?;
+        }
+
+        // ===== Optional: Create cwd macros =====
+        // These TEMPORARY macros filter by current working directory
+        if opts.create_ephemeral_views {
+            self.create_cwd_macros(&conn)?;
         }
 
         Ok(conn)
@@ -185,80 +337,212 @@ impl Store {
         Ok(())
     }
 
-    /// Ensure tables exist in parquet mode for pull operations.
+    /// Migrate existing installations to the new schema architecture.
     ///
-    /// This is a migration for existing parquet mode installations that
-    /// were created before pull support was added.
-    fn ensure_tables_for_pull(&self, conn: &Connection) -> Result<()> {
-        // Check if tables already exist
-        let table_exists: bool = conn
+    /// Checks if the `local` schema exists; if not, creates the new schema
+    /// structure and migrates data from old `*_table` tables.
+    fn migrate_to_new_schema(&self, conn: &Connection) -> Result<()> {
+        // Check if already migrated (local schema exists)
+        let local_exists: bool = conn
             .query_row(
-                "SELECT COUNT(*) > 0 FROM duckdb_tables() WHERE table_name = 'sessions_table'",
+                "SELECT COUNT(*) > 0 FROM information_schema.schemata WHERE schema_name = 'local'",
                 [],
                 |row| row.get(0),
             )
             .unwrap_or(false);
 
-        if table_exists {
+        if local_exists {
             return Ok(());
         }
 
-        // Create tables (same as init.rs create_duckdb_tables)
+        // This is an old installation - need to migrate
+        // For now, just create the new schemas. Data migration would require
+        // moving data from old tables/views to new structure.
+        // TODO: Implement full data migration if needed
+
+        eprintln!("Note: Migrating to new schema architecture...");
+
+        // Create core schemas
         conn.execute_batch(
             r#"
-            CREATE TABLE IF NOT EXISTS invocations_table (
+            CREATE SCHEMA IF NOT EXISTS local;
+            CREATE SCHEMA IF NOT EXISTS cached_placeholder;
+            CREATE SCHEMA IF NOT EXISTS remote_placeholder;
+            CREATE SCHEMA IF NOT EXISTS caches;
+            CREATE SCHEMA IF NOT EXISTS remotes;
+            CREATE SCHEMA IF NOT EXISTS unified;
+            CREATE SCHEMA IF NOT EXISTS cwd;
+            "#,
+        )?;
+
+        // For DuckDB mode, create local tables
+        if self.config.storage_mode == crate::StorageMode::DuckDB {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS local.sessions (
+                    session_id VARCHAR, client_id VARCHAR, invoker VARCHAR, invoker_pid INTEGER,
+                    invoker_type VARCHAR, registered_at TIMESTAMP, cwd VARCHAR, date DATE
+                );
+                CREATE TABLE IF NOT EXISTS local.invocations (
+                    id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
+                    cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
+                    format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR, date DATE
+                );
+                CREATE TABLE IF NOT EXISTS local.outputs (
+                    id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
+                    byte_length BIGINT, storage_type VARCHAR, storage_ref VARCHAR,
+                    content_type VARCHAR, date DATE
+                );
+                CREATE TABLE IF NOT EXISTS local.events (
+                    id UUID, invocation_id UUID, client_id VARCHAR, hostname VARCHAR,
+                    event_type VARCHAR, severity VARCHAR, ref_file VARCHAR, ref_line INTEGER,
+                    ref_column INTEGER, message VARCHAR, error_code VARCHAR, test_name VARCHAR,
+                    status VARCHAR, format_used VARCHAR, date DATE
+                );
+                "#,
+            )?;
+
+            // Copy data from old tables if they exist
+            let old_tables_exist: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM duckdb_tables() WHERE table_name = 'sessions_table'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+
+            if old_tables_exist {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO local.sessions SELECT * FROM sessions_table;
+                    INSERT INTO local.invocations SELECT * FROM invocations_table;
+                    INSERT INTO local.outputs SELECT * FROM outputs_table;
+                    INSERT INTO local.events SELECT * FROM events_table;
+                    "#,
+                )?;
+            }
+        } else {
+            // Parquet mode - create views over parquet files
+            conn.execute_batch(
+                r#"
+                CREATE OR REPLACE VIEW local.sessions AS
+                SELECT * EXCLUDE (filename) FROM read_parquet(
+                    'recent/sessions/**/*.parquet',
+                    union_by_name = true, hive_partitioning = true, filename = true
+                );
+                CREATE OR REPLACE VIEW local.invocations AS
+                SELECT * EXCLUDE (filename) FROM read_parquet(
+                    'recent/invocations/**/*.parquet',
+                    union_by_name = true, hive_partitioning = true, filename = true
+                );
+                CREATE OR REPLACE VIEW local.outputs AS
+                SELECT * EXCLUDE (filename) FROM read_parquet(
+                    'recent/outputs/**/*.parquet',
+                    union_by_name = true, hive_partitioning = true, filename = true
+                );
+                CREATE OR REPLACE VIEW local.events AS
+                SELECT * EXCLUDE (filename) FROM read_parquet(
+                    'recent/events/**/*.parquet',
+                    union_by_name = true, hive_partitioning = true, filename = true
+                );
+                "#,
+            )?;
+        }
+
+        // Create placeholder schemas
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS cached_placeholder.sessions (
+                session_id VARCHAR, client_id VARCHAR, invoker VARCHAR, invoker_pid INTEGER,
+                invoker_type VARCHAR, registered_at TIMESTAMP, cwd VARCHAR, date DATE, _source VARCHAR
+            );
+            CREATE TABLE IF NOT EXISTS cached_placeholder.invocations (
                 id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
                 cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
-                format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR, date DATE
+                format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR, date DATE, _source VARCHAR
             );
-            CREATE TABLE IF NOT EXISTS outputs_table (
+            CREATE TABLE IF NOT EXISTS cached_placeholder.outputs (
                 id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
                 byte_length BIGINT, storage_type VARCHAR, storage_ref VARCHAR,
-                content_type VARCHAR, date DATE
+                content_type VARCHAR, date DATE, _source VARCHAR
             );
-            CREATE TABLE IF NOT EXISTS sessions_table (
-                session_id VARCHAR, client_id VARCHAR, invoker VARCHAR, invoker_pid INTEGER,
-                invoker_type VARCHAR, registered_at TIMESTAMP, cwd VARCHAR, date DATE
-            );
-            CREATE TABLE IF NOT EXISTS events_table (
+            CREATE TABLE IF NOT EXISTS cached_placeholder.events (
                 id UUID, invocation_id UUID, client_id VARCHAR, hostname VARCHAR,
                 event_type VARCHAR, severity VARCHAR, ref_file VARCHAR, ref_line INTEGER,
                 ref_column INTEGER, message VARCHAR, error_code VARCHAR, test_name VARCHAR,
-                status VARCHAR, format_used VARCHAR, date DATE
+                status VARCHAR, format_used VARCHAR, date DATE, _source VARCHAR
+            );
+            CREATE TABLE IF NOT EXISTS remote_placeholder.sessions (
+                session_id VARCHAR, client_id VARCHAR, invoker VARCHAR, invoker_pid INTEGER,
+                invoker_type VARCHAR, registered_at TIMESTAMP, cwd VARCHAR, date DATE, _source VARCHAR
+            );
+            CREATE TABLE IF NOT EXISTS remote_placeholder.invocations (
+                id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
+                cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
+                format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR, date DATE, _source VARCHAR
+            );
+            CREATE TABLE IF NOT EXISTS remote_placeholder.outputs (
+                id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
+                byte_length BIGINT, storage_type VARCHAR, storage_ref VARCHAR,
+                content_type VARCHAR, date DATE, _source VARCHAR
+            );
+            CREATE TABLE IF NOT EXISTS remote_placeholder.events (
+                id UUID, invocation_id UUID, client_id VARCHAR, hostname VARCHAR,
+                event_type VARCHAR, severity VARCHAR, ref_file VARCHAR, ref_line INTEGER,
+                ref_column INTEGER, message VARCHAR, error_code VARCHAR, test_name VARCHAR,
+                status VARCHAR, format_used VARCHAR, date DATE, _source VARCHAR
             );
             "#,
         )?;
 
-        // Update views to UNION parquet with tables
+        // Create union schemas
         conn.execute_batch(
             r#"
-            CREATE OR REPLACE VIEW invocations AS
-            SELECT * EXCLUDE (filename) FROM read_parquet(
-                'recent/invocations/**/*.parquet',
-                union_by_name = true, hive_partitioning = true, filename = true
-            )
-            UNION ALL SELECT * FROM invocations_table;
+            CREATE OR REPLACE VIEW caches.sessions AS SELECT * FROM cached_placeholder.sessions;
+            CREATE OR REPLACE VIEW caches.invocations AS SELECT * FROM cached_placeholder.invocations;
+            CREATE OR REPLACE VIEW caches.outputs AS SELECT * FROM cached_placeholder.outputs;
+            CREATE OR REPLACE VIEW caches.events AS SELECT * FROM cached_placeholder.events;
 
-            CREATE OR REPLACE VIEW outputs AS
-            SELECT * EXCLUDE (filename) FROM read_parquet(
-                'recent/outputs/**/*.parquet',
-                union_by_name = true, hive_partitioning = true, filename = true
-            )
-            UNION ALL SELECT * FROM outputs_table;
+            CREATE OR REPLACE VIEW remotes.sessions AS SELECT * FROM remote_placeholder.sessions;
+            CREATE OR REPLACE VIEW remotes.invocations AS SELECT * FROM remote_placeholder.invocations;
+            CREATE OR REPLACE VIEW remotes.outputs AS SELECT * FROM remote_placeholder.outputs;
+            CREATE OR REPLACE VIEW remotes.events AS SELECT * FROM remote_placeholder.events;
 
-            CREATE OR REPLACE VIEW sessions AS
-            SELECT * EXCLUDE (filename) FROM read_parquet(
-                'recent/sessions/**/*.parquet',
-                union_by_name = true, hive_partitioning = true, filename = true
-            )
-            UNION ALL SELECT * FROM sessions_table;
+            CREATE OR REPLACE VIEW main.sessions AS
+                SELECT *, 'local' as _source FROM local.sessions
+                UNION ALL BY NAME SELECT * FROM caches.sessions;
+            CREATE OR REPLACE VIEW main.invocations AS
+                SELECT *, 'local' as _source FROM local.invocations
+                UNION ALL BY NAME SELECT * FROM caches.invocations;
+            CREATE OR REPLACE VIEW main.outputs AS
+                SELECT *, 'local' as _source FROM local.outputs
+                UNION ALL BY NAME SELECT * FROM caches.outputs;
+            CREATE OR REPLACE VIEW main.events AS
+                SELECT *, 'local' as _source FROM local.events
+                UNION ALL BY NAME SELECT * FROM caches.events;
 
-            CREATE OR REPLACE VIEW events AS
-            SELECT * EXCLUDE (filename) FROM read_parquet(
-                'recent/events/**/*.parquet',
-                union_by_name = true, hive_partitioning = true, filename = true
-            )
-            UNION ALL SELECT * FROM events_table;
+            CREATE OR REPLACE VIEW unified.sessions AS
+                SELECT * FROM main.sessions UNION ALL BY NAME SELECT * FROM remotes.sessions;
+            CREATE OR REPLACE VIEW unified.invocations AS
+                SELECT * FROM main.invocations UNION ALL BY NAME SELECT * FROM remotes.invocations;
+            CREATE OR REPLACE VIEW unified.outputs AS
+                SELECT * FROM main.outputs UNION ALL BY NAME SELECT * FROM remotes.outputs;
+            CREATE OR REPLACE VIEW unified.events AS
+                SELECT * FROM main.events UNION ALL BY NAME SELECT * FROM remotes.events;
+
+            -- Qualified views: deduplicated with source list
+            CREATE OR REPLACE VIEW unified.qualified_sessions AS
+                SELECT * EXCLUDE (_source), list(DISTINCT _source) as _sources
+                FROM unified.sessions GROUP BY ALL;
+            CREATE OR REPLACE VIEW unified.qualified_invocations AS
+                SELECT * EXCLUDE (_source), list(DISTINCT _source) as _sources
+                FROM unified.invocations GROUP BY ALL;
+            CREATE OR REPLACE VIEW unified.qualified_outputs AS
+                SELECT * EXCLUDE (_source), list(DISTINCT _source) as _sources
+                FROM unified.outputs GROUP BY ALL;
+            CREATE OR REPLACE VIEW unified.qualified_events AS
+                SELECT * EXCLUDE (_source), list(DISTINCT _source) as _sources
+                FROM unified.events GROUP BY ALL;
             "#,
         )?;
 
@@ -366,40 +650,107 @@ impl Store {
         Ok(())
     }
 
-    /// Create unified 'bird_all' schema with UNION views across main + all remotes.
-    /// Named 'bird_all' to avoid conflict with SQL keyword 'ALL'.
-    fn create_unified_schema(&self, conn: &Connection) -> Result<()> {
-        conn.execute("CREATE SCHEMA IF NOT EXISTS bird_all", [])?;
+    /// Create TEMPORARY macros for accessing remote data.
+    ///
+    /// We use TEMPORARY macros to avoid persisting references to attached databases
+    /// in the catalog. Persisted references cause database corruption when the
+    /// attachment is not present.
+    ///
+    /// Usage: `SELECT * FROM remotes_invocations()` or `SELECT * FROM remote_<name>_invocations()`
+    fn create_remote_macros(&self, conn: &Connection) -> Result<()> {
+        let remotes = self.config.auto_attach_remotes();
+        if remotes.is_empty() {
+            return Ok(());
+        }
 
-        // Tables to create unified views for
-        let tables = ["invocations", "outputs", "sessions", "events"];
+        // Create per-remote TEMPORARY macros for each table type
+        for remote in &remotes {
+            let schema = remote.quoted_schema_name();
+            let name = &remote.name;
+            // Sanitize name for use in macro identifier
+            let safe_name = name.replace('-', "_").replace('.', "_");
 
-        for table in &tables {
-            let mut union_parts = vec![format!(
-                "SELECT *, 'local' as _remote FROM main.{}",
-                table
-            )];
-
-            for remote in self.config.auto_attach_remotes() {
-                union_parts.push(format!(
-                    "SELECT *, '{}' as _remote FROM {}.{}",
-                    remote.name,
-                    remote.quoted_schema_name(),
-                    table
-                ));
-            }
-
-            let view_sql = format!(
-                "CREATE OR REPLACE VIEW bird_all.{} AS {}",
-                table,
-                union_parts.join(" UNION ALL BY NAME ")
-            );
-
-            if let Err(e) = conn.execute(&view_sql, []) {
-                eprintln!("Warning: Failed to create unified view for {}: {}", table, e);
+            for table in &["sessions", "invocations", "outputs", "events"] {
+                let macro_name = format!("\"remote_{safe_name}_{table}\"");
+                let sql = format!(
+                    r#"CREATE OR REPLACE TEMPORARY MACRO {macro_name}() AS TABLE (
+                        SELECT *, '{name}' as _source FROM {schema}.{table}
+                    )"#,
+                    macro_name = macro_name,
+                    name = name,
+                    schema = schema,
+                    table = table
+                );
+                if let Err(e) = conn.execute(&sql, []) {
+                    eprintln!("Warning: Failed to create macro {}: {}", macro_name, e);
+                }
             }
         }
 
+        // Create combined remotes_* TEMPORARY macros that union all remotes
+        for table in &["sessions", "invocations", "outputs", "events"] {
+            let mut union_parts: Vec<String> = remotes
+                .iter()
+                .map(|r| {
+                    let safe_name = r.name.replace('-', "_").replace('.', "_");
+                    format!("SELECT * FROM \"remote_{safe_name}_{table}\"()", safe_name = safe_name, table = table)
+                })
+                .collect();
+
+            // Include placeholder for empty case
+            union_parts.push(format!("SELECT * FROM remote_placeholder.{}", table));
+
+            let sql = format!(
+                r#"CREATE OR REPLACE TEMPORARY MACRO remotes_{table}() AS TABLE (
+                    {union}
+                )"#,
+                table = table,
+                union = union_parts.join(" UNION ALL BY NAME ")
+            );
+            if let Err(e) = conn.execute(&sql, []) {
+                eprintln!("Warning: Failed to create remotes_{} macro: {}", table, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create TEMPORARY macros for cwd-filtered data.
+    ///
+    /// These filter main.* data to entries matching the current working directory.
+    /// Uses TEMPORARY macros to avoid persisting anything that changes per-connection.
+    ///
+    /// Usage: `SELECT * FROM cwd_invocations()`
+    fn create_cwd_macros(&self, conn: &Connection) -> Result<()> {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let cwd_escaped = cwd.replace('\'', "''");
+
+        // Create TEMPORARY macros for cwd-filtered data
+        let macros = format!(
+            r#"
+            CREATE OR REPLACE TEMPORARY MACRO cwd_sessions() AS TABLE (
+                SELECT * FROM main.sessions WHERE cwd LIKE '{}%'
+            );
+            CREATE OR REPLACE TEMPORARY MACRO cwd_invocations() AS TABLE (
+                SELECT * FROM main.invocations WHERE cwd LIKE '{}%'
+            );
+            CREATE OR REPLACE TEMPORARY MACRO cwd_outputs() AS TABLE (
+                SELECT o.* FROM main.outputs o
+                JOIN main.invocations i ON o.invocation_id = i.id
+                WHERE i.cwd LIKE '{}%'
+            );
+            CREATE OR REPLACE TEMPORARY MACRO cwd_events() AS TABLE (
+                SELECT e.* FROM main.events e
+                JOIN main.invocations i ON e.invocation_id = i.id
+                WHERE i.cwd LIKE '{}%'
+            );
+            "#,
+            cwd_escaped, cwd_escaped, cwd_escaped, cwd_escaped
+        );
+
+        conn.execute_batch(&macros)?;
         Ok(())
     }
 
@@ -534,7 +885,11 @@ impl Store {
                     }
                     ValueRef::Text(s) => String::from_utf8_lossy(s).to_string(),
                     ValueRef::Blob(b) => format!("<blob {} bytes>", b.len()),
-                    _ => "<complex>".to_string(),
+                    other => {
+                        // Convert to owned Value for complex types (List, Array, Map, Struct)
+                        let owned: Value = other.into();
+                        format_value(&owned)
+                    }
                 };
                 values.push(value);
             }
@@ -661,7 +1016,7 @@ impl Store {
             // Check if session exists
             let exists: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM sessions_table WHERE session_id = ?",
+                    "SELECT COUNT(*) FROM local.sessions WHERE session_id = ?",
                     params![&session.session_id],
                     |row| row.get(0),
                 )
@@ -669,7 +1024,7 @@ impl Store {
 
             if exists == 0 {
                 conn.execute(
-                    r#"INSERT INTO sessions_table VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+                    r#"INSERT INTO local.sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
                     params![
                         session.session_id,
                         session.client_id,
@@ -686,7 +1041,7 @@ impl Store {
 
         // Write invocation
         conn.execute(
-            r#"INSERT INTO invocations_table VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            r#"INSERT INTO local.invocations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             params![
                 invocation.id.to_string(),
                 invocation.session_id,
@@ -751,7 +1106,7 @@ impl Store {
             // Write output record
             let output_id = uuid::Uuid::now_v7();
             conn.execute(
-                r#"INSERT INTO outputs_table VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                r#"INSERT INTO local.outputs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
                 params![
                     output_id.to_string(),
                     inv_id.to_string(),
@@ -770,7 +1125,7 @@ impl Store {
         if let Some(ref events) = batch.events {
             for event in events {
                 conn.execute(
-                    r#"INSERT INTO events_table VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                    r#"INSERT INTO local.events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
                     params![
                         event.id.to_string(),
                         event.invocation_id.to_string(),

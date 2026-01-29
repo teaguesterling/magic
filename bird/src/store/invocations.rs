@@ -25,7 +25,7 @@ impl Store {
     ///
     /// Behavior depends on storage mode:
     /// - Parquet: Creates a new Parquet file in the appropriate date partition
-    /// - DuckDB: Inserts directly into the invocations_table
+    /// - DuckDB: Inserts directly into the local.invocations
     pub fn write_invocation(&self, record: &InvocationRecord) -> Result<()> {
         match self.config.storage_mode {
             StorageMode::Parquet => self.write_invocation_parquet(record),
@@ -120,7 +120,7 @@ impl Store {
 
         conn.execute(
             r#"
-            INSERT INTO invocations_table VALUES (
+            INSERT INTO local.invocations VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             "#,

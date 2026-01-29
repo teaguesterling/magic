@@ -403,8 +403,8 @@ impl Store {
                 atomic::rename_into_place(&temp_path, &file_path)?;
             }
             StorageMode::DuckDB => {
-                // Insert directly into events_table
-                conn.execute_batch("INSERT INTO events_table SELECT * FROM temp_events")?;
+                // Insert directly into local.events
+                conn.execute_batch("INSERT INTO local.events SELECT * FROM temp_events")?;
                 conn.execute("DROP TABLE temp_events", [])?;
             }
         }
@@ -416,7 +416,7 @@ impl Store {
     ///
     /// Behavior depends on storage mode:
     /// - Parquet: Creates Parquet files partitioned by date
-    /// - DuckDB: Inserts directly into the events_table
+    /// - DuckDB: Inserts directly into the local.events
     pub fn write_events(&self, records: &[EventRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
@@ -525,7 +525,7 @@ impl Store {
         for record in records {
             conn.execute(
                 r#"
-                INSERT INTO events_table VALUES (
+                INSERT INTO local.events VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 "#,
@@ -759,7 +759,7 @@ impl Store {
     ///
     /// Behavior depends on storage mode:
     /// - Parquet: Deletes parquet files containing the events
-    /// - DuckDB: Deletes rows from events_table
+    /// - DuckDB: Deletes rows from local.events
     pub fn delete_events_for_invocation(&self, invocation_id: &str) -> Result<usize> {
         match self.config.storage_mode {
             StorageMode::Parquet => self.delete_events_parquet(invocation_id),
@@ -826,7 +826,7 @@ impl Store {
         // Count events before deletion
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM events_table WHERE invocation_id = ?",
+                "SELECT COUNT(*) FROM local.events WHERE invocation_id = ?",
                 params![invocation_id],
                 |row| row.get(0),
             )
@@ -834,7 +834,7 @@ impl Store {
 
         if count > 0 {
             conn.execute(
-                "DELETE FROM events_table WHERE invocation_id = ?",
+                "DELETE FROM local.events WHERE invocation_id = ?",
                 params![invocation_id],
             )?;
         }

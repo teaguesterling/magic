@@ -1,4 +1,30 @@
 //! BIRD initialization - creates directory structure and database.
+//!
+//! # Schema Architecture
+//!
+//! BIRD uses a multi-schema architecture for flexible data organization:
+//!
+//! ## Data Schemas (contain actual tables)
+//! - `local` - Locally generated data (tables in DuckDB mode, parquet views in parquet mode)
+//! - `cached_<name>` - One per remote, contains data pulled/synced from that remote
+//! - `cached_placeholder` - Empty tables (ensures `caches` views work with no cached data)
+//!
+//! ## Attached Schemas (live remote connections)
+//! - `remote_<name>` - Attached remote databases (read-only)
+//! - `remote_placeholder` - Empty tables (ensures `remotes` views work with no remotes)
+//!
+//! ## Union Schemas (dynamic views)
+//! - `caches` - Union of all `cached_*` schemas
+//! - `remotes` - Union of all `remote_*` schemas
+//! - `main` - Union of `local` + `caches` (all data we own locally)
+//! - `unified` - Union of `main` + `remotes` (everything)
+//! - `cwd` - Views filtered to current working directory
+//!
+//! ## Reserved Schema Names
+//! - `local`, `main`, `unified`, `cwd`, `caches`, `remotes` - Core schemas
+//! - `cached_*` - Reserved prefix for cached remote data
+//! - `remote_*` - Reserved prefix for attached remotes
+//! - `project` - Reserved for attached project-level database
 
 use std::fs;
 
@@ -8,7 +34,7 @@ use crate::{Config, Error, Result};
 /// Initialize a new BIRD installation.
 ///
 /// Creates the directory structure and initializes the DuckDB database
-/// with views for querying Parquet files.
+/// with the schema architecture.
 pub fn initialize(config: &Config) -> Result<()> {
     let bird_root = &config.bird_root;
 
@@ -20,7 +46,7 @@ pub fn initialize(config: &Config) -> Result<()> {
     // Create directory structure
     create_directories(config)?;
 
-    // Initialize DuckDB with views
+    // Initialize DuckDB with schemas
     init_database(config)?;
 
     // Save config
@@ -60,7 +86,7 @@ fn create_directories(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Initialize the DuckDB database with views.
+/// Initialize the DuckDB database with schema architecture.
 fn init_database(config: &Config) -> Result<()> {
     let conn = duckdb::Connection::open(&config.db_path())?;
 
@@ -71,9 +97,6 @@ fn init_database(config: &Config) -> Result<()> {
     // Verify community extensions can be loaded (downloads to ~/.duckdb cache if needed)
     verify_extensions(&conn)?;
 
-    // Create blob_registry table (used by both modes)
-    create_blob_registry(&conn)?;
-
     // Set file search path so views use relative paths
     let data_dir = config.data_dir();
     conn.execute(
@@ -81,97 +104,276 @@ fn init_database(config: &Config) -> Result<()> {
         [],
     )?;
 
-    // Mode-specific initialization
+    // Create core schemas
+    create_core_schemas(&conn)?;
+
+    // Create blob_registry table in main schema (used by both modes)
+    create_blob_registry(&conn)?;
+
+    // Mode-specific initialization for local schema
     match config.storage_mode {
         StorageMode::Parquet => {
             // Create seed parquet files with correct schema but no rows
-            // This ensures the glob pattern always matches at least one file
             create_seed_files(&conn, config)?;
-            // Create tables too - used for pull operations (remote sync)
-            // Normal writes go to parquet, but pull inserts into tables
-            create_duckdb_tables(&conn)?;
-            // Views UNION parquet files with tables
-            create_parquet_views(&conn)?;
+            // Create local schema with views over parquet files
+            create_local_parquet_views(&conn)?;
         }
         StorageMode::DuckDB => {
-            // Create tables for direct storage
-            create_duckdb_tables(&conn)?;
-            create_duckdb_views(&conn)?;
+            // Create local schema with tables for direct storage
+            create_local_tables(&conn)?;
         }
     }
 
-    // Create helper views (same for both modes, depend on base views)
+    // Create placeholder schemas (for empty unions)
+    create_placeholder_schemas(&conn)?;
+
+    // Create union schemas (caches, remotes, main, bird)
+    create_union_schemas(&conn)?;
+
+    // Create helper views in main schema
     create_helper_views(&conn)?;
+
+    // Create cwd schema views (placeholders, rebuilt at connection time)
+    create_cwd_views(&conn)?;
 
     Ok(())
 }
 
-/// Create views that read from Parquet files (for Parquet mode).
-///
-/// Views UNION parquet files with tables. Normal writes go to parquet files,
-/// but pull operations insert into tables. This allows remote sync to work
-/// in parquet mode.
-fn create_parquet_views(conn: &duckdb::Connection) -> Result<()> {
+/// Create core schemas used by BIRD.
+fn create_core_schemas(conn: &duckdb::Connection) -> Result<()> {
     conn.execute_batch(
         r#"
-        -- Invocations view: parquet files UNION pulled records in table
-        CREATE OR REPLACE VIEW invocations AS
-        SELECT * EXCLUDE (filename)
-        FROM read_parquet(
-            'recent/invocations/**/*.parquet',
-            union_by_name = true,
-            hive_partitioning = true,
-            filename = true
-        )
-        UNION ALL
-        SELECT * FROM invocations_table;
+        -- Data schemas
+        CREATE SCHEMA IF NOT EXISTS local;
+        CREATE SCHEMA IF NOT EXISTS cached_placeholder;
+        CREATE SCHEMA IF NOT EXISTS remote_placeholder;
 
-        -- Outputs view: parquet files UNION pulled records
-        CREATE OR REPLACE VIEW outputs AS
-        SELECT * EXCLUDE (filename)
-        FROM read_parquet(
-            'recent/outputs/**/*.parquet',
-            union_by_name = true,
-            hive_partitioning = true,
-            filename = true
-        )
-        UNION ALL
-        SELECT * FROM outputs_table;
+        -- Union schemas
+        CREATE SCHEMA IF NOT EXISTS caches;
+        CREATE SCHEMA IF NOT EXISTS remotes;
+        -- main already exists as default schema
+        CREATE SCHEMA IF NOT EXISTS unified;
+        CREATE SCHEMA IF NOT EXISTS cwd;
+        "#,
+    )?;
+    Ok(())
+}
 
-        -- Sessions view: parquet files UNION pulled records
-        CREATE OR REPLACE VIEW sessions AS
+/// Create placeholder schemas with empty tables.
+/// These ensure union views work even when no cached/remote schemas exist.
+fn create_placeholder_schemas(conn: &duckdb::Connection) -> Result<()> {
+    // Cached placeholder - empty tables with correct schema
+    conn.execute_batch(
+        r#"
+        CREATE TABLE cached_placeholder.sessions (
+            session_id VARCHAR, client_id VARCHAR, invoker VARCHAR, invoker_pid INTEGER,
+            invoker_type VARCHAR, registered_at TIMESTAMP, cwd VARCHAR, date DATE,
+            _source VARCHAR
+        );
+        CREATE TABLE cached_placeholder.invocations (
+            id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
+            cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
+            format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR,
+            date DATE, _source VARCHAR
+        );
+        CREATE TABLE cached_placeholder.outputs (
+            id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
+            byte_length BIGINT, storage_type VARCHAR, storage_ref VARCHAR,
+            content_type VARCHAR, date DATE, _source VARCHAR
+        );
+        CREATE TABLE cached_placeholder.events (
+            id UUID, invocation_id UUID, client_id VARCHAR, hostname VARCHAR,
+            event_type VARCHAR, severity VARCHAR, ref_file VARCHAR, ref_line INTEGER,
+            ref_column INTEGER, message VARCHAR, error_code VARCHAR, test_name VARCHAR,
+            status VARCHAR, format_used VARCHAR, date DATE, _source VARCHAR
+        );
+        "#,
+    )?;
+
+    // Remote placeholder - same structure
+    conn.execute_batch(
+        r#"
+        CREATE TABLE remote_placeholder.sessions (
+            session_id VARCHAR, client_id VARCHAR, invoker VARCHAR, invoker_pid INTEGER,
+            invoker_type VARCHAR, registered_at TIMESTAMP, cwd VARCHAR, date DATE,
+            _source VARCHAR
+        );
+        CREATE TABLE remote_placeholder.invocations (
+            id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
+            cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
+            format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR,
+            date DATE, _source VARCHAR
+        );
+        CREATE TABLE remote_placeholder.outputs (
+            id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
+            byte_length BIGINT, storage_type VARCHAR, storage_ref VARCHAR,
+            content_type VARCHAR, date DATE, _source VARCHAR
+        );
+        CREATE TABLE remote_placeholder.events (
+            id UUID, invocation_id UUID, client_id VARCHAR, hostname VARCHAR,
+            event_type VARCHAR, severity VARCHAR, ref_file VARCHAR, ref_line INTEGER,
+            ref_column INTEGER, message VARCHAR, error_code VARCHAR, test_name VARCHAR,
+            status VARCHAR, format_used VARCHAR, date DATE, _source VARCHAR
+        );
+        "#,
+    )?;
+
+    Ok(())
+}
+
+/// Create union schemas that combine data from multiple sources.
+/// Initially these just reference placeholders; they get rebuilt when remotes are added.
+fn create_union_schemas(conn: &duckdb::Connection) -> Result<()> {
+    // caches = union of all cached_* schemas (initially just placeholder)
+    conn.execute_batch(
+        r#"
+        CREATE OR REPLACE VIEW caches.sessions AS SELECT * FROM cached_placeholder.sessions;
+        CREATE OR REPLACE VIEW caches.invocations AS SELECT * FROM cached_placeholder.invocations;
+        CREATE OR REPLACE VIEW caches.outputs AS SELECT * FROM cached_placeholder.outputs;
+        CREATE OR REPLACE VIEW caches.events AS SELECT * FROM cached_placeholder.events;
+        "#,
+    )?;
+
+    // remotes = union of all remote_* schemas (initially just placeholder)
+    conn.execute_batch(
+        r#"
+        CREATE OR REPLACE VIEW remotes.sessions AS SELECT * FROM remote_placeholder.sessions;
+        CREATE OR REPLACE VIEW remotes.invocations AS SELECT * FROM remote_placeholder.invocations;
+        CREATE OR REPLACE VIEW remotes.outputs AS SELECT * FROM remote_placeholder.outputs;
+        CREATE OR REPLACE VIEW remotes.events AS SELECT * FROM remote_placeholder.events;
+        "#,
+    )?;
+
+    // main = local + caches (all data we own)
+    conn.execute_batch(
+        r#"
+        CREATE OR REPLACE VIEW main.sessions AS
+            SELECT *, 'local' as _source FROM local.sessions
+            UNION ALL BY NAME SELECT * FROM caches.sessions;
+        CREATE OR REPLACE VIEW main.invocations AS
+            SELECT *, 'local' as _source FROM local.invocations
+            UNION ALL BY NAME SELECT * FROM caches.invocations;
+        CREATE OR REPLACE VIEW main.outputs AS
+            SELECT *, 'local' as _source FROM local.outputs
+            UNION ALL BY NAME SELECT * FROM caches.outputs;
+        CREATE OR REPLACE VIEW main.events AS
+            SELECT *, 'local' as _source FROM local.events
+            UNION ALL BY NAME SELECT * FROM caches.events;
+        "#,
+    )?;
+
+    // unified = main + remotes (everything)
+    conn.execute_batch(
+        r#"
+        CREATE OR REPLACE VIEW unified.sessions AS
+            SELECT * FROM main.sessions
+            UNION ALL BY NAME SELECT * FROM remotes.sessions;
+        CREATE OR REPLACE VIEW unified.invocations AS
+            SELECT * FROM main.invocations
+            UNION ALL BY NAME SELECT * FROM remotes.invocations;
+        CREATE OR REPLACE VIEW unified.outputs AS
+            SELECT * FROM main.outputs
+            UNION ALL BY NAME SELECT * FROM remotes.outputs;
+        CREATE OR REPLACE VIEW unified.events AS
+            SELECT * FROM main.events
+            UNION ALL BY NAME SELECT * FROM remotes.events;
+        "#,
+    )?;
+
+    // unified.qualified_* views - deduplicated with source list
+    conn.execute_batch(
+        r#"
+        CREATE OR REPLACE VIEW unified.qualified_sessions AS
+            SELECT * EXCLUDE (_source), list(DISTINCT _source) as _sources
+            FROM unified.sessions
+            GROUP BY ALL;
+        CREATE OR REPLACE VIEW unified.qualified_invocations AS
+            SELECT * EXCLUDE (_source), list(DISTINCT _source) as _sources
+            FROM unified.invocations
+            GROUP BY ALL;
+        CREATE OR REPLACE VIEW unified.qualified_outputs AS
+            SELECT * EXCLUDE (_source), list(DISTINCT _source) as _sources
+            FROM unified.outputs
+            GROUP BY ALL;
+        CREATE OR REPLACE VIEW unified.qualified_events AS
+            SELECT * EXCLUDE (_source), list(DISTINCT _source) as _sources
+            FROM unified.events
+            GROUP BY ALL;
+        "#,
+    )?;
+
+    Ok(())
+}
+
+/// Create local schema with views over Parquet files (for Parquet mode).
+///
+/// In parquet mode, local data is stored in parquet files.
+/// Views in the local schema read from these files.
+fn create_local_parquet_views(conn: &duckdb::Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        -- Sessions view: read from parquet files
+        CREATE OR REPLACE VIEW local.sessions AS
         SELECT * EXCLUDE (filename)
         FROM read_parquet(
             'recent/sessions/**/*.parquet',
             union_by_name = true,
             hive_partitioning = true,
             filename = true
-        )
-        UNION ALL
-        SELECT * FROM sessions_table;
+        );
 
-        -- Events view: parquet files UNION pulled records
-        CREATE OR REPLACE VIEW events AS
+        -- Invocations view: read from parquet files
+        CREATE OR REPLACE VIEW local.invocations AS
+        SELECT * EXCLUDE (filename)
+        FROM read_parquet(
+            'recent/invocations/**/*.parquet',
+            union_by_name = true,
+            hive_partitioning = true,
+            filename = true
+        );
+
+        -- Outputs view: read from parquet files
+        CREATE OR REPLACE VIEW local.outputs AS
+        SELECT * EXCLUDE (filename)
+        FROM read_parquet(
+            'recent/outputs/**/*.parquet',
+            union_by_name = true,
+            hive_partitioning = true,
+            filename = true
+        );
+
+        -- Events view: read from parquet files
+        CREATE OR REPLACE VIEW local.events AS
         SELECT * EXCLUDE (filename)
         FROM read_parquet(
             'recent/events/**/*.parquet',
             union_by_name = true,
             hive_partitioning = true,
             filename = true
-        )
-        UNION ALL
-        SELECT * FROM events_table;
+        );
         "#,
     )?;
     Ok(())
 }
 
-/// Create tables for direct storage (for DuckDB mode).
-fn create_duckdb_tables(conn: &duckdb::Connection) -> Result<()> {
+/// Create local schema with tables for direct storage (for DuckDB mode).
+fn create_local_tables(conn: &duckdb::Connection) -> Result<()> {
     conn.execute_batch(
         r#"
+        -- Sessions table
+        CREATE TABLE IF NOT EXISTS local.sessions (
+            session_id VARCHAR,
+            client_id VARCHAR,
+            invoker VARCHAR,
+            invoker_pid INTEGER,
+            invoker_type VARCHAR,
+            registered_at TIMESTAMP,
+            cwd VARCHAR,
+            date DATE
+        );
+
         -- Invocations table
-        CREATE TABLE IF NOT EXISTS invocations_table (
+        CREATE TABLE IF NOT EXISTS local.invocations (
             id UUID,
             session_id VARCHAR,
             timestamp TIMESTAMP,
@@ -188,7 +390,7 @@ fn create_duckdb_tables(conn: &duckdb::Connection) -> Result<()> {
         );
 
         -- Outputs table
-        CREATE TABLE IF NOT EXISTS outputs_table (
+        CREATE TABLE IF NOT EXISTS local.outputs (
             id UUID,
             invocation_id UUID,
             stream VARCHAR,
@@ -200,20 +402,8 @@ fn create_duckdb_tables(conn: &duckdb::Connection) -> Result<()> {
             date DATE
         );
 
-        -- Sessions table
-        CREATE TABLE IF NOT EXISTS sessions_table (
-            session_id VARCHAR,
-            client_id VARCHAR,
-            invoker VARCHAR,
-            invoker_pid INTEGER,
-            invoker_type VARCHAR,
-            registered_at TIMESTAMP,
-            cwd VARCHAR,
-            date DATE
-        );
-
         -- Events table
-        CREATE TABLE IF NOT EXISTS events_table (
+        CREATE TABLE IF NOT EXISTS local.events (
             id UUID,
             invocation_id UUID,
             client_id VARCHAR,
@@ -235,47 +425,33 @@ fn create_duckdb_tables(conn: &duckdb::Connection) -> Result<()> {
     Ok(())
 }
 
-/// Create views that read from tables (for DuckDB mode).
-fn create_duckdb_views(conn: &duckdb::Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
-        -- Views simply select from tables
-        CREATE OR REPLACE VIEW invocations AS SELECT * FROM invocations_table;
-        CREATE OR REPLACE VIEW outputs AS SELECT * FROM outputs_table;
-        CREATE OR REPLACE VIEW sessions AS SELECT * FROM sessions_table;
-        CREATE OR REPLACE VIEW events AS SELECT * FROM events_table;
-        "#,
-    )?;
-    Ok(())
-}
-
-/// Create helper views (same for both modes).
+/// Create helper views in main schema.
 fn create_helper_views(conn: &duckdb::Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         -- Recent invocations helper view
-        CREATE OR REPLACE VIEW recent_invocations AS
+        CREATE OR REPLACE VIEW main.recent_invocations AS
         SELECT *
-        FROM invocations
+        FROM main.invocations
         WHERE date >= CURRENT_DATE - INTERVAL '7 days'
         ORDER BY timestamp DESC;
 
         -- Invocations today helper view
-        CREATE OR REPLACE VIEW invocations_today AS
+        CREATE OR REPLACE VIEW main.invocations_today AS
         SELECT *
-        FROM invocations
+        FROM main.invocations
         WHERE date = CURRENT_DATE
         ORDER BY timestamp DESC;
 
         -- Failed invocations helper view
-        CREATE OR REPLACE VIEW failed_invocations AS
+        CREATE OR REPLACE VIEW main.failed_invocations AS
         SELECT *
-        FROM invocations
+        FROM main.invocations
         WHERE exit_code != 0
         ORDER BY timestamp DESC;
 
         -- Invocations with outputs (joined view)
-        CREATE OR REPLACE VIEW invocations_with_outputs AS
+        CREATE OR REPLACE VIEW main.invocations_with_outputs AS
         SELECT
             i.*,
             o.id as output_id,
@@ -283,29 +459,51 @@ fn create_helper_views(conn: &duckdb::Connection) -> Result<()> {
             o.byte_length,
             o.storage_type,
             o.storage_ref
-        FROM invocations i
-        LEFT JOIN outputs o ON i.id = o.invocation_id;
+        FROM main.invocations i
+        LEFT JOIN main.outputs o ON i.id = o.invocation_id;
 
         -- Clients view (derived from sessions)
-        CREATE OR REPLACE VIEW clients AS
+        CREATE OR REPLACE VIEW main.clients AS
         SELECT
             client_id,
             MIN(registered_at) as first_seen,
             MAX(registered_at) as last_seen,
             COUNT(DISTINCT session_id) as session_count
-        FROM sessions
+        FROM main.sessions
         GROUP BY client_id;
 
         -- Events with invocation context (joined view)
-        CREATE OR REPLACE VIEW events_with_context AS
+        CREATE OR REPLACE VIEW main.events_with_context AS
         SELECT
             e.*,
             i.cmd,
             i.timestamp,
             i.cwd,
             i.exit_code
-        FROM events e
-        JOIN invocations i ON e.invocation_id = i.id;
+        FROM main.events e
+        JOIN main.invocations i ON e.invocation_id = i.id;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Create cwd schema views filtered to current working directory.
+/// These views are dynamically regenerated when the connection opens.
+/// Note: Initial creation uses a placeholder; actual filtering happens at connection time.
+fn create_cwd_views(conn: &duckdb::Connection) -> Result<()> {
+    // cwd views filter main data to entries where cwd starts with current directory
+    // The actual current directory is set via a variable at connection time
+    conn.execute_batch(
+        r#"
+        -- Placeholder views - these get rebuilt with actual cwd at connection time
+        CREATE OR REPLACE VIEW cwd.sessions AS
+        SELECT * FROM main.sessions WHERE false;
+        CREATE OR REPLACE VIEW cwd.invocations AS
+        SELECT * FROM main.invocations WHERE false;
+        CREATE OR REPLACE VIEW cwd.outputs AS
+        SELECT * FROM main.outputs WHERE false;
+        CREATE OR REPLACE VIEW cwd.events AS
+        SELECT * FROM main.events WHERE false;
         "#,
     )?;
     Ok(())

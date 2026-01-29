@@ -701,6 +701,37 @@ pub struct BirdStats {
     pub invocations: InvocationStats,
     pub sessions: SessionStats,
     pub events: EventStats,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub remotes: Vec<RemoteInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schemas: Option<SchemaStats>,
+}
+
+#[derive(serde::Serialize)]
+pub struct RemoteInfo {
+    pub name: String,
+    pub remote_type: String,
+    pub uri: String,
+    pub auto_attach: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invocations: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+pub struct SchemaStats {
+    pub local: SchemaCounts,
+    pub caches: SchemaCounts,
+    pub remotes: SchemaCounts,
+    pub main: SchemaCounts,
+    pub unified: SchemaCounts,
+}
+
+#[derive(serde::Serialize)]
+pub struct SchemaCounts {
+    pub invocations: i64,
+    pub sessions: i64,
+    pub outputs: i64,
+    pub events: i64,
 }
 
 #[derive(serde::Serialize)]
@@ -747,26 +778,119 @@ pub fn stats(format: &str) -> bird::Result<()> {
     let config = Config::load()?;
     let store = Store::open(config.clone())?;
 
-    // Gather stats
-    let inv_count = store.invocation_count()?;
-    let session_count = store.session_count()?;
-    let last_inv = store.last_invocation()?;
+    // Use a single connection for all queries to avoid multiple connection issues
+    let conn = store.connection()?;
 
-    let event_count = store.event_count(&EventFilters::default())?;
-    let error_count = store.event_count(&EventFilters {
-        severity: Some("error".to_string()),
-        ..Default::default()
-    })?;
-    let warning_count = store.event_count(&EventFilters {
-        severity: Some("warning".to_string()),
-        ..Default::default()
-    })?;
+    // Gather basic stats using the single connection
+    let inv_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM main.invocations", [], |r| r.get(0))
+        .unwrap_or(0);
+    let session_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM main.sessions", [], |r| r.get(0))
+        .unwrap_or(0);
 
-    let last_error_event = store.query_events(&EventFilters {
-        severity: Some("error".to_string()),
-        limit: Some(1),
-        ..Default::default()
-    })?;
+    // Get last invocation
+    let last_inv: Option<bird::InvocationSummary> = conn
+        .query_row(
+            "SELECT id, cmd, exit_code, timestamp FROM main.invocations ORDER BY timestamp DESC LIMIT 1",
+            [],
+            |row| {
+                Ok(bird::InvocationSummary {
+                    id: row.get::<_, String>(0)?,
+                    cmd: row.get::<_, String>(1)?,
+                    exit_code: row.get::<_, i32>(2)?,
+                    timestamp: row.get::<_, String>(3)?,
+                    duration_ms: None,
+                })
+            },
+        )
+        .ok();
+
+    // Event counts
+    let event_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM main.events", [], |r| r.get(0))
+        .unwrap_or(0);
+    let error_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM main.events WHERE severity = 'error'", [], |r| r.get(0))
+        .unwrap_or(0);
+    let warning_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM main.events WHERE severity = 'warning'", [], |r| r.get(0))
+        .unwrap_or(0);
+
+    // Last error event (simplified - not querying for now)
+    let last_error: Option<LastError> = None;
+
+    // Gather remote info
+    let remotes: Vec<RemoteInfo> = config
+        .remotes
+        .iter()
+        .map(|r| {
+            // Try to get invocation count from remote
+            let inv_count = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {}.invocations", r.quoted_schema_name()),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .ok();
+            RemoteInfo {
+                name: r.name.clone(),
+                remote_type: format!("{:?}", r.remote_type).to_lowercase(),
+                uri: r.uri.clone(),
+                auto_attach: r.auto_attach,
+                invocations: inv_count,
+            }
+        })
+        .collect();
+
+    // Gather per-schema stats (only if we have remotes or cached data)
+    let schemas = if !config.remotes.is_empty() {
+        // Helper to get counts from schema.table pattern
+        let get_schema_counts = |schema: &str| -> SchemaCounts {
+            SchemaCounts {
+                invocations: conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {}.invocations", schema), [], |r| r.get(0))
+                    .unwrap_or(0),
+                sessions: conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {}.sessions", schema), [], |r| r.get(0))
+                    .unwrap_or(0),
+                outputs: conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {}.outputs", schema), [], |r| r.get(0))
+                    .unwrap_or(0),
+                events: conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {}.events", schema), [], |r| r.get(0))
+                    .unwrap_or(0),
+            }
+        };
+
+        // Helper to get counts from table-returning macros (remotes use macros)
+        let get_macro_counts = |prefix: &str| -> SchemaCounts {
+            SchemaCounts {
+                invocations: conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {}_invocations()", prefix), [], |r| r.get(0))
+                    .unwrap_or(0),
+                sessions: conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {}_sessions()", prefix), [], |r| r.get(0))
+                    .unwrap_or(0),
+                outputs: conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {}_outputs()", prefix), [], |r| r.get(0))
+                    .unwrap_or(0),
+                events: conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {}_events()", prefix), [], |r| r.get(0))
+                    .unwrap_or(0),
+            }
+        };
+
+        Some(SchemaStats {
+            local: get_schema_counts("local"),
+            caches: get_schema_counts("caches"),
+            remotes: get_macro_counts("remotes"),  // Uses remotes_*() macros
+            main: get_schema_counts("main"),
+            unified: get_schema_counts("unified"),
+        })
+    } else {
+        None
+    };
 
     // Build stats struct
     let stats = BirdStats {
@@ -789,13 +913,10 @@ pub fn stats(format: &str) -> bird::Result<()> {
             total: event_count,
             errors: error_count,
             warnings: warning_count,
-            last_error: last_error_event.first().map(|err| LastError {
-                id: err.id.clone(),
-                message: err.message.clone(),
-                file: err.ref_file.clone(),
-                line: err.ref_line,
-            }),
+            last_error,
         },
+        remotes,
+        schemas,
     };
 
     match format {
@@ -827,6 +948,29 @@ pub fn stats(format: &str) -> bird::Result<()> {
                 };
                 let msg = err.message.as_deref().unwrap_or("-");
                 println!("  Last error:      {}{}", truncate_string(msg, 40), location);
+            }
+
+            // Show remotes
+            if !stats.remotes.is_empty() {
+                println!();
+                println!("Remotes:");
+                for r in &stats.remotes {
+                    let inv_str = r.invocations.map(|n| format!(" ({} invocations)", n)).unwrap_or_default();
+                    let attach = if r.auto_attach { "" } else { " [manual]" };
+                    println!("  {} [{}]: {}{}{}", r.name, r.remote_type, r.uri, inv_str, attach);
+                }
+            }
+
+            // Show per-schema stats
+            if let Some(ref s) = stats.schemas {
+                println!();
+                println!("Schema Summary:");
+                println!("  {:12} {:>10} {:>10} {:>10} {:>10}", "SCHEMA", "INVOCS", "SESSIONS", "OUTPUTS", "EVENTS");
+                println!("  {:12} {:>10} {:>10} {:>10} {:>10}", "local", s.local.invocations, s.local.sessions, s.local.outputs, s.local.events);
+                println!("  {:12} {:>10} {:>10} {:>10} {:>10}", "caches", s.caches.invocations, s.caches.sessions, s.caches.outputs, s.caches.events);
+                println!("  {:12} {:>10} {:>10} {:>10} {:>10}", "remotes", s.remotes.invocations, s.remotes.sessions, s.remotes.outputs, s.remotes.events);
+                println!("  {:12} {:>10} {:>10} {:>10} {:>10}", "main", s.main.invocations, s.main.sessions, s.main.outputs, s.main.events);
+                println!("  {:12} {:>10} {:>10} {:>10} {:>10}", "unified", s.unified.invocations, s.unified.sessions, s.unified.outputs, s.unified.events);
             }
         }
     }

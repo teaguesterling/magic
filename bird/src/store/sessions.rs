@@ -15,7 +15,7 @@ impl Store {
     ///
     /// Behavior depends on storage mode:
     /// - Parquet: Creates a new Parquet file in the appropriate date partition
-    /// - DuckDB: Inserts directly into the sessions_table
+    /// - DuckDB: Inserts directly into the local.sessions
     ///
     /// Sessions are written lazily on first invocation from that session.
     pub fn write_session(&self, record: &SessionRecord) -> Result<()> {
@@ -94,7 +94,7 @@ impl Store {
 
         conn.execute(
             r#"
-            INSERT INTO sessions_table VALUES (
+            INSERT INTO local.sessions VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?
             )
             "#,
