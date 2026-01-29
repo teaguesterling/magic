@@ -106,6 +106,7 @@ fn parse_duration_days(s: &str) -> Option<i64> {
 }
 
 /// Get the cached schema name for a remote (e.g., "cached_team" for remote "team").
+#[allow(dead_code)]
 pub fn cached_schema_name(remote_name: &str) -> String {
     format!("cached_{}", remote_name)
 }
