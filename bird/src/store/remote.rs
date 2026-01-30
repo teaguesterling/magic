@@ -640,6 +640,33 @@ fn pull_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{RemoteConfig, RemoteMode, RemoteType};
+    use crate::init::initialize;
+    use crate::schema::InvocationRecord;
+    use crate::store::{ConnectionOptions, Store};
+    use crate::Config;
+    use tempfile::TempDir;
+
+    fn setup_store_duckdb() -> (TempDir, Store) {
+        let tmp = TempDir::new().unwrap();
+        let config = Config::with_duckdb_mode(tmp.path());
+        initialize(&config).unwrap();
+        let store = Store::open(config).unwrap();
+        (tmp, store)
+    }
+
+    fn create_file_remote(name: &str, path: &std::path::Path) -> RemoteConfig {
+        RemoteConfig {
+            name: name.to_string(),
+            remote_type: RemoteType::File,
+            uri: path.to_string_lossy().to_string(),
+            mode: RemoteMode::ReadWrite,
+            auto_attach: true,
+            credential_provider: None,
+        }
+    }
+
+    // ===== Date parsing tests =====
 
     #[test]
     fn test_parse_since_days() {
@@ -671,5 +698,359 @@ mod tests {
     #[test]
     fn test_parse_since_invalid() {
         assert!(parse_since("invalid").is_err());
+    }
+
+    // ===== Push/Pull integration tests =====
+
+    #[test]
+    fn test_push_to_file_remote() {
+        let (tmp, store) = setup_store_duckdb();
+
+        // Write some local data
+        let inv = InvocationRecord::new(
+            "test-session",
+            "echo hello",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&inv).unwrap();
+
+        // Create a file remote
+        let remote_path = tmp.path().join("remote.duckdb");
+        let remote = create_file_remote("test", &remote_path);
+
+        // Push to remote
+        let stats = store.push(&remote, PushOptions::default()).unwrap();
+
+        assert_eq!(stats.invocations, 1);
+        assert!(remote_path.exists(), "Remote database file should be created");
+    }
+
+    #[test]
+    fn test_push_is_idempotent() {
+        let (tmp, store) = setup_store_duckdb();
+
+        // Write local data
+        let inv = InvocationRecord::new(
+            "test-session",
+            "echo hello",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&inv).unwrap();
+
+        // Create remote
+        let remote_path = tmp.path().join("remote.duckdb");
+        let remote = create_file_remote("test", &remote_path);
+
+        // Push twice
+        let stats1 = store.push(&remote, PushOptions::default()).unwrap();
+        let stats2 = store.push(&remote, PushOptions::default()).unwrap();
+
+        // First push should transfer data, second should be idempotent
+        assert_eq!(stats1.invocations, 1);
+        assert_eq!(stats2.invocations, 0, "Second push should be idempotent");
+    }
+
+    #[test]
+    fn test_push_dry_run() {
+        let (tmp, store) = setup_store_duckdb();
+
+        // Write local data
+        let inv = InvocationRecord::new(
+            "test-session",
+            "echo hello",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&inv).unwrap();
+
+        // Create remote
+        let remote_path = tmp.path().join("remote.duckdb");
+        let remote = create_file_remote("test", &remote_path);
+
+        // Dry run push
+        let dry_stats = store
+            .push(
+                &remote,
+                PushOptions {
+                    dry_run: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(dry_stats.invocations, 1, "Dry run should count invocations");
+
+        // Actual push should still transfer data (dry run didn't modify)
+        let actual_stats = store.push(&remote, PushOptions::default()).unwrap();
+        assert_eq!(actual_stats.invocations, 1);
+    }
+
+    #[test]
+    fn test_pull_from_file_remote() {
+        let (tmp, store) = setup_store_duckdb();
+
+        // Write local data and push to remote
+        let inv = InvocationRecord::new(
+            "test-session",
+            "echo hello",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&inv).unwrap();
+
+        let remote_path = tmp.path().join("remote.duckdb");
+        let remote = create_file_remote("test", &remote_path);
+        store.push(&remote, PushOptions::default()).unwrap();
+
+        // Clear local data (simulate different client)
+        let conn = store.connection().unwrap();
+        conn.execute("DELETE FROM local.invocations", []).unwrap();
+        drop(conn);
+
+        // Pull from remote
+        let stats = store.pull(&remote, PullOptions::default()).unwrap();
+
+        assert_eq!(stats.invocations, 1, "Should pull the invocation back");
+
+        // Verify data in cached schema
+        let conn = store.connection().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM caches.invocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "Data should be in cached schema");
+    }
+
+    #[test]
+    fn test_pull_is_idempotent() {
+        let (tmp, store) = setup_store_duckdb();
+
+        // Setup: write, push, clear local
+        let inv = InvocationRecord::new(
+            "test-session",
+            "echo hello",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&inv).unwrap();
+
+        let remote_path = tmp.path().join("remote.duckdb");
+        let remote = create_file_remote("test", &remote_path);
+        store.push(&remote, PushOptions::default()).unwrap();
+
+        // Pull twice
+        let stats1 = store.pull(&remote, PullOptions::default()).unwrap();
+        let stats2 = store.pull(&remote, PullOptions::default()).unwrap();
+
+        assert_eq!(stats1.invocations, 1);
+        assert_eq!(stats2.invocations, 0, "Second pull should be idempotent");
+    }
+
+    // ===== Remote name handling tests =====
+
+    #[test]
+    fn test_remote_name_with_hyphen() {
+        let (tmp, store) = setup_store_duckdb();
+
+        // Write local data
+        let inv = InvocationRecord::new(
+            "test-session",
+            "echo hello",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&inv).unwrap();
+
+        // Create remote with hyphen in name
+        let remote_path = tmp.path().join("my-team-remote.duckdb");
+        let remote = create_file_remote("my-team", &remote_path);
+
+        // Push should work despite hyphen
+        let stats = store.push(&remote, PushOptions::default()).unwrap();
+        assert_eq!(stats.invocations, 1);
+
+        // Pull should also work (hyphen in name handled correctly)
+        let pull_stats = store.pull(&remote, PullOptions::default()).unwrap();
+        // Pull brings data from remote into cached_my_team schema
+        assert_eq!(pull_stats.invocations, 1);
+    }
+
+    #[test]
+    fn test_remote_name_with_dots() {
+        let (tmp, store) = setup_store_duckdb();
+
+        let inv = InvocationRecord::new(
+            "test-session",
+            "echo hello",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&inv).unwrap();
+
+        // Remote with dots in name
+        let remote_path = tmp.path().join("team.v2.duckdb");
+        let remote = create_file_remote("team.v2", &remote_path);
+
+        let stats = store.push(&remote, PushOptions::default()).unwrap();
+        assert_eq!(stats.invocations, 1);
+    }
+
+    // ===== Connection options tests =====
+
+    #[test]
+    fn test_connection_minimal_vs_full() {
+        let (_tmp, store) = setup_store_duckdb();
+
+        // Minimal connection should work
+        let conn_minimal = store.connect(ConnectionOptions::minimal()).unwrap();
+        let count: i64 = conn_minimal
+            .query_row("SELECT COUNT(*) FROM local.invocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(conn_minimal);
+
+        // Full connection should also work
+        let conn_full = store.connect(ConnectionOptions::full()).unwrap();
+        let count: i64 = conn_full
+            .query_row("SELECT COUNT(*) FROM main.invocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_multiple_sequential_connections() {
+        let (_tmp, store) = setup_store_duckdb();
+
+        // Open and close multiple connections sequentially
+        // This tests for database corruption issues
+        for i in 0..5 {
+            let conn = store.connection().unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM main.invocations", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "Connection {} should work", i);
+            drop(conn);
+        }
+
+        // Write some data
+        let inv = InvocationRecord::new(
+            "test-session",
+            "echo hello",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&inv).unwrap();
+
+        // More connections should still work and see the data
+        for i in 0..3 {
+            let conn = store.connection().unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM main.invocations", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 1, "Connection {} should see the data", i);
+            drop(conn);
+        }
+    }
+
+    // ===== Cached schema tests =====
+
+    #[test]
+    fn test_caches_schema_views_work() {
+        let (tmp, store) = setup_store_duckdb();
+
+        // Initially caches should be empty
+        let conn = store.connection().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM caches.invocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(conn);
+
+        // Write and push data
+        let inv = InvocationRecord::new(
+            "test-session",
+            "echo hello",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&inv).unwrap();
+
+        let remote_path = tmp.path().join("remote.duckdb");
+        let remote = create_file_remote("test", &remote_path);
+        store.push(&remote, PushOptions::default()).unwrap();
+
+        // Pull creates cached_test schema
+        store.pull(&remote, PullOptions::default()).unwrap();
+
+        // Rebuild caches views to include cached_test
+        let conn = store.connection().unwrap();
+        store.rebuild_caches_schema(&conn).unwrap();
+
+        // caches.invocations should now have data
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM caches.invocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "caches should include pulled data after rebuild");
+    }
+
+    #[test]
+    fn test_main_schema_unions_local_and_caches() {
+        let (tmp, store) = setup_store_duckdb();
+
+        // Write local data
+        let inv1 = InvocationRecord::new(
+            "test-session",
+            "local command",
+            "/home/user",
+            0,
+            "local@client",
+        );
+        store.write_invocation(&inv1).unwrap();
+
+        // Push to remote, then pull (simulating another client's data)
+        let remote_path = tmp.path().join("remote.duckdb");
+        let remote = create_file_remote("team", &remote_path);
+
+        // Push local data to remote
+        store.push(&remote, PushOptions::default()).unwrap();
+
+        // Delete local, pull from remote to create cached data
+        let conn = store.connection().unwrap();
+        conn.execute("DELETE FROM local.invocations", []).unwrap();
+        drop(conn);
+
+        store.pull(&remote, PullOptions::default()).unwrap();
+
+        // Rebuild caches schema
+        let conn = store.connection().unwrap();
+        store.rebuild_caches_schema(&conn).unwrap();
+
+        // Write new local data
+        let inv2 = InvocationRecord::new(
+            "test-session-2",
+            "new local command",
+            "/home/user",
+            0,
+            "local@client",
+        );
+        drop(conn);
+        store.write_invocation(&inv2).unwrap();
+
+        // main.invocations should have both local and cached
+        let conn = store.connection().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM main.invocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "main should union local + caches");
     }
 }
