@@ -288,9 +288,24 @@ fn test_hook_init_bash() {
 
     assert!(output.status.success());
     let hook = String::from_utf8_lossy(&output.stdout);
-    assert!(hook.contains("__shq_debug"));
-    assert!(hook.contains("__shq_prompt"));
-    assert!(hook.contains("PROMPT_COMMAND"));
+    // New PS0-based hook
+    assert!(hook.contains("__shq_ps0_hook"), "Should use PS0 hook");
+    assert!(
+        hook.contains("__shq_prompt_command"),
+        "Should use PROMPT_COMMAND"
+    );
+    assert!(hook.contains("history 1"), "Should read from history");
+    assert!(
+        hook.contains("PROMPT_COMMAND"),
+        "Should register PROMPT_COMMAND"
+    );
+    // Privacy features preserved
+    assert!(hook.contains("SHQ_DISABLED"), "Should check SHQ_DISABLED");
+    assert!(hook.contains("SHQ_EXCLUDE"), "Should support SHQ_EXCLUDE");
+    assert!(hook.contains("__shq_excluded"), "Should have exclude function");
+    assert!(hook.contains("__shq_is_query"), "Should have query detection");
+    // Output capture helper
+    assert!(hook.contains("shqr"), "Should define shqr function");
 }
 
 #[test]

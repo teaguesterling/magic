@@ -564,12 +564,9 @@ pub fn invocations(query_str: &str, format: &str) -> bird::Result<()> {
     let config = Config::load()?;
     let store = Store::open(config)?;
 
-    // Parse query to get limit from range
+    // Parse query and apply filters
     let query = parse_query(query_str);
-    let limit = query.range.map(|r| r.start).unwrap_or(20);
-
-    // TODO: Apply full query filters (source, path, field filters)
-    let invocations = store.recent_invocations(limit)?;
+    let invocations = store.query_invocations(&query)?;
 
     if invocations.is_empty() {
         println!("No invocations recorded yet.");
@@ -1210,13 +1207,12 @@ pub fn events(
     let config = Config::load()?;
     let store = Store::open(config)?;
 
-    // Parse query to get limit from range
+    // Parse query (filters and range applied by query_invocations)
     let query = parse_query(query_str);
-    let n = query.range.map(|r| r.start).unwrap_or(10);
 
     // Handle reparse mode: re-extract events from outputs
     if reparse {
-        let invocations = store.recent_invocations(n)?;
+        let invocations = store.query_invocations(&query)?;
         let mut total_events = 0;
 
         for inv in &invocations {
@@ -1235,9 +1231,8 @@ pub fn events(
         return Ok(());
     }
 
-    // Get invocations matching query
-    // TODO: Apply full query filters (source, path, field filters)
-    let invocations = store.recent_invocations(n)?;
+    // Get invocations matching query (with filters applied)
+    let invocations = store.query_invocations(&query)?;
     if invocations.is_empty() {
         println!("No invocations found.");
         return Ok(());
@@ -1488,13 +1483,16 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 
 /// Resolve a query to a single invocation ID.
 fn resolve_query_to_invocation(store: &Store, query: &Query) -> bird::Result<String> {
-    // For now, use range as offset (e.g., ~1 = last command)
+    // Apply filters and get matching invocations
+    let invocations = store.query_invocations(query)?;
+
+    // The range.start indicates how many results we want, and we take the last one
+    // e.g., ~1 means "last 1" so we get 1 result and take it
+    // e.g., ~5 means "last 5" so we get 5 results and take the 5th (oldest of those)
     let n = query.range.map(|r| r.start).unwrap_or(1);
+    let idx = n.min(invocations.len()).saturating_sub(1);
 
-    // TODO: Apply full query filters (source, path, field filters)
-    let invocations = store.recent_invocations(n)?;
-
-    if let Some(inv) = invocations.last() {
+    if let Some(inv) = invocations.get(idx) {
         Ok(inv.id.clone())
     } else {
         Err(bird::Error::NotFound("No matching invocation found".to_string()))
@@ -2320,8 +2318,8 @@ pub fn pull(remote: Option<&str>, client: Option<&str>, since: Option<&str>) -> 
     Ok(())
 }
 
-const BASH_HOOK: &str = r#"# shq shell integration for bash
-# Add to ~/.bashrc: eval "$(shq hook init)"
+const BASH_HOOK: &str = r#"# shq shell integration for bash (requires bash 4.4+)
+# Add to ~/.bashrc: eval "$(shq hook init --shell bash)"
 #
 # Privacy escapes (command not recorded):
 #   - Start command with a space: " ls -la"
@@ -2330,16 +2328,29 @@ const BASH_HOOK: &str = r#"# shq shell integration for bash
 # Temporary disable: export SHQ_DISABLED=1
 # Exclude patterns: export SHQ_EXCLUDE="*password*:*secret*"
 
-# Session ID based on this shell's PID (stable across commands)
-__shq_session_id="bash-$$"
+# --- Guard: only init once per shell ---
+[[ -n "$__shq_initialized" ]] && return 0
+__shq_initialized=1
 
-# Check if command matches any exclude pattern
+# --- Version check ---
+if [[ "${BASH_VERSINFO[0]}" -lt 4 ]] || { [[ "${BASH_VERSINFO[0]}" -eq 4 ]] && [[ "${BASH_VERSINFO[1]}" -lt 4 ]]; }; then
+    echo "shq: bash 4.4+ required (found ${BASH_VERSION}). Hook not installed." >&2
+    return 0
+fi
+
+# --- Session ID (stable for this shell instance) ---
+__shq_session_id="bash-$$"
+__shq_start_ms=""
+
+# --- Helpers ---
+
+# Check if command matches any colon-delimited exclude pattern
 __shq_excluded() {
     [[ -z "$SHQ_EXCLUDE" ]] && return 1
     local cmd="$1"
     local IFS=':'
     for pattern in $SHQ_EXCLUDE; do
-        # Use bash pattern matching
+        # Use bash pattern matching (extglob not required for simple globs)
         if [[ "$cmd" == $pattern ]]; then
             return 0
         fi
@@ -2347,43 +2358,60 @@ __shq_excluded() {
     return 1
 }
 
-# Check if command is a shq/blq query (read-only) command - don't record these
+# Check if command is a shq/blq read-only query — don't record these
 __shq_is_query() {
     local cmd="$1"
-    # Skip shq query commands (output, show, invocations, history, info, events, stats, sql, quick-help)
-    [[ "$cmd" =~ ^shq[[:space:]]+(output|show|o|invocations|history|i|info|I|events|e|stats|sql|q|quick-help|\?)[[:space:]]* ]] && return 0
-    [[ "$cmd" =~ ^shq[[:space:]]+(output|show|o|invocations|history|i|info|I|events|e|stats|sql|q|quick-help|\?)$ ]] && return 0
-    # Skip blq query commands
-    [[ "$cmd" =~ ^blq[[:space:]]+(show|list|errors|context|stats)[[:space:]]* ]] && return 0
-    [[ "$cmd" =~ ^blq[[:space:]]+(show|list|errors|context|stats)$ ]] && return 0
+    [[ "$cmd" =~ ^shq\ +(output|show|o|invocations|history|i|info|I|events|e|stats|sql|q|quick-help|\?) ]] && return 0
+    [[ "$cmd" =~ ^blq\ +(show|list|errors|context|stats) ]] && return 0
     return 1
 }
 
-# Use DEBUG trap for preexec equivalent
-__shq_debug() {
-    # Skip our own functions
-    [[ "$BASH_COMMAND" == "__shq_"* ]] && return
-    [[ "$BASH_COMMAND" == "shq "* ]] && return
-
-    __shq_last_cmd="$BASH_COMMAND"
-    __shq_start_time=$EPOCHREALTIME
+# Milliseconds since epoch (uses $EPOCHREALTIME from bash 5.0+, falls back to date)
+__shq_now_ms() {
+    if [[ -n "$EPOCHREALTIME" ]]; then
+        local sec="${EPOCHREALTIME%.*}"
+        local frac="${EPOCHREALTIME#*.}"
+        # Pad or truncate fractional part to 3 digits
+        frac="${frac}000"
+        echo "${sec}${frac:0:3}"
+    else
+        date +%s%3N
+    fi
 }
 
-# Use PROMPT_COMMAND for precmd equivalent (metadata only - no output capture)
-__shq_prompt() {
-    local exit_code=$?
-    local cmd="$__shq_last_cmd"
+# --- PS0: fires after command is read, before execution ---
+# We use PS0 to record the start time. The trick: PS0 is expanded for
+# display, so we use a command substitution that sets __shq_start_ms
+# as a side effect and prints nothing.
+__shq_ps0_hook() {
+    __shq_start_ms=$(__shq_now_ms)
+    # Print nothing — PS0 output appears before command output
+}
 
-    # Reset for next command
-    __shq_last_cmd=""
+# Chain with existing PS0 if present
+if [[ -n "$PS0" ]]; then
+    PS0='$(__shq_ps0_hook)'"$PS0"
+else
+    PS0='$(__shq_ps0_hook)'
+fi
+
+# --- PROMPT_COMMAND: fires after command completes, before prompt ---
+__shq_prompt_command() {
+    local exit_code=$?
 
     # Skip if disabled
     [[ -n "$SHQ_DISABLED" ]] && return
 
-    # Skip if no command
+    # Get the full command line from history (solves the pipeline problem)
+    local cmd
+    cmd=$(HISTTIMEFORMAT='' history 1 | sed 's/^[ ]*[0-9]*[ ]*//')
+
+    # Skip if empty (just pressed Enter, or history didn't record it)
     [[ -z "$cmd" ]] && return
 
     # Skip if command starts with space (privacy escape)
+    # Note: if HISTCONTROL=ignorespace, history 1 won't return it anyway,
+    # but check explicitly for HISTCONTROL configs that don't strip it.
     [[ "$cmd" =~ ^[[:space:]] ]] && return
 
     # Skip if command starts with backslash (privacy escape)
@@ -2397,28 +2425,32 @@ __shq_prompt() {
 
     # Calculate duration in milliseconds
     local duration=0
-    if [[ -n "$__shq_start_time" ]]; then
-        duration=$(echo "($EPOCHREALTIME - $__shq_start_time) * 1000" | bc 2>/dev/null || echo 0)
-        duration=${duration%.*}
+    if [[ -n "$__shq_start_ms" ]]; then
+        local now_ms
+        now_ms=$(__shq_now_ms)
+        duration=$(( now_ms - __shq_start_ms ))
+        # Guard against negative durations (clock skew, etc.)
+        (( duration < 0 )) && duration=0
     fi
-    __shq_start_time=""
+    __shq_start_ms=""
 
-    # Save to BIRD with inline extraction and compaction (async, background)
+    # Save to BIRD (async, non-blocking — never slow down the prompt)
     (
         shq save -c "$cmd" -x "$exit_code" -d "$duration" \
             --session-id "$__shq_session_id" \
             --invoker-pid $$ \
             --invoker bash \
-            --extract --compact -q \
+            -q \
             </dev/null \
             2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
     ) &
     disown 2>/dev/null
 }
 
-# Run command with full output capture
+# --- shqr: run a command with full output capture ---
 # Usage: shqr <command> [args...]
 # Example: shqr make test
+# Unlike the default hook (metadata only), shqr also captures stdout/stderr.
 shqr() {
     # Check if disabled
     if [[ -n "$SHQ_DISABLED" ]]; then
@@ -2427,37 +2459,43 @@ shqr() {
     fi
 
     local cmd="$*"
-    local tmpdir=$(mktemp -d)
+    local tmpdir
+    tmpdir=$(mktemp -d)
     local stdout_file="$tmpdir/stdout"
     local stderr_file="$tmpdir/stderr"
-    local start_time=$EPOCHREALTIME
+    local start_ms
+    start_ms=$(__shq_now_ms)
 
-    # Run command, capturing output while still displaying to terminal
-    # Uses process substitution to tee both streams
+    # Run command, tee-ing output to files while displaying to terminal
     { eval "$cmd" ; } > >(tee "$stdout_file") 2> >(tee "$stderr_file" >&2)
     local exit_code=${PIPESTATUS[0]:-$?}
 
-    # Calculate duration (ensure integer, default to 0)
-    local duration=$(echo "($EPOCHREALTIME - $start_time) * 1000" | bc 2>/dev/null || echo 0)
-    duration=${duration%.*}
-    duration=${duration:-0}
+    # Calculate duration
+    local now_ms
+    now_ms=$(__shq_now_ms)
+    local duration=$(( now_ms - start_ms ))
+    (( duration < 0 )) && duration=0
 
-    # Save to BIRD with captured output, extraction, and compaction
+    # Save to BIRD with captured output (synchronous — user explicitly asked for capture)
     shq save -c "$cmd" -x "$exit_code" -d "$duration" \
         -o "$stdout_file" -e "$stderr_file" \
         --session-id "$__shq_session_id" \
         --invoker-pid $$ \
         --invoker bash \
-        --extract --compact -q \
+        -q \
         2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
 
-    # Cleanup
+    # Cleanup temp files
     rm -rf "$tmpdir"
 
     return $exit_code
 }
 
-# Register hooks
-trap '__shq_debug' DEBUG
-PROMPT_COMMAND="__shq_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+# --- Register ---
+# Prepend to PROMPT_COMMAND so we capture exit code before other hooks modify it
+if [[ -z "$PROMPT_COMMAND" ]]; then
+    PROMPT_COMMAND="__shq_prompt_command"
+else
+    PROMPT_COMMAND="__shq_prompt_command; $PROMPT_COMMAND"
+fi
 "#;

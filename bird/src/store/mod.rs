@@ -11,6 +11,8 @@ mod remote;
 mod sessions;
 
 use std::fs;
+use std::thread;
+use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
 use duckdb::{
@@ -231,6 +233,52 @@ impl Store {
         Ok(Self { config })
     }
 
+    /// Open a DuckDB connection with retry and exponential backoff.
+    ///
+    /// DuckDB uses file locking for concurrent access. When multiple processes
+    /// (e.g., background shell hook saves) try to access the database simultaneously,
+    /// this method retries with exponential backoff to avoid lock conflicts.
+    fn open_connection_with_retry(&self) -> Result<Connection> {
+        const MAX_RETRIES: u32 = 10;
+        const INITIAL_DELAY_MS: u64 = 10;
+        const MAX_DELAY_MS: u64 = 1000;
+
+        let db_path = self.config.db_path();
+        let mut delay_ms = INITIAL_DELAY_MS;
+        let mut last_error = None;
+
+        for attempt in 0..MAX_RETRIES {
+            match Connection::open(&db_path) {
+                Ok(conn) => return Ok(conn),
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    // Check if this is a lock conflict error
+                    if err_msg.contains("Could not set lock")
+                        || err_msg.contains("Conflicting lock")
+                        || err_msg.contains("database is locked")
+                    {
+                        last_error = Some(e);
+                        if attempt < MAX_RETRIES - 1 {
+                            // Add jitter to avoid thundering herd
+                            let jitter = (attempt as u64 * 7) % 10;
+                            thread::sleep(Duration::from_millis(delay_ms + jitter));
+                            delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+                            continue;
+                        }
+                    } else {
+                        // Non-lock error, fail immediately
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+
+        // All retries exhausted
+        Err(last_error
+            .map(|e| e.into())
+            .unwrap_or_else(|| Error::Storage("Failed to open database after retries".to_string())))
+    }
+
     /// Get a DuckDB connection with full features (attachments, ephemeral views).
     pub fn connection(&self) -> Result<Connection> {
         self.connect(ConnectionOptions::full())
@@ -253,16 +301,29 @@ impl Store {
     /// - Whether project database is attached
     /// - Whether ephemeral views are created
     /// - Whether migration should run
+    ///
+    /// Uses retry with exponential backoff to handle concurrent access.
     pub fn connect(&self, opts: ConnectionOptions) -> Result<Connection> {
-        let conn = Connection::open(&self.config.db_path())?;
+        let conn = self.open_connection_with_retry()?;
 
         // ===== Always load required extensions =====
         // These are required for basic functionality
         conn.execute("LOAD parquet", [])?;
         conn.execute("LOAD icu", [])?;
         conn.execute("SET allow_community_extensions = true", [])?;
-        conn.execute("LOAD scalarfs", [])?;
-        conn.execute("LOAD duck_hunt", [])?;
+
+        // Optional community extensions - log warning if missing, don't fail
+        for (ext, desc) in [
+            ("scalarfs", "data: URL support for inline blobs"),
+            ("duck_hunt", "log/output parsing for event extraction"),
+        ] {
+            if let Err(e) = conn.execute(&format!("LOAD {}", ext), []) {
+                eprintln!(
+                    "Warning: {} extension not available ({}): {}",
+                    ext, desc, e
+                );
+            }
+        }
 
         // Set file search path so views resolve relative paths correctly
         conn.execute(

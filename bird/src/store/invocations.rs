@@ -7,6 +7,7 @@ use duckdb::params;
 use super::atomic;
 use super::{sanitize_filename, Store};
 use crate::config::StorageMode;
+use crate::query::{CompareOp, Query, QueryComponent};
 use crate::schema::InvocationRecord;
 use crate::Result;
 
@@ -199,6 +200,113 @@ impl Store {
     pub fn last_invocation(&self) -> Result<Option<InvocationSummary>> {
         let invocations = self.recent_invocations(1)?;
         Ok(invocations.into_iter().next())
+    }
+
+    /// Query invocations with filters from the query micro-language.
+    ///
+    /// Supports:
+    /// - `~N` range selector (limit to N results)
+    /// - `%exit<>0` field filters (exit code, duration, etc.)
+    /// - `%/pattern/` command regex
+    pub fn query_invocations(&self, query: &Query) -> Result<Vec<InvocationSummary>> {
+        let conn = self.connection()?;
+
+        // Build WHERE clauses from query filters
+        let mut where_clauses: Vec<String> = Vec::new();
+
+        for component in &query.filters {
+            match component {
+                QueryComponent::CommandRegex(pattern) => {
+                    // Use regexp_matches for regex filtering
+                    let escaped = pattern.replace('\'', "''");
+                    where_clauses.push(format!("regexp_matches(cmd, '{}')", escaped));
+                }
+                QueryComponent::FieldFilter(filter) => {
+                    // Map field names to SQL column names
+                    let column = match filter.field.as_str() {
+                        "exit" | "exit_code" => "exit_code",
+                        "duration" | "duration_ms" => "duration_ms",
+                        "cmd" | "command" => "cmd",
+                        "cwd" => "cwd",
+                        other => other, // Pass through unknown fields
+                    };
+
+                    let escaped_value = filter.value.replace('\'', "''");
+
+                    let clause = match filter.op {
+                        CompareOp::Eq => format!("{} = '{}'", column, escaped_value),
+                        CompareOp::NotEq => format!("{} <> '{}'", column, escaped_value),
+                        CompareOp::Gt => format!("{} > '{}'", column, escaped_value),
+                        CompareOp::Lt => format!("{} < '{}'", column, escaped_value),
+                        CompareOp::Gte => format!("{} >= '{}'", column, escaped_value),
+                        CompareOp::Lte => format!("{} <= '{}'", column, escaped_value),
+                        CompareOp::Regex => {
+                            format!("regexp_matches({}::VARCHAR, '{}')", column, escaped_value)
+                        }
+                    };
+                    where_clauses.push(clause);
+                }
+                QueryComponent::Tag(_) => {
+                    // Tags not implemented in MVP
+                }
+            }
+        }
+
+        // Build the SQL query
+        let where_sql = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_clauses.join(" AND "))
+        };
+
+        let limit = query.range.map(|r| r.start).unwrap_or(20);
+
+        let sql = format!(
+            r#"
+            SELECT id::VARCHAR, cmd, exit_code, timestamp::VARCHAR, duration_ms
+            FROM recent_invocations
+            {}
+            LIMIT {}
+            "#,
+            where_sql, limit
+        );
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                if e.to_string().contains("No files found") {
+                    return Ok(Vec::new());
+                }
+                return Err(e.into());
+            }
+        };
+
+        let rows = stmt.query_map([], |row| {
+            Ok(InvocationSummary {
+                id: row.get(0)?,
+                cmd: row.get(1)?,
+                exit_code: row.get(2)?,
+                timestamp: row.get(3)?,
+                duration_ms: row.get(4)?,
+            })
+        });
+
+        match rows {
+            Ok(rows) => {
+                let mut results = Vec::new();
+                for row in rows {
+                    results.push(row?);
+                }
+                Ok(results)
+            }
+            Err(e) => {
+                if e.to_string().contains("No files found") {
+                    Ok(Vec::new())
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
     }
 
     /// Count total invocations in the store.

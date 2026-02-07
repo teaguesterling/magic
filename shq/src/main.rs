@@ -17,8 +17,8 @@ struct Cli {
 enum Commands {
     /// Initialize BIRD database
     Init {
-        /// Storage mode: parquet (multi-writer, needs compaction) or duckdb (single-writer, simpler)
-        #[arg(short = 'm', long = "mode", default_value = "parquet")]
+        /// Storage mode: duckdb (single-writer, simpler) or parquet (multi-writer, needs compaction)
+        #[arg(short = 'm', long = "mode", default_value = "duckdb")]
         mode: String,
     },
 
