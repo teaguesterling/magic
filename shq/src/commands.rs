@@ -1511,9 +1511,8 @@ pub fn info(query_str: &str, format: &str) -> bird::Result<()> {
     // Get full invocation details via SQL
     let result = store.query(&format!(
         "SELECT id, cmd, cwd, exit_code, timestamp, duration_ms, session_id
-         FROM read_parquet('{}/**/invocations/*.parquet')
+         FROM invocations
          WHERE id = '{}'",
-        store.config().bird_root.display(),
         invocation_id
     ))?;
 
@@ -1592,8 +1591,7 @@ pub fn rerun(query_str: &str, dry_run: bool, no_capture: bool) -> bird::Result<(
 
     // Get full invocation details via SQL (need cmd and cwd)
     let result = store.query(&format!(
-        "SELECT cmd, cwd FROM read_parquet('{}/**/invocations/*.parquet') WHERE id = '{}'",
-        store.config().bird_root.display(),
+        "SELECT cmd, cwd FROM invocations WHERE id = '{}'",
         invocation_id
     ))?;
 
@@ -2358,10 +2356,12 @@ __shq_excluded() {
     return 1
 }
 
-# Check if command is a shq/blq read-only query — don't record these
+# Check if command is a shq/blq read-only query or shqr — don't record these
+# (shqr handles its own recording with the inner command)
 __shq_is_query() {
     local cmd="$1"
     [[ "$cmd" =~ ^shq\ +(output|show|o|invocations|history|i|info|I|events|e|stats|sql|q|quick-help|\?) ]] && return 0
+    [[ "$cmd" =~ ^shqr\  ]] && return 0
     [[ "$cmd" =~ ^blq\ +(show|list|errors|context|stats) ]] && return 0
     return 1
 }
