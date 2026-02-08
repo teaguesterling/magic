@@ -208,7 +208,15 @@ impl Store {
     /// - `~N` range selector (limit to N results)
     /// - `%exit<>0` field filters (exit code, duration, etc.)
     /// - `%/pattern/` command regex
-    pub fn query_invocations(&self, query: &Query) -> Result<Vec<InvocationSummary>> {
+    ///
+    /// Use `default_limit` to specify the limit when no range is provided:
+    /// - 20 for listing commands (shq i)
+    /// - 1 for single-item commands (shq o, shq I, shq R)
+    pub fn query_invocations_with_limit(
+        &self,
+        query: &Query,
+        default_limit: usize,
+    ) -> Result<Vec<InvocationSummary>> {
         let conn = self.connection()?;
 
         // Build WHERE clauses from query filters
@@ -259,7 +267,7 @@ impl Store {
             format!("WHERE {}", where_clauses.join(" AND "))
         };
 
-        let limit = query.range.map(|r| r.start).unwrap_or(20);
+        let limit = query.range.map(|r| r.start).unwrap_or(default_limit);
 
         let sql = format!(
             r#"
@@ -307,6 +315,11 @@ impl Store {
                 }
             }
         }
+    }
+
+    /// Query invocations with default limit of 20 (for listing).
+    pub fn query_invocations(&self, query: &Query) -> Result<Vec<InvocationSummary>> {
+        self.query_invocations_with_limit(query, 20)
     }
 
     /// Count total invocations in the store.

@@ -1483,8 +1483,8 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 
 /// Resolve a query to a single invocation ID.
 fn resolve_query_to_invocation(store: &Store, query: &Query) -> bird::Result<String> {
-    // Apply filters and get matching invocations
-    let invocations = store.query_invocations(query)?;
+    // Apply filters and get matching invocations (default to 1 for single-item commands)
+    let invocations = store.query_invocations_with_limit(query, 1)?;
 
     // The range.start indicates how many results we want, and we take the last one
     // e.g., ~1 means "last 1" so we get 1 result and take it
@@ -2334,15 +2334,13 @@ const BASH_HOOK: &str = r#"# shq shell integration for bash (requires bash 4.4+)
 # Temporary disable: export SHQ_DISABLED=1
 # Exclude patterns: export SHQ_EXCLUDE="*password*:*secret*"
 
-# --- Guard: only init once per shell ---
-[[ -n "$__shq_initialized" ]] && return 0
-__shq_initialized=1
-
-# --- Version check ---
-if [[ "${BASH_VERSINFO[0]}" -lt 4 ]] || { [[ "${BASH_VERSINFO[0]}" -eq 4 ]] && [[ "${BASH_VERSINFO[1]}" -lt 4 ]]; }; then
+# --- Guard and version check ---
+if [[ -n "$__shq_initialized" ]]; then
+    : # Already initialized, skip
+elif [[ "${BASH_VERSINFO[0]}" -lt 4 ]] || { [[ "${BASH_VERSINFO[0]}" -eq 4 ]] && [[ "${BASH_VERSINFO[1]}" -lt 4 ]]; }; then
     echo "shq: bash 4.4+ required (found ${BASH_VERSION}). Hook not installed." >&2
-    return 0
-fi
+else
+__shq_initialized=1
 
 # --- Session ID (stable for this shell instance) ---
 __shq_session_id="bash-$$"
@@ -2506,4 +2504,6 @@ if [[ -z "$PROMPT_COMMAND" ]]; then
 else
     PROMPT_COMMAND="__shq_prompt_command; $PROMPT_COMMAND"
 fi
+
+fi  # End of guard/version check else block
 "#;
