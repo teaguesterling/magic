@@ -421,6 +421,32 @@ fn try_parse_filter(input: &str) -> Option<(QueryComponent, &str)> {
         }
     }
 
+    // Filter aliases: %failed, %success, %error
+    if let Some(rest) = after_percent.strip_prefix("failed") {
+        let filter = FieldFilter {
+            field: "exit".to_string(),
+            op: CompareOp::NotEq,
+            value: "0".to_string(),
+        };
+        return Some((QueryComponent::FieldFilter(filter), rest));
+    }
+    if let Some(rest) = after_percent.strip_prefix("success") {
+        let filter = FieldFilter {
+            field: "exit".to_string(),
+            op: CompareOp::Eq,
+            value: "0".to_string(),
+        };
+        return Some((QueryComponent::FieldFilter(filter), rest));
+    }
+    if let Some(rest) = after_percent.strip_prefix("ok") {
+        let filter = FieldFilter {
+            field: "exit".to_string(),
+            op: CompareOp::Eq,
+            value: "0".to_string(),
+        };
+        return Some((QueryComponent::FieldFilter(filter), rest));
+    }
+
     // Try field filter: %field<op>value
     if let Some((filter, rest)) = try_parse_field_filter(after_percent) {
         return Some((QueryComponent::FieldFilter(filter), rest));

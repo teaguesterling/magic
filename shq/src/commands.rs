@@ -1707,15 +1707,22 @@ RANGE         1 or ~1     Last command
               5 or ~5     Last 5 commands
               ~10:5       Commands 10 to 5 ago
 
-SOURCE        shell:      Shell commands on this host
-              shell:zsh:  Zsh shells only
-              *:*:*:*:    Everything everywhere
+SOURCE        Format: host:type:client:session:
+              shell:           Shell commands on this host
+              shell:bash:      Bash shells only
+              shell:zsh:       Zsh shells only
+              myhost:shell::   All shells on myhost
+              *:*:*:*:         Everything everywhere (all hosts, all types)
+              *:shell:*:*:     All shell commands on all hosts
 
 PATH          .           Current directory
               ~/Projects/ Home-relative
               /tmp/       Absolute path
 
-FILTERS       %exit<>0    Non-zero exit code
+FILTERS       %failed     Non-zero exit code (alias for %exit<>0)
+              %success    Successful commands (alias for %exit=0)
+              %ok         Same as %success
+              %exit<>0    Non-zero exit code
               %exit=0     Successful commands only
               %duration>5000   Took > 5 seconds
               %cmd~=test  Command matches regex
@@ -1738,7 +1745,8 @@ shq o %exit<>0~1             Output of last failed command
 
 shq i                        Last 20 commands (default)
 shq i 50                     Last 50 commands
-shq i %exit<>0~20            Last 20 failed commands
+shq i %failed~20             Last 20 failed commands
+shq i %failed                All failed commands (up to default limit)
 shq i %duration>10000~10     Last 10 commands that took >10s
 shq i %/cargo/~10            Last 10 cargo commands
 
@@ -1786,7 +1794,7 @@ __shq_excluded() {
 }
 
 # Check if command is a shq/blq query (read-only) command - don't record these
-__shq_is_query() {
+__shq_is_shq_command() {
     local cmd="$1"
     # Skip shq query commands (output, show, invocations, history, info, events, stats, sql, quick-help)
     [[ "$cmd" =~ ^shq[[:space:]]+(output|show|o|invocations|history|i|info|I|events|e|stats|sql|q|quick-help|\?)[[:space:]]*  ]] && return 0
@@ -1827,7 +1835,7 @@ __shq_precmd() {
     __shq_excluded "$cmd" && return
 
     # Skip shq/blq query commands (prevent recursive recording)
-    __shq_is_query "$cmd" && return
+    __shq_is_shq_command "$cmd" && return
 
     # Calculate duration in milliseconds
     local duration=0
@@ -2356,13 +2364,13 @@ __shq_excluded() {
     return 1
 }
 
-# Check if command is a shq/blq read-only query or shqr — don't record these
-# (shqr handles its own recording with the inner command)
-__shq_is_query() {
+# Check if command is shq/shqr/blq — don't record these
+# (shq commands are meta; shqr handles its own recording)
+__shq_is_shq_command() {
     local cmd="$1"
-    [[ "$cmd" =~ ^shq\ +(output|show|o|invocations|history|i|info|I|events|e|stats|sql|q|quick-help|\?) ]] && return 0
+    [[ "$cmd" =~ ^shq\  ]] && return 0
     [[ "$cmd" =~ ^shqr\  ]] && return 0
-    [[ "$cmd" =~ ^blq\ +(show|list|errors|context|stats) ]] && return 0
+    [[ "$cmd" =~ ^blq\  ]] && return 0
     return 1
 }
 
@@ -2421,7 +2429,7 @@ __shq_prompt_command() {
     __shq_excluded "$cmd" && return
 
     # Skip shq/blq query commands (prevent recursive recording)
-    __shq_is_query "$cmd" && return
+    __shq_is_shq_command "$cmd" && return
 
     # Calculate duration in milliseconds
     local duration=0

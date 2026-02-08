@@ -205,7 +205,7 @@ enum Commands {
     },
 
     /// Quick reference for commands and query syntax
-    #[command(name = "quick-help", visible_alias = "?")]
+    #[command(name = "quick-help", visible_aliases = ["?", "h"])]
     QuickHelp,
 
     /// Show statistics

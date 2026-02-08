@@ -303,7 +303,7 @@ fn test_hook_init_bash() {
     assert!(hook.contains("SHQ_DISABLED"), "Should check SHQ_DISABLED");
     assert!(hook.contains("SHQ_EXCLUDE"), "Should support SHQ_EXCLUDE");
     assert!(hook.contains("__shq_excluded"), "Should have exclude function");
-    assert!(hook.contains("__shq_is_query"), "Should have query detection");
+    assert!(hook.contains("__shq_is_shq_command"), "Should have query detection");
     // Output capture helper
     assert!(hook.contains("shqr"), "Should define shqr function");
 }
@@ -329,7 +329,7 @@ fn test_hook_contains_privacy_escapes() {
     assert!(hook.contains("__shq_excluded"), "Should have exclude function");
 
     // Query command auto-exclusion
-    assert!(hook.contains("__shq_is_query"), "Should have query detection");
+    assert!(hook.contains("__shq_is_shq_command"), "Should have query detection");
 
     // Inline extraction (--extract flag)
     assert!(hook.contains("--extract"), "Should use inline extraction");
