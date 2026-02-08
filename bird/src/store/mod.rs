@@ -306,22 +306,41 @@ impl Store {
     pub fn connect(&self, opts: ConnectionOptions) -> Result<Connection> {
         let conn = self.open_connection_with_retry()?;
 
-        // ===== Always load required extensions =====
-        // These are required for basic functionality
-        conn.execute("LOAD parquet", [])?;
-        conn.execute("LOAD icu", [])?;
+        // ===== Set extension directory to BIRD_ROOT/db/extensions =====
+        let ext_dir = self.config.extensions_dir();
+        std::fs::create_dir_all(&ext_dir)?;
+        conn.execute(
+            &format!("SET extension_directory = '{}'", ext_dir.display()),
+            [],
+        )?;
+
+        // ===== Load required extensions (install if missing) =====
+        for ext in ["parquet", "icu"] {
+            if conn.execute(&format!("LOAD {}", ext), []).is_err() {
+                conn.execute(&format!("INSTALL {}", ext), [])?;
+                conn.execute(&format!("LOAD {}", ext), [])?;
+            }
+        }
+
         conn.execute("SET allow_community_extensions = true", [])?;
 
-        // Optional community extensions - log warning if missing, don't fail
+        // Optional community extensions - install and load, warn if missing
         for (ext, desc) in [
             ("scalarfs", "data: URL support for inline blobs"),
             ("duck_hunt", "log/output parsing for event extraction"),
         ] {
-            if let Err(e) = conn.execute(&format!("LOAD {}", ext), []) {
-                eprintln!(
-                    "Warning: {} extension not available ({}): {}",
-                    ext, desc, e
-                );
+            if conn.execute(&format!("LOAD {}", ext), []).is_err() {
+                // Try to install from community
+                if let Err(e) = conn.execute(&format!("INSTALL {} FROM community", ext), []) {
+                    eprintln!("Warning: {} extension not available ({}): {}", ext, desc, e);
+                    continue;
+                }
+                if let Err(e) = conn.execute(&format!("LOAD {}", ext), []) {
+                    eprintln!(
+                        "Warning: {} extension not available ({}): {}",
+                        ext, desc, e
+                    );
+                }
             }
         }
 
