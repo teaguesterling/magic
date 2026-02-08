@@ -1,5 +1,5 @@
 [package]
-name = "bird"
+name = "magic-bird"
 description = "Buffer and Invocation Record Database - storage layer for shell command history"
 version.workspace = true
 edition.workspace = true

@@ -1,5 +1,5 @@
 [package]
-name = "shq"
+name = "magic-shq"
 description = "Shell Query - CLI for capturing and querying shell command history"
 version.workspace = true
 edition.workspace = true
@@ -11,7 +11,7 @@ name = "shq"
 path = "src/main.rs"
 
 [dependencies]
-bird = { path = "../bird" }
+bird = { path = "../bird", package = "magic-bird" }
 clap = { version = "4.5", features = ["derive"] }
 thiserror.workspace = true
 chrono.workspace = true

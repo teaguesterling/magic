@@ -6,7 +6,7 @@ members = ["bird", "shq"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/yourorg/magic"
+repository = "https://github.com/teaguesterling/magic"
 
 [workspace.dependencies]
 # Shared dependencies across workspace

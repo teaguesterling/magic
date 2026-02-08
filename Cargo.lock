@@ -308,25 +308,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "bird"
-version = "0.1.0"
-dependencies = [
- "base64",
- "blake3",
- "chrono",
- "directories",
- "duckdb",
- "gethostname",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.17",
- "toml",
- "uuid",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1266,6 +1247,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "magic-bird"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "blake3",
+ "chrono",
+ "directories",
+ "duckdb",
+ "gethostname",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+ "toml",
+ "uuid",
+]
+
+[[package]]
+name = "magic-shq"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "clap",
+ "magic-bird",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+ "uuid",
+]
+
+[[package]]
 name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1910,21 +1925,6 @@ name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
-
-[[package]]
-name = "shq"
-version = "0.1.0"
-dependencies = [
- "base64",
- "bird",
- "chrono",
- "clap",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.17",
- "uuid",
-]
 
 [[package]]
 name = "simd-adler32"
