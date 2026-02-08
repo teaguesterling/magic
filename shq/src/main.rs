@@ -29,6 +29,10 @@ enum Commands {
         #[arg(short = 'c', long = "command")]
         shell_cmd: Option<String>,
 
+        /// Tag this invocation with a name (like git tag)
+        #[arg(short = 't', long = "tag")]
+        tag: Option<String>,
+
         /// Extract events from output after command completes (overrides config)
         #[arg(short = 'x', long = "extract", conflicts_with = "no_extract")]
         extract: bool,
@@ -102,6 +106,10 @@ enum Commands {
         /// Run compaction check after saving
         #[arg(long = "compact")]
         compact: bool,
+
+        /// Tag this invocation with a name (like git tag)
+        #[arg(short = 't', long = "tag")]
+        tag: Option<String>,
 
         /// Suppress informational output
         #[arg(short = 'q', long = "quiet")]
@@ -534,7 +542,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::Init { mode } => commands::init(&mode),
-        Commands::Run { shell_cmd, extract, no_extract, format, compact, cmd } => {
+        Commands::Run { shell_cmd, tag, extract, no_extract, format, compact, cmd } => {
             // Resolve extract behavior: --extract forces on, --no-extract forces off, otherwise use config
             let extract_override = if extract {
                 Some(true)
@@ -543,9 +551,9 @@ fn main() {
             } else {
                 None
             };
-            commands::run(shell_cmd.as_deref(), &cmd, extract_override, format.as_deref(), compact)
+            commands::run(shell_cmd.as_deref(), &cmd, tag.as_deref(), extract_override, format.as_deref(), compact)
         }
-        Commands::Save { file, command, exit_code, duration_ms, stream, stdout_file, stderr_file, session_id, invoker_pid, invoker, invoker_type, extract, compact, quiet } => {
+        Commands::Save { file, command, exit_code, duration_ms, stream, stdout_file, stderr_file, session_id, invoker_pid, invoker, invoker_type, extract, compact, tag, quiet } => {
             commands::save(
                 file.as_deref(),
                 &command,
@@ -560,6 +568,7 @@ fn main() {
                 &invoker_type,
                 extract,
                 compact,
+                tag.as_deref(),
                 quiet,
             )
         }

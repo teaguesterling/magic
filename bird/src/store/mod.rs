@@ -447,7 +447,8 @@ impl Store {
                 CREATE TABLE IF NOT EXISTS local.invocations (
                     id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
                     cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
-                    format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR, date DATE
+                    format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR,
+                    tag VARCHAR, date DATE
                 );
                 CREATE TABLE IF NOT EXISTS local.outputs (
                     id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
@@ -1102,7 +1103,7 @@ impl Store {
 
         // Write invocation
         conn.execute(
-            r#"INSERT INTO local.invocations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            r#"INSERT INTO local.invocations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             params![
                 invocation.id.to_string(),
                 invocation.session_id,
@@ -1116,6 +1117,7 @@ impl Store {
                 invocation.client_id,
                 invocation.hostname,
                 invocation.username,
+                invocation.tag,
                 date.to_string(),
             ],
         )?;

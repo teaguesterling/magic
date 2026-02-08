@@ -42,6 +42,9 @@ pub struct InvocationRecord {
 
     /// Username who executed the invocation.
     pub username: Option<String>,
+
+    /// User-defined tag (unique alias for this invocation, like git tags).
+    pub tag: Option<String>,
 }
 
 /// Environment variable for sharing invocation UUID between nested BIRD clients.
@@ -91,6 +94,7 @@ impl InvocationRecord {
             client_id: client_id.into(),
             hostname: gethostname::gethostname().to_str().map(|s| s.to_string()),
             username: std::env::var("USER").ok(),
+            tag: None,
         }
     }
 
@@ -120,6 +124,7 @@ impl InvocationRecord {
             client_id: client_id.into(),
             hostname: gethostname::gethostname().to_str().map(|s| s.to_string()),
             username: std::env::var("USER").ok(),
+            tag: None,
         }
     }
 
@@ -142,6 +147,12 @@ impl InvocationRecord {
     /// Set the format hint.
     pub fn with_format_hint(mut self, hint: impl Into<String>) -> Self {
         self.format_hint = Some(hint.into());
+        self
+    }
+
+    /// Set the tag (unique alias for this invocation).
+    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tag = Some(tag.into());
         self
     }
 
@@ -416,6 +427,7 @@ CREATE TABLE invocations (
     client_id         VARCHAR NOT NULL,
     hostname          VARCHAR,
     username          VARCHAR,
+    tag               VARCHAR,
     date              DATE NOT NULL
 );
 "#;

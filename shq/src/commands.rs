@@ -47,10 +47,11 @@ fn contains_nosave_marker(data: &[u8]) -> bool {
 
 /// Run a command and capture it to BIRD.
 ///
+/// `tag`: Optional tag (unique alias) for this invocation.
 /// `extract_override`: Some(true) forces extraction, Some(false) disables it, None uses config.
 /// `format_override`: Override format detection for event extraction.
 /// `auto_compact`: If true, spawn background compaction after saving.
-pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract_override: Option<bool>, format_override: Option<&str>, auto_compact: bool) -> bird::Result<()> {
+pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extract_override: Option<bool>, format_override: Option<&str>, auto_compact: bool) -> bird::Result<()> {
     use std::io::Write;
 
     // Determine command string and how to execute
@@ -140,7 +141,7 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract_override: Optio
     );
 
     // Use the pre-generated invocation ID (which was passed to child process)
-    let record = InvocationRecord::with_id(
+    let mut record = InvocationRecord::with_id(
         invocation_id,
         &sid,
         &cmd_str,
@@ -149,6 +150,11 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], extract_override: Optio
         &config.client_id,
     )
     .with_duration(duration_ms);
+
+    // Add tag if provided
+    if let Some(t) = tag {
+        record = record.with_tag(t);
+    }
 
     let inv_id = record.id;
 
@@ -218,6 +224,7 @@ pub fn save(
     explicit_invoker_type: &str,
     extract: bool,
     compact: bool,
+    tag: Option<&str>,
     quiet: bool,
 ) -> bird::Result<()> {
     use std::process::Command;
@@ -283,6 +290,9 @@ pub fn save(
     );
     if let Some(ms) = duration_ms {
         inv_record = inv_record.with_duration(ms);
+    }
+    if let Some(t) = tag {
+        inv_record = inv_record.with_tag(t);
     }
     let inv_id = inv_record.id;
 
@@ -1634,10 +1644,19 @@ fn looks_like_hex_id(s: &str) -> bool {
     s.len() >= 4 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
-/// Try to find an invocation by short or full ID.
-/// Returns Some(full_id) if found, None if not found or query doesn't look like an ID.
+/// Try to find an invocation by tag, short ID, or full ID.
+/// Returns Some(full_id) if found, None if not found or query doesn't look like an ID/tag.
 fn try_find_by_id(store: &Store, query_str: &str) -> bird::Result<Option<String>> {
     let trimmed = query_str.trim();
+
+    // Check for tag lookup (:tagname)
+    if let Some(tag) = trimmed.strip_prefix(':') {
+        if let Some(id) = store.find_by_tag(tag)? {
+            return Ok(Some(id));
+        }
+        // Tag not found - this is an explicit error, not a fallback to query
+        return Err(bird::Error::NotFound(format!("Tag '{}' not found", tag)));
+    }
 
     if !looks_like_hex_id(trimmed) {
         return Ok(None);
@@ -1700,7 +1719,7 @@ pub fn info(query_str: &str, format: &str, field: Option<&str>) -> bird::Result<
 
     // Get full invocation details via SQL
     let result = store.query(&format!(
-        "SELECT id, cmd, cwd, exit_code, timestamp, duration_ms, session_id
+        "SELECT id, cmd, cwd, exit_code, timestamp, duration_ms, session_id, tag
          FROM invocations
          WHERE id = '{}'",
         invocation_id
@@ -1718,6 +1737,7 @@ pub fn info(query_str: &str, format: &str, field: Option<&str>) -> bird::Result<
     let timestamp = &row[4];
     let duration_ms = &row[5];
     let session_id = &row[6];
+    let tag = &row[7];
 
     // Get output info
     let outputs = store.get_outputs(&invocation_id, None)?;
@@ -1740,6 +1760,7 @@ pub fn info(query_str: &str, format: &str, field: Option<&str>) -> bird::Result<
             "timestamp" | "time" => timestamp.to_string(),
             "duration" | "duration_ms" => duration_ms.to_string(),
             "session" | "session_id" => session_id.to_string(),
+            "tag" => tag.to_string(),
             "stdout" | "stdout_bytes" => stdout_size.to_string(),
             "stderr" | "stderr_bytes" => stderr_size.to_string(),
             "events" | "event_count" => event_count.to_string(),
@@ -1759,6 +1780,9 @@ pub fn info(query_str: &str, format: &str, field: Option<&str>) -> bird::Result<
             println!(r#"  "exit_code": {},"#, exit_code);
             println!(r#"  "duration_ms": {},"#, duration_ms);
             println!(r#"  "session_id": "{}","#, session_id);
+            if tag != "NULL" && !tag.is_empty() {
+                println!(r#"  "tag": "{}","#, tag);
+            }
             println!(r#"  "stdout_bytes": {},"#, stdout_size);
             println!(r#"  "stderr_bytes": {},"#, stderr_size);
             println!(r#"  "event_count": {}"#, event_count);
@@ -1773,6 +1797,9 @@ pub fn info(query_str: &str, format: &str, field: Option<&str>) -> bird::Result<
             println!("Exit Code:   {}", exit_code);
             println!("Duration:    {}ms", duration_ms);
             println!("Session:     {}", session_id);
+            if tag != "NULL" && !tag.is_empty() {
+                println!("Tag:         {}", tag);
+            }
             println!("Stdout:      {} bytes", stdout_size);
             println!("Stderr:      {} bytes", stderr_size);
             println!("Events:      {}", event_count);
@@ -2111,6 +2138,38 @@ shqr() {
 autoload -Uz add-zsh-hook
 add-zsh-hook preexec __shq_preexec
 add-zsh-hook precmd __shq_precmd
+
+# --- Convenience aliases ---
+# % <command> -> shq run <command>
+alias %='shq run'
+
+# %run / %r -> shq run (with options)
+alias %run='shq run'
+alias %r='shq run'
+
+# %rerun / %R -> shq rerun
+alias %rerun='shq rerun'
+alias %R='shq rerun'
+
+# %history / %h / %i -> shq history
+alias %history='shq history'
+alias %h='shq history'
+alias %i='shq history'
+
+# %output / %o -> shq output
+alias %output='shq output'
+alias %o='shq output'
+
+# %info / %I -> shq info
+alias %info='shq info'
+alias %I='shq info'
+
+# %events / %e -> shq events
+alias %events='shq events'
+alias %e='shq events'
+
+# %% -> shq (general)
+alias %%='shq'
 "#;
 
 // Format hints management
@@ -2663,8 +2722,9 @@ __shq_prompt_command() {
 }
 
 # --- shqr: run a command with full output capture ---
-# Usage: shqr <command> [args...]
+# Usage: shqr <command> [args...] [#:tag]
 # Example: shqr make test
+# Example: shqr make test #:build  (tags this invocation as "build")
 # Unlike the default hook (metadata only), shqr also captures stdout/stderr.
 shqr() {
     # Check if disabled
@@ -2674,6 +2734,15 @@ shqr() {
     fi
 
     local cmd="$*"
+    local tag=""
+
+    # Extract tag from #:tagname suffix
+    if [[ "$cmd" =~ \ #:([a-zA-Z0-9_-]+)$ ]]; then
+        tag="${BASH_REMATCH[1]}"
+        # Remove the tag from the command
+        cmd="${cmd% #:*}"
+    fi
+
     local tmpdir
     tmpdir=$(mktemp -d)
     local stdout_file="$tmpdir/stdout"
@@ -2691,14 +2760,21 @@ shqr() {
     local duration=$(( now_ms - start_ms ))
     (( duration < 0 )) && duration=0
 
-    # Save to BIRD with captured output (synchronous — user explicitly asked for capture)
-    shq save -c "$cmd" -x "$exit_code" -d "$duration" \
-        -o "$stdout_file" -e "$stderr_file" \
-        --session-id "$__shq_session_id" \
+    # Build save command
+    local save_cmd="shq save -c \"$cmd\" -x \"$exit_code\" -d \"$duration\" \
+        -o \"$stdout_file\" -e \"$stderr_file\" \
+        --session-id \"$__shq_session_id\" \
         --invoker-pid $$ \
         --invoker bash \
-        -q \
-        2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
+        --extract --compact -q"
+
+    # Add tag if present
+    if [[ -n "$tag" ]]; then
+        save_cmd="$save_cmd --tag \"$tag\""
+    fi
+
+    # Save to BIRD with captured output
+    eval "$save_cmd" 2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
 
     # Cleanup temp files
     rm -rf "$tmpdir"
@@ -2713,6 +2789,38 @@ if [[ -z "$PROMPT_COMMAND" ]]; then
 else
     PROMPT_COMMAND="__shq_prompt_command; $PROMPT_COMMAND"
 fi
+
+# --- Convenience aliases ---
+# % <command> -> shq run <command>
+alias %='shq run'
+
+# %run / %r -> shq run (with options)
+alias %run='shq run'
+alias %r='shq run'
+
+# %rerun / %R -> shq rerun
+alias %rerun='shq rerun'
+alias %R='shq rerun'
+
+# %history / %h / %i -> shq history
+alias %history='shq history'
+alias %h='shq history'
+alias %i='shq history'
+
+# %output / %o -> shq output
+alias %output='shq output'
+alias %o='shq output'
+
+# %info / %I -> shq info
+alias %info='shq info'
+alias %I='shq info'
+
+# %events / %e -> shq events
+alias %events='shq events'
+alias %e='shq events'
+
+# %% -> shq (general)
+alias %%='shq'
 
 fi  # End of guard/version check else block
 "#;

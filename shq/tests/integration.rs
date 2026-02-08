@@ -1329,3 +1329,146 @@ fn test_compact_includes_events() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Dry run"));
 }
+
+// Tag tests
+
+#[test]
+fn test_run_with_tag() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run command with tag
+    let output = shq_cmd(tmp.path())
+        .args(["run", "-t", "mytag", "echo", "tagged command"])
+        .output()
+        .expect("failed to run");
+
+    assert!(output.status.success());
+
+    // Verify tag is stored via SQL
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT tag FROM invocations WHERE tag = 'mytag'"])
+        .output()
+        .expect("failed to query");
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("mytag"));
+}
+
+#[test]
+fn test_save_with_tag() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Save with tag
+    let mut child = shq_cmd(tmp.path())
+        .args(["save", "-c", "test command", "--tag", "savetag"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn");
+
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(b"output\n").unwrap();
+    }
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+
+    // Verify tag is stored
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT tag FROM invocations WHERE tag = 'savetag'"])
+        .output()
+        .expect("failed to query");
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("savetag"));
+}
+
+#[test]
+fn test_tag_lookup() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run command with tag
+    shq_cmd(tmp.path())
+        .args(["run", "-t", "findme", "echo", "find this"])
+        .output()
+        .expect("failed to run");
+
+    // Look up by tag using :tagname syntax
+    let output = shq_cmd(tmp.path())
+        .args(["info", ":findme", "--field", "cmd"])
+        .output()
+        .expect("failed to get info");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("find this"), "Expected 'find this' in output: {}", stdout);
+}
+
+#[test]
+fn test_tag_in_info_output() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run command with tag
+    shq_cmd(tmp.path())
+        .args(["run", "-t", "infotag", "echo", "hello"])
+        .output()
+        .expect("failed to run");
+
+    // Get info using ~1 (most recent)
+    let output = shq_cmd(tmp.path())
+        .args(["info", "~1", "--format", "table"])
+        .output()
+        .expect("failed to get info");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("infotag"), "Expected 'infotag' in output: {}", stdout);
+}
+
+#[test]
+fn test_tag_field_extraction() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run command with tag
+    shq_cmd(tmp.path())
+        .args(["run", "-t", "extracttag", "echo", "test"])
+        .output()
+        .expect("failed to run");
+
+    // Extract just the tag field
+    let output = shq_cmd(tmp.path())
+        .args(["info", ":extracttag", "--field", "tag"])
+        .output()
+        .expect("failed to get info");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "extracttag");
+}
+
+#[test]
+fn test_tag_not_found() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command without tag
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "no tag"])
+        .output()
+        .expect("failed to run");
+
+    // Try to look up nonexistent tag
+    let output = shq_cmd(tmp.path())
+        .args(["info", ":nonexistent"])
+        .output()
+        .expect("failed to get info");
+
+    // Should fail because tag doesn't exist
+    assert!(!output.status.success());
+}

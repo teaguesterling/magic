@@ -174,7 +174,7 @@ fn create_placeholder_schemas(conn: &duckdb::Connection) -> Result<()> {
             id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
             cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
             format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR,
-            date DATE, _source VARCHAR
+            tag VARCHAR, date DATE, _source VARCHAR
         );
         CREATE TABLE cached_placeholder.outputs (
             id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
@@ -202,7 +202,7 @@ fn create_placeholder_schemas(conn: &duckdb::Connection) -> Result<()> {
             id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
             cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
             format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR,
-            date DATE, _source VARCHAR
+            tag VARCHAR, date DATE, _source VARCHAR
         );
         CREATE TABLE remote_placeholder.outputs (
             id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
@@ -386,6 +386,7 @@ fn create_local_tables(conn: &duckdb::Connection) -> Result<()> {
             client_id VARCHAR,
             hostname VARCHAR,
             username VARCHAR,
+            tag VARCHAR,
             date DATE
         );
 
@@ -569,6 +570,7 @@ fn create_seed_files(conn: &duckdb::Connection, config: &Config) -> Result<()> {
                 NULL::VARCHAR as client_id,
                 NULL::VARCHAR as hostname,
                 NULL::VARCHAR as username,
+                NULL::VARCHAR as tag,
                 NULL::DATE as date
             WHERE false
         ) TO '{}' (FORMAT PARQUET);

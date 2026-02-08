@@ -69,6 +69,7 @@ impl Store {
                 client_id VARCHAR,
                 hostname VARCHAR,
                 username VARCHAR,
+                tag VARCHAR,
                 date DATE
             );
             "#,
@@ -77,7 +78,7 @@ impl Store {
         conn.execute(
             r#"
             INSERT INTO temp_invocation VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             "#,
             params![
@@ -93,6 +94,7 @@ impl Store {
                 record.client_id,
                 record.hostname,
                 record.username,
+                record.tag,
                 date.to_string(),
             ],
         )?;
@@ -122,7 +124,7 @@ impl Store {
         conn.execute(
             r#"
             INSERT INTO local.invocations VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             "#,
             params![
@@ -138,6 +140,7 @@ impl Store {
                 record.client_id,
                 record.hostname,
                 record.username,
+                record.tag,
                 date.to_string(),
             ],
         )?;
@@ -339,6 +342,39 @@ impl Store {
                 }
             }
         }
+    }
+
+    /// Find an invocation by its tag.
+    /// Returns the full invocation ID if found.
+    pub fn find_by_tag(&self, tag: &str) -> Result<Option<String>> {
+        let conn = self.connection()?;
+
+        // Normalize tag (remove leading : if present)
+        let tag = tag.trim_start_matches(':');
+
+        let result: std::result::Result<String, _> = conn.query_row(
+            "SELECT id::VARCHAR FROM invocations WHERE tag = ?",
+            params![tag],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Set or update the tag on an invocation.
+    pub fn set_tag(&self, invocation_id: &str, tag: Option<&str>) -> Result<()> {
+        let conn = self.connection()?;
+
+        conn.execute(
+            "UPDATE local.invocations SET tag = ? WHERE id = ?",
+            params![tag, invocation_id],
+        )?;
+
+        Ok(())
     }
 }
 
