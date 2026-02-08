@@ -11,7 +11,7 @@ name = "shq"
 path = "src/main.rs"
 
 [dependencies]
-bird = { path = "../bird", package = "magic-bird", version = "0.1.1" }
+bird = { path = "../bird", package = "magic-bird", version = "0.1.2" }
 clap = { version = "4.5", features = ["derive"] }
 thiserror.workspace = true
 chrono.workspace = true
