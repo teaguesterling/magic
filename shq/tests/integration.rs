@@ -114,9 +114,9 @@ fn test_save_with_duration() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
 
-    // Verify duration was recorded
+    // Verify duration was recorded (use table format to see duration)
     let history = shq_cmd(tmp.path())
-        .args(["history"])
+        .args(["history", "--format", "table"])
         .output()
         .expect("failed to get history");
 

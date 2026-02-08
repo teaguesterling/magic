@@ -160,25 +160,33 @@ enum Commands {
     /// List invocation history
     #[command(visible_aliases = ["i", "history"])]
     Invocations {
-        /// Query selector (e.g., ~20, shell:~10, %exit<>0~5)
+        /// Query selector (e.g., ~20, shell:~10, %failed~5)
         #[arg(default_value = "~20")]
         query: String,
 
-        /// Output format: table, json, oneline
-        #[arg(short = 'f', long = "format", default_value = "table")]
+        /// Output format: compact (default), table, json
+        #[arg(short = 'f', long = "format", default_value = "compact")]
         format: String,
+
+        /// Show detailed table view (same as -f table)
+        #[arg(short = 'd', long = "details")]
+        details: bool,
     },
 
     /// Show detailed info about an invocation
     #[command(visible_alias = "I")]
     Info {
-        /// Query selector (e.g., ~1, %/make/~1)
+        /// Query selector (e.g., ~1, %/make/~1) or short ID
         #[arg(default_value = "~1")]
         query: String,
 
         /// Output format: table, json
         #[arg(short = 'f', long = "format", default_value = "table")]
         format: String,
+
+        /// Return only this field (id, cmd, cwd, exit, timestamp, duration, session)
+        #[arg(long = "field")]
+        field: Option<String>,
     },
 
     /// Re-run a previous command
@@ -570,8 +578,11 @@ fn main() {
             };
             commands::output(&query, resolved_stream, &opts)
         }
-        Commands::Invocations { query, format } => commands::invocations(&query, &format),
-        Commands::Info { query, format } => commands::info(&query, &format),
+        Commands::Invocations { query, format, details } => {
+            let fmt = if details { "table" } else { &format };
+            commands::invocations(&query, fmt)
+        }
+        Commands::Info { query, format, field } => commands::info(&query, &format, field.as_deref()),
         Commands::Rerun { query, dry_run, no_capture } => commands::rerun(&query, dry_run, no_capture),
         Commands::Sql { query } => commands::sql(&query),
         Commands::QuickHelp => commands::quick_help(),

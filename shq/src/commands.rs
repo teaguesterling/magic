@@ -354,14 +354,18 @@ pub fn output(query_str: &str, stream_filter: Option<&str>, opts: &OutputOptions
         None => (None, false), // No filter, route to original streams
     };
 
-    // Resolve invocation(s) from query
-    let invocation_id = match resolve_query_to_invocation(&store, &query) {
-        Ok(id) => id,
-        Err(bird::Error::NotFound(_)) => {
-            eprintln!("No matching invocation found");
-            return Ok(());
+    // First try to find by ID (short or full), then fall back to query system
+    let invocation_id = if let Some(id) = try_find_by_id(&store, query_str)? {
+        id
+    } else {
+        match resolve_query_to_invocation(&store, &query) {
+            Ok(id) => id,
+            Err(bird::Error::NotFound(_)) => {
+                eprintln!("No matching invocation found");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) => return Err(e),
     };
 
     // Get outputs for the invocation (optionally filtered by stream)
@@ -573,34 +577,35 @@ pub fn invocations(query_str: &str, format: &str) -> bird::Result<()> {
         return Ok(());
     }
 
+    // Get output info for all invocations (which streams have data)
+    let inv_ids: Vec<&str> = invocations.iter().map(|i| i.id.as_str()).collect();
+    let output_info = get_output_info_batch(&store, &inv_ids)?;
+
     match format {
         "json" => {
             // JSON output
             println!("[");
             for (i, inv) in invocations.iter().enumerate() {
                 let comma = if i < invocations.len() - 1 { "," } else { "" };
+                let out_state = output_info.get(inv.id.as_str()).copied().unwrap_or_default();
                 println!(
-                    r#"  {{"id": "{}", "timestamp": "{}", "cmd": "{}", "exit_code": {}, "duration_ms": {}}}{}"#,
+                    r#"  {{"id": "{}", "timestamp": "{}", "cmd": "{}", "exit_code": {}, "duration_ms": {}, "has_stdout": {}, "has_stderr": {}, "has_combined": {}}}{}"#,
                     inv.id,
                     inv.timestamp,
                     inv.cmd.replace('\\', "\\\\").replace('"', "\\\""),
                     inv.exit_code,
                     inv.duration_ms.unwrap_or(0),
+                    out_state.has_stdout,
+                    out_state.has_stderr,
+                    out_state.has_combined,
                     comma
                 );
             }
             println!("]");
         }
-        "oneline" => {
-            // One-line per invocation
-            for inv in &invocations {
-                let duration = inv.duration_ms.map(|d| format!("{}ms", d)).unwrap_or_else(|| "-".to_string());
-                println!("{} [{}] {} {}", &inv.id[..8], inv.exit_code, duration, inv.cmd);
-            }
-        }
-        _ => {
-            // Table output (default)
-            println!("{:<20} {:<6} {:<10} {}", "TIMESTAMP", "EXIT", "DURATION", "COMMAND");
+        "table" => {
+            // Detailed table output
+            println!("{:<20} {:<6} {:<10} {:<4} {}", "TIMESTAMP", "EXIT", "DURATION", "OUT", "COMMAND");
             println!("{}", "-".repeat(80));
 
             for inv in invocations {
@@ -616,6 +621,10 @@ pub fn invocations(query_str: &str, format: &str) -> bird::Result<()> {
                     &inv.timestamp
                 };
 
+                // Output indicator
+                let out_state = output_info.get(inv.id.as_str()).copied().unwrap_or_default();
+                let out_indicator = out_state.glyph();
+
                 // Truncate command if too long
                 let cmd_display = if inv.cmd.len() > 50 {
                     format!("{}...", &inv.cmd[..47])
@@ -624,14 +633,131 @@ pub fn invocations(query_str: &str, format: &str) -> bird::Result<()> {
                 };
 
                 println!(
-                    "{:<20} {:<6} {:<10} {}",
-                    timestamp, inv.exit_code, duration, cmd_display
+                    "{:<20} {:<6} {:<10} {:<4} {}",
+                    timestamp, inv.exit_code, duration, out_indicator, cmd_display
+                );
+            }
+        }
+        "commands" => {
+            // Just commands, nothing else
+            for inv in invocations {
+                println!("{}", inv.cmd);
+            }
+        }
+        _ => {
+            // Compact color output (default)
+            // Format: ✓ abcd1234 command... ●
+            for inv in invocations {
+                // Status glyph with color
+                let (status_glyph, color_code) = if inv.exit_code == 0 {
+                    ("✓", "\x1b[32m") // Green
+                } else {
+                    ("✗", "\x1b[31m") // Red
+                };
+                let reset = "\x1b[0m";
+                let dim = "\x1b[2m";
+
+                // Short ID (last 8 chars - more unique for UUIDv7)
+                let id_len = inv.id.len();
+                let short_id = if id_len >= 8 {
+                    &inv.id[id_len - 8..]
+                } else {
+                    &inv.id
+                };
+
+                // Output indicator
+                let out_state = output_info.get(inv.id.as_str()).copied().unwrap_or_default();
+                let out_glyph = out_state.glyph();
+
+                // Truncate command for terminal width (leave room for prefix)
+                let max_cmd_len = 65;
+                let cmd_display = if inv.cmd.len() > max_cmd_len {
+                    format!("{}…", &inv.cmd[..max_cmd_len - 1])
+                } else {
+                    inv.cmd.clone()
+                };
+
+                println!(
+                    "{}{}{} {}{}{} {} {}",
+                    color_code, status_glyph, reset,
+                    dim, short_id, reset,
+                    out_glyph,
+                    cmd_display
                 );
             }
         }
     }
 
     Ok(())
+}
+
+/// Output capture state for display
+#[derive(Debug, Clone, Copy, Default)]
+struct OutputState {
+    has_stdout: bool,
+    has_stderr: bool,
+    has_combined: bool,
+    has_empty: bool,  // Has entry but 0 bytes
+}
+
+impl OutputState {
+    /// Get display glyph for output state
+    fn glyph(&self) -> &'static str {
+        if self.has_combined {
+            "◉"  // Combined (merged, can't separate)
+        } else if self.has_stdout && self.has_stderr {
+            "●"  // Both separate streams
+        } else if self.has_stdout {
+            "◐"  // Stdout only
+        } else if self.has_stderr {
+            "◑"  // Stderr only
+        } else if self.has_empty {
+            "○"  // Captured but empty
+        } else {
+            "·"  // Not captured
+        }
+    }
+}
+
+/// Get output info for a batch of invocation IDs.
+fn get_output_info_batch(store: &Store, inv_ids: &[&str]) -> bird::Result<std::collections::HashMap<String, OutputState>> {
+    use std::collections::HashMap;
+
+    if inv_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Build SQL to query output streams for all invocations at once
+    let ids_sql = inv_ids.iter().map(|id| format!("'{}'", id)).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT invocation_id, stream, byte_length FROM outputs WHERE invocation_id IN ({})",
+        ids_sql
+    );
+
+    let result = store.query(&sql)?;
+
+    let mut info: HashMap<String, OutputState> = HashMap::new();
+    for row in &result.rows {
+        if row.len() >= 3 {
+            let inv_id = row[0].clone();
+            let stream = row[1].clone();
+            let byte_length: i64 = row[2].parse().unwrap_or(0);
+
+            let entry = info.entry(inv_id).or_default();
+            if byte_length > 0 {
+                match stream.as_str() {
+                    "stdout" => entry.has_stdout = true,
+                    "stderr" => entry.has_stderr = true,
+                    "combined" => entry.has_combined = true,
+                    _ => {}
+                }
+            } else {
+                entry.has_empty = true;
+            }
+        }
+    }
+
+    Ok(info)
 }
 
 /// Show quick reference for commands and query syntax.
@@ -1481,6 +1607,44 @@ fn truncate_string(s: &str, max_len: usize) -> String {
     }
 }
 
+/// Check if a string looks like a hex ID (short or full UUID).
+fn looks_like_hex_id(s: &str) -> bool {
+    // Must be at least 4 chars and only contain hex digits and dashes
+    s.len() >= 4 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Try to find an invocation by short or full ID.
+/// Returns Some(full_id) if found, None if not found or query doesn't look like an ID.
+fn try_find_by_id(store: &Store, query_str: &str) -> bird::Result<Option<String>> {
+    let trimmed = query_str.trim();
+
+    if !looks_like_hex_id(trimmed) {
+        return Ok(None);
+    }
+
+    // Try exact match first (full UUID)
+    let result = store.query(&format!(
+        "SELECT id::VARCHAR FROM invocations WHERE id::VARCHAR = '{}' LIMIT 1",
+        trimmed
+    ))?;
+
+    if !result.rows.is_empty() {
+        return Ok(Some(result.rows[0][0].clone()));
+    }
+
+    // Try suffix match (short ID - we show last 8 chars of UUIDv7)
+    let result = store.query(&format!(
+        "SELECT id::VARCHAR FROM invocations WHERE suffix(id::VARCHAR, '{}') ORDER BY timestamp DESC LIMIT 1",
+        trimmed
+    ))?;
+
+    if !result.rows.is_empty() {
+        return Ok(Some(result.rows[0][0].clone()));
+    }
+
+    Ok(None)
+}
+
 /// Resolve a query to a single invocation ID.
 fn resolve_query_to_invocation(store: &Store, query: &Query) -> bird::Result<String> {
     // Apply filters and get matching invocations (default to 1 for single-item commands)
@@ -1500,13 +1664,18 @@ fn resolve_query_to_invocation(store: &Store, query: &Query) -> bird::Result<Str
 }
 
 /// Show detailed info about an invocation.
-pub fn info(query_str: &str, format: &str) -> bird::Result<()> {
+pub fn info(query_str: &str, format: &str, field: Option<&str>) -> bird::Result<()> {
     let config = Config::load()?;
     let store = Store::open(config)?;
 
-    // Parse query and resolve to invocation
-    let query = parse_query(query_str);
-    let invocation_id = resolve_query_to_invocation(&store, &query)?;
+    // First try to find by ID (short or full)
+    let invocation_id = if let Some(id) = try_find_by_id(&store, query_str)? {
+        id
+    } else {
+        // Fall back to query system
+        let query = parse_query(query_str);
+        resolve_query_to_invocation(&store, &query)?
+    };
 
     // Get full invocation details via SQL
     let result = store.query(&format!(
@@ -1540,6 +1709,25 @@ pub fn info(query_str: &str, format: &str) -> bird::Result<()> {
         ..Default::default()
     })?;
 
+    // If a specific field is requested, just print that value (for scripting)
+    if let Some(f) = field {
+        let value = match f.to_lowercase().as_str() {
+            "id" => id.to_string(),
+            "cmd" | "command" => cmd.to_string(),
+            "cwd" | "dir" | "working_dir" => cwd.to_string(),
+            "exit" | "exit_code" => exit_code.to_string(),
+            "timestamp" | "time" => timestamp.to_string(),
+            "duration" | "duration_ms" => duration_ms.to_string(),
+            "session" | "session_id" => session_id.to_string(),
+            "stdout" | "stdout_bytes" => stdout_size.to_string(),
+            "stderr" | "stderr_bytes" => stderr_size.to_string(),
+            "events" | "event_count" => event_count.to_string(),
+            _ => return Err(bird::Error::Config(format!("Unknown field: {}", f))),
+        };
+        println!("{}", value);
+        return Ok(());
+    }
+
     match format {
         "json" => {
             println!(r#"{{"#);
@@ -1557,9 +1745,6 @@ pub fn info(query_str: &str, format: &str) -> bird::Result<()> {
         }
         _ => {
             // Table format
-            println!("Invocation Details");
-            println!("==================");
-            println!();
             println!("ID:          {}", id);
             println!("Timestamp:   {}", timestamp);
             println!("Command:     {}", cmd);
@@ -1567,11 +1752,9 @@ pub fn info(query_str: &str, format: &str) -> bird::Result<()> {
             println!("Exit Code:   {}", exit_code);
             println!("Duration:    {}ms", duration_ms);
             println!("Session:     {}", session_id);
-            println!();
-            println!("Output:");
-            println!("  stdout:    {} bytes", stdout_size);
-            println!("  stderr:    {} bytes", stderr_size);
-            println!("  events:    {}", event_count);
+            println!("Stdout:      {} bytes", stdout_size);
+            println!("Stderr:      {} bytes", stderr_size);
+            println!("Events:      {}", event_count);
         }
     }
 
@@ -1585,9 +1768,14 @@ pub fn rerun(query_str: &str, dry_run: bool, no_capture: bool) -> bird::Result<(
     let config = Config::load()?;
     let store = Store::open(config)?;
 
-    // Parse query and resolve to invocation
-    let query = parse_query(query_str);
-    let invocation_id = resolve_query_to_invocation(&store, &query)?;
+    // First try to find by ID (short or full)
+    let invocation_id = if let Some(id) = try_find_by_id(&store, query_str)? {
+        id
+    } else {
+        // Fall back to query system
+        let query = parse_query(query_str);
+        resolve_query_to_invocation(&store, &query)?
+    };
 
     // Get full invocation details via SQL (need cmd and cwd)
     let result = store.query(&format!(
