@@ -230,11 +230,19 @@ enum Commands {
     QuickHelp,
 
     /// Show statistics
-    #[command(visible_alias = "s")]
+    #[command(visible_aliases = ["s", "status"])]
     Stats {
         /// Output format: table, json
         #[arg(short = 'f', long = "format", default_value = "table")]
         format: String,
+
+        /// Show detailed information (config, session info)
+        #[arg(short = 'd', long = "details")]
+        details: bool,
+
+        /// Get a single field value (for scripting)
+        #[arg(long = "field")]
+        field: Option<String>,
     },
 
     /// Move old data from recent to archive
@@ -439,6 +447,9 @@ enum HookAction {
         #[arg(short, long)]
         quiet: bool,
     },
+
+    /// Output ignore patterns for shell hooks (colon-separated)
+    IgnorePatterns,
 }
 
 #[derive(Subcommand)]
@@ -617,13 +628,14 @@ fn main() {
         Commands::Rerun { query, dry_run, no_capture } => commands::rerun(&query, dry_run, no_capture),
         Commands::Sql { query } => commands::sql(&query),
         Commands::QuickHelp => commands::quick_help(),
-        Commands::Stats { format } => commands::stats(&format),
+        Commands::Stats { format, details, field } => commands::stats(&format, details, field.as_deref()),
         Commands::Archive { days, dry_run, extract_first } => commands::archive(days, dry_run, extract_first),
         Commands::Compact { file_threshold, recompact_threshold, consolidate, extract_first, session, today_only, quiet, recent_only, archive_only, dry_run } => {
             commands::compact(file_threshold, recompact_threshold, consolidate, extract_first, session.as_deref(), today_only, quiet, recent_only, archive_only, dry_run)
         }
         Commands::Hook { action } => match action {
             HookAction::Init { shell, inactive, no_prompt_indicator, quiet } => commands::hook_init(shell.as_deref(), inactive, !no_prompt_indicator, quiet),
+            HookAction::IgnorePatterns => commands::hook_ignore_patterns(),
         },
         Commands::FormatHints { action } => match action {
             FormatHintsAction::List { filter, user_only, builtin_only } => {

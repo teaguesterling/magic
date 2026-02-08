@@ -841,6 +841,7 @@ pub struct BirdStats {
     pub root: String,
     pub client_id: String,
     pub storage_mode: String,
+    pub current_session: CurrentSession,
     pub invocations: InvocationStats,
     pub sessions: SessionStats,
     pub events: EventStats,
@@ -898,6 +899,15 @@ pub struct SessionStats {
 }
 
 #[derive(serde::Serialize)]
+pub struct CurrentSession {
+    pub hostname: String,
+    pub username: String,
+    pub shell: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
 pub struct EventStats {
     pub total: i64,
     pub errors: i64,
@@ -917,12 +927,19 @@ pub struct LastError {
     pub line: Option<i32>,
 }
 
-pub fn stats(format: &str) -> bird::Result<()> {
+pub fn stats(format: &str, details: bool, field: Option<&str>) -> bird::Result<()> {
     let config = Config::load()?;
     let store = Store::open(config.clone())?;
 
     // Use a single connection for all queries to avoid multiple connection issues
     let conn = store.connection()?;
+
+    // Get current session info from client_id (username@hostname) and environment
+    let (username, hostname) = config.client_id.split_once('@')
+        .map(|(u, h)| (u.to_string(), h.to_string()))
+        .unwrap_or_else(|| (config.client_id.clone(), "unknown".to_string()));
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string());
+    let session_id = std::env::var("__shq_session_id").ok();
 
     // Gather basic stats using the single connection
     let inv_count: i64 = conn
@@ -1040,6 +1057,12 @@ pub fn stats(format: &str) -> bird::Result<()> {
         root: config.bird_root.display().to_string(),
         client_id: config.client_id.clone(),
         storage_mode: config.storage_mode.to_string(),
+        current_session: CurrentSession {
+            hostname,
+            username,
+            shell,
+            session_id,
+        },
         invocations: InvocationStats {
             total: inv_count,
             last: last_inv.map(|inv| LastInvocation {
@@ -1062,6 +1085,31 @@ pub fn stats(format: &str) -> bird::Result<()> {
         schemas,
     };
 
+    // Handle --field option for scripting
+    if let Some(field_name) = field {
+        let value = match field_name {
+            "root" => stats.root.clone(),
+            "client_id" => stats.client_id.clone(),
+            "storage_mode" => stats.storage_mode.clone(),
+            "hostname" => stats.current_session.hostname.clone(),
+            "username" => stats.current_session.username.clone(),
+            "shell" => stats.current_session.shell.clone(),
+            "session_id" => stats.current_session.session_id.clone().unwrap_or_default(),
+            "invocations" | "invocations.total" => stats.invocations.total.to_string(),
+            "sessions" | "sessions.total" => stats.sessions.total.to_string(),
+            "events" | "events.total" => stats.events.total.to_string(),
+            "errors" | "events.errors" => stats.events.errors.to_string(),
+            "warnings" | "events.warnings" => stats.events.warnings.to_string(),
+            _ => {
+                eprintln!("Unknown field: {}", field_name);
+                eprintln!("Available fields: root, client_id, storage_mode, hostname, username, shell, session_id, invocations, sessions, events, errors, warnings");
+                return Ok(());
+            }
+        };
+        println!("{}", value);
+        return Ok(());
+    }
+
     match format {
         "json" => {
             println!("{}", serde_json::to_string_pretty(&stats).unwrap());
@@ -1070,6 +1118,14 @@ pub fn stats(format: &str) -> bird::Result<()> {
             println!("Root:         {}", stats.root);
             println!("Client ID:    {}", stats.client_id);
             println!("Storage mode: {}", stats.storage_mode);
+            if details {
+                println!("Hostname:     {}", stats.current_session.hostname);
+                println!("Username:     {}", stats.current_session.username);
+                println!("Shell:        {}", stats.current_session.shell);
+                if let Some(ref sid) = stats.current_session.session_id {
+                    println!("Session ID:   {}", sid);
+                }
+            }
             println!();
             println!("Total invocations: {}", stats.invocations.total);
             println!("Total sessions:    {}", stats.sessions.total);
@@ -1298,6 +1354,14 @@ fn format_reduction(before: u64, after: u64) -> String {
         let reduction = ((before - after) as f64 / before as f64) * 100.0;
         format!("-{:.1}%", reduction)
     }
+}
+
+/// Output ignore patterns for shell hooks (colon-separated).
+pub fn hook_ignore_patterns() -> bird::Result<()> {
+    let config = Config::load()?;
+    let patterns = config.hooks.ignore_patterns.join(":");
+    println!("{}", patterns);
+    Ok(())
 }
 
 /// Output shell integration code.
@@ -2035,26 +2099,21 @@ const ZSH_HOOK: &str = r#"# shq shell integration for zsh
 # Session ID based on this shell's PID (stable across commands)
 __shq_session_id="zsh-$$"
 
-# Check if command matches any exclude pattern
-__shq_excluded() {
-    [[ -z "$SHQ_EXCLUDE" ]] && return 1
+# Default ignore patterns (colon-separated) - shq commands, job control, etc.
+: ${SHQ_IGNORE:="shq *:shqr *:blq *:%*:fg:fg *:bg:bg *:jobs:jobs *:exit:logout:clear:history:history *"}
+
+# Check if command should be ignored (matches SHQ_IGNORE or SHQ_EXCLUDE)
+__shq_should_ignore() {
     local cmd="$1"
     local IFS=':'
-    for pattern in $SHQ_EXCLUDE; do
+    # Check SHQ_IGNORE patterns
+    for pattern in $SHQ_IGNORE; do
         [[ "$cmd" == $~pattern ]] && return 0
     done
-    return 1
-}
-
-# Check if command is a shq/blq query (read-only) command - don't record these
-__shq_is_shq_command() {
-    local cmd="$1"
-    # Skip shq query commands (output, show, invocations, history, info, events, stats, sql, quick-help)
-    [[ "$cmd" =~ ^shq[[:space:]]+(output|show|o|invocations|history|i|info|I|events|e|stats|sql|q|quick-help|\?)[[:space:]]*  ]] && return 0
-    [[ "$cmd" =~ ^shq[[:space:]]+(output|show|o|invocations|history|i|info|I|events|e|stats|sql|q|quick-help|\?)$ ]] && return 0
-    # Skip blq query commands
-    [[ "$cmd" =~ ^blq[[:space:]]+(show|list|errors|context|stats)[[:space:]]* ]] && return 0
-    [[ "$cmd" =~ ^blq[[:space:]]+(show|list|errors|context|stats)$ ]] && return 0
+    # Check SHQ_EXCLUDE patterns (user-defined)
+    [[ -n "$SHQ_EXCLUDE" ]] && for pattern in $SHQ_EXCLUDE; do
+        [[ "$cmd" == $~pattern ]] && return 0
+    done
     return 1
 }
 
@@ -2084,11 +2143,8 @@ __shq_precmd() {
     # Skip if command starts with backslash (privacy escape)
     [[ "$cmd" =~ ^\\ ]] && return
 
-    # Skip if command matches exclude pattern
-    __shq_excluded "$cmd" && return
-
-    # Skip shq/blq query commands (prevent recursive recording)
-    __shq_is_shq_command "$cmd" && return
+    # Skip if command matches ignore patterns (shq commands, job control, etc.)
+    __shq_should_ignore "$cmd" && return
 
     # Calculate duration in milliseconds
     local duration=0
@@ -2156,7 +2212,7 @@ shq-off() {
     add-zsh-hook -d preexec __shq_preexec
     add-zsh-hook -d precmd __shq_precmd
     unset __shq_cmd __shq_start_time __shq_session_id
-    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %% 2>/dev/null
+    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %stats %s %% 2>/dev/null
     [[ -n "$__shq_orig_ps1" ]] && PS1="$__shq_orig_ps1"
     unset __shq_orig_ps1 SHQ_INDICATOR
     [[ -z "$__shq_quiet" ]] && echo "shq disabled (use shq-on to re-enable)"
@@ -2208,6 +2264,10 @@ alias %e='shq events'
 
 # %% -> shq (general)
 alias %%='shq'
+
+# %stats / %s -> shq stats
+alias %stats='shq stats'
+alias %s='shq stats'
 "#;
 
 const ZSH_HOOK_INACTIVE: &str = r#"# shq shell integration for zsh (inactive mode)
@@ -2218,7 +2278,7 @@ shq-off() {
     add-zsh-hook -d preexec __shq_preexec
     add-zsh-hook -d precmd __shq_precmd
     unset __shq_cmd __shq_start_time __shq_session_id
-    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %% 2>/dev/null
+    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %stats %s %% 2>/dev/null
     # Restore prompt
     [[ -n "$__shq_orig_ps1" ]] && PS1="$__shq_orig_ps1"
     unset __shq_orig_ps1 SHQ_INDICATOR
@@ -2255,6 +2315,10 @@ alias %events='shq events'
 alias %e='shq events'
 alias %%='shq'
 
+# %stats / %s -> shq stats
+alias %stats='shq stats'
+alias %s='shq stats'
+
 [[ -z "$__shq_quiet" ]] && echo "shq loaded (inactive). Use shq-on to enable hooks."
 "#;
 
@@ -2286,7 +2350,7 @@ shq-off() {
     add-zsh-hook -d preexec __shq_preexec
     add-zsh-hook -d precmd __shq_precmd
     unset __shq_cmd __shq_start_time __shq_session_id
-    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %% 2>/dev/null
+    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %stats %s %% 2>/dev/null
     [[ -z "$__shq_quiet" ]] && echo "shq disabled (use shq-on to re-enable)"
     unset __shq_quiet
 }
@@ -2304,6 +2368,10 @@ alias %output='shq output' %o='shq output'
 alias %info='shq info' %I='shq info'
 alias %events='shq events' %e='shq events'
 alias %%='shq'
+
+# %stats / %s -> shq stats
+alias %stats='shq stats'
+alias %s='shq stats'
 "#
 );
 
@@ -2751,27 +2819,21 @@ __shq_start_ms=""
 
 # --- Helpers ---
 
-# Check if command matches any colon-delimited exclude pattern
-__shq_excluded() {
-    [[ -z "$SHQ_EXCLUDE" ]] && return 1
+# Default ignore patterns (colon-separated) - shq commands, job control, etc.
+: ${SHQ_IGNORE:="shq *:shqr *:blq *:%*:fg:fg *:bg:bg *:jobs:jobs *:exit:logout:clear:history:history *"}
+
+# Check if command should be ignored (matches SHQ_IGNORE or SHQ_EXCLUDE)
+__shq_should_ignore() {
     local cmd="$1"
     local IFS=':'
-    for pattern in $SHQ_EXCLUDE; do
-        # Use bash pattern matching (extglob not required for simple globs)
-        if [[ "$cmd" == $pattern ]]; then
-            return 0
-        fi
+    # Check SHQ_IGNORE patterns
+    for pattern in $SHQ_IGNORE; do
+        [[ "$cmd" == $pattern ]] && return 0
     done
-    return 1
-}
-
-# Check if command is shq/shqr/blq — don't record these
-# (shq commands are meta; shqr handles its own recording)
-__shq_is_shq_command() {
-    local cmd="$1"
-    [[ "$cmd" =~ ^shq\  ]] && return 0
-    [[ "$cmd" =~ ^shqr\  ]] && return 0
-    [[ "$cmd" =~ ^blq\  ]] && return 0
+    # Check SHQ_EXCLUDE patterns (user-defined)
+    [[ -n "$SHQ_EXCLUDE" ]] && for pattern in $SHQ_EXCLUDE; do
+        [[ "$cmd" == $pattern ]] && return 0
+    done
     return 1
 }
 
@@ -2826,11 +2888,8 @@ __shq_prompt_command() {
     # Skip if command starts with backslash (privacy escape)
     [[ "$cmd" =~ ^\\ ]] && return
 
-    # Skip if command matches exclude pattern
-    __shq_excluded "$cmd" && return
-
-    # Skip shq/blq query commands (prevent recursive recording)
-    __shq_is_shq_command "$cmd" && return
+    # Skip if command matches ignore patterns (shq commands, job control, etc.)
+    __shq_should_ignore "$cmd" && return
 
     # Calculate duration in milliseconds
     local duration=0
@@ -2931,7 +2990,7 @@ shq-off() {
     unset __shq_cmd __shq_start_ms __shq_session_id __shq_loaded
     unset PS0
     # Remove convenience aliases
-    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %% 2>/dev/null
+    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %stats %s %% 2>/dev/null
     # Restore prompt
     [[ -n "$__shq_orig_ps1" ]] && PS1="$__shq_orig_ps1"
     unset __shq_orig_ps1 SHQ_INDICATOR
@@ -2988,6 +3047,10 @@ alias %e='shq events'
 # %% -> shq (general)
 alias %%='shq'
 
+# %stats / %s -> shq stats
+alias %stats='shq stats'
+alias %s='shq stats'
+
 fi  # End of guard/version check else block
 "#;
 
@@ -3001,7 +3064,7 @@ shq-off() {
     PROMPT_COMMAND="${PROMPT_COMMAND//__shq_prompt_command/}"
     PROMPT_COMMAND="${PROMPT_COMMAND#; }"; PROMPT_COMMAND="${PROMPT_COMMAND#;}"
     unset __shq_cmd __shq_start_ms __shq_session_id __shq_loaded PS0
-    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %% 2>/dev/null
+    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %stats %s %% 2>/dev/null
     # Restore prompt
     [[ -n "$__shq_orig_ps1" ]] && PS1="$__shq_orig_ps1"
     unset __shq_orig_ps1 SHQ_INDICATOR
@@ -3037,6 +3100,10 @@ alias %I='shq info'
 alias %events='shq events'
 alias %e='shq events'
 alias %%='shq'
+
+# %stats / %s -> shq stats
+alias %stats='shq stats'
+alias %s='shq stats'
 
 [[ -z "$__shq_quiet" ]] && echo "shq loaded (inactive). Use shq-on to enable hooks."
 "#;
@@ -3081,7 +3148,7 @@ shq-off() {
     PROMPT_COMMAND="${PROMPT_COMMAND//__shq_prompt_command/}"
     PROMPT_COMMAND="${PROMPT_COMMAND#; }"; PROMPT_COMMAND="${PROMPT_COMMAND#;}"
     unset __shq_cmd __shq_start_ms __shq_session_id __shq_loaded PS0
-    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %% 2>/dev/null
+    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %stats %s %% 2>/dev/null
     [[ -z "$__shq_quiet" ]] && echo "shq disabled (use shq-on to re-enable)"
     unset __shq_quiet
 }
@@ -3109,6 +3176,10 @@ alias %I='shq info'
 alias %events='shq events'
 alias %e='shq events'
 alias %%='shq'
+
+# %stats / %s -> shq stats
+alias %stats='shq stats'
+alias %s='shq stats'
 
 fi
 "#;

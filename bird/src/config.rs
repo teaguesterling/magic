@@ -252,6 +252,40 @@ fn default_blob_sync_min() -> usize {
     1024 // 1KB
 }
 
+/// Shell hook configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HooksConfig {
+    /// Command patterns to ignore (not record).
+    /// Uses glob-style matching. Defaults include shq/blq commands and job control.
+    #[serde(default = "default_ignore_patterns")]
+    pub ignore_patterns: Vec<String>,
+}
+
+fn default_ignore_patterns() -> Vec<String> {
+    vec![
+        // shq/blq commands (they handle their own recording or are queries)
+        "shq *".to_string(),
+        "shqr *".to_string(),
+        "blq *".to_string(),
+        // % aliases (expand to shq commands)
+        "%*".to_string(),
+        // Job control (noise, can cause issues)
+        "fg".to_string(),
+        "fg *".to_string(),
+        "bg".to_string(),
+        "bg *".to_string(),
+        "jobs".to_string(),
+        "jobs *".to_string(),
+        // Shell session commands
+        "exit".to_string(),
+        "logout".to_string(),
+        // Utility commands (noise)
+        "clear".to_string(),
+        "history".to_string(),
+        "history *".to_string(),
+    ]
+}
+
 /// BIRD configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -287,6 +321,10 @@ pub struct Config {
     /// Sync configuration for push/pull operations.
     #[serde(default)]
     pub sync: SyncConfig,
+
+    /// Shell hook configuration.
+    #[serde(default)]
+    pub hooks: HooksConfig,
 }
 
 fn default_client_id() -> String {
@@ -320,6 +358,7 @@ impl Config {
             storage_mode: StorageMode::default(),
             remotes: Vec::new(),
             sync: SyncConfig::default(),
+            hooks: HooksConfig::default(),
         }
     }
 
@@ -334,6 +373,7 @@ impl Config {
             storage_mode: StorageMode::DuckDB,
             remotes: Vec::new(),
             sync: SyncConfig::default(),
+            hooks: HooksConfig::default(),
         }
     }
 
