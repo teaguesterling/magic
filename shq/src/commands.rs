@@ -2227,6 +2227,9 @@ shq-off() {
 }
 
 shq-on() {
+    # Restore original PS1 before loading new hook (avoid stacking indicators)
+    [[ -n "$__shq_orig_ps1" ]] && PS1="$__shq_orig_ps1"
+    unset __shq_orig_ps1 SHQ_INDICATOR
     eval "$(shq hook init --shell zsh)"
 }
 
@@ -3007,6 +3010,9 @@ shq-off() {
 }
 
 shq-on() {
+    # Restore original PS1 before loading new hook (avoid stacking indicators)
+    [[ -n "$__shq_orig_ps1" ]] && PS1="$__shq_orig_ps1"
+    unset __shq_orig_ps1 SHQ_INDICATOR
     eval "$(shq hook init --shell bash)"
 }
 
