@@ -90,12 +90,12 @@ fn create_directories(config: &Config) -> Result<()> {
 fn init_database(config: &Config) -> Result<()> {
     let conn = duckdb::Connection::open(&config.db_path())?;
 
-    // Load bundled extensions
-    conn.execute("LOAD parquet", [])?;
-    conn.execute("LOAD icu", [])?;
+    // Enable community extensions
+    conn.execute("SET allow_community_extensions = true", [])?;
 
-    // Verify community extensions can be loaded (downloads to ~/.duckdb cache if needed)
-    verify_extensions(&conn)?;
+    // Install and load required extensions
+    // This pre-installs to the default location so connect() is fast
+    install_extensions(&conn)?;
 
     // Set file search path so views use relative paths
     let data_dir = config.data_dir();
@@ -510,19 +510,58 @@ fn create_cwd_views(conn: &duckdb::Connection) -> Result<()> {
     Ok(())
 }
 
-/// Verify extensions can be loaded (post-init sanity check).
-/// Does NOT install - just verifies the setup is correct.
-fn verify_extensions(conn: &duckdb::Connection) -> Result<()> {
-    conn.execute("SET allow_community_extensions = true", [])?;
+/// Ensure a DuckDB extension is loaded, installing if necessary.
+///
+/// Attempts in order:
+/// 1. LOAD (extension might already be available)
+/// 2. INSTALL from default repository, then LOAD
+/// 3. INSTALL FROM community, then LOAD
+fn ensure_extension(conn: &duckdb::Connection, name: &str) -> Result<bool> {
+    // Try loading directly first (already installed/cached)
+    if conn.execute(&format!("LOAD {}", name), []).is_ok() {
+        return Ok(true);
+    }
 
-    // Try to load extensions - they should be in ~/.duckdb cache or already installed
-    for name in &["scalarfs", "duck_hunt"] {
-        if conn.execute(&format!("LOAD {}", name), []).is_err() {
-            // Not cached - install from community (one-time download)
-            conn.execute(&format!("INSTALL {} FROM community", name), [])?;
-            conn.execute(&format!("LOAD {}", name), [])?;
+    // Try installing from default repository
+    if conn.execute(&format!("INSTALL {}", name), []).is_ok() {
+        if conn.execute(&format!("LOAD {}", name), []).is_ok() {
+            return Ok(true);
         }
     }
+
+    // Try installing from community repository
+    if conn.execute(&format!("INSTALL {} FROM community", name), []).is_ok() {
+        if conn.execute(&format!("LOAD {}", name), []).is_ok() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Install and load all required extensions during initialization.
+/// This pre-populates the extension cache so connect() is fast.
+fn install_extensions(conn: &duckdb::Connection) -> Result<()> {
+    // Required extensions - fail if not available
+    for name in ["parquet", "icu"] {
+        if !ensure_extension(conn, name)? {
+            return Err(Error::Config(format!(
+                "Required extension '{}' could not be installed",
+                name
+            )));
+        }
+    }
+
+    // Optional community extensions - warn if not available
+    for (name, desc) in [
+        ("scalarfs", "data: URL support for inline blobs"),
+        ("duck_hunt", "log/output parsing for event extraction"),
+    ] {
+        if !ensure_extension(conn, name)? {
+            eprintln!("Warning: {} extension not available ({})", name, desc);
+        }
+    }
+
     Ok(())
 }
 

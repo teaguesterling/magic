@@ -510,15 +510,25 @@ fn strip_ansi_escapes(input: &[u8]) -> Vec<u8> {
     output
 }
 
-pub fn init(mode: &str) -> bird::Result<()> {
+pub fn init(mode: &str, force: bool) -> bird::Result<()> {
     // Parse storage mode
     let storage_mode: StorageMode = mode.parse()?;
 
     let mut config = Config::default_location()?;
 
     if init::is_initialized(&config) {
-        println!("BIRD already initialized at {}", config.bird_root.display());
-        return Ok(());
+        if force {
+            // Delete existing database directory
+            let db_dir = config.bird_root.join("db");
+            if db_dir.exists() {
+                std::fs::remove_dir_all(&db_dir)?;
+                println!("Removed existing database at {}", db_dir.display());
+            }
+        } else {
+            println!("BIRD already initialized at {}", config.bird_root.display());
+            println!("Use --force to re-initialize (this will delete all data)");
+            return Ok(());
+        }
     }
 
     // Set storage mode before initialization
@@ -1057,9 +1067,6 @@ pub fn stats(format: &str) -> bird::Result<()> {
             println!("{}", serde_json::to_string_pretty(&stats).unwrap());
         }
         _ => {
-            println!("BIRD Statistics");
-            println!("===============");
-            println!();
             println!("Root:         {}", stats.root);
             println!("Client ID:    {}", stats.client_id);
             println!("Storage mode: {}", stats.storage_mode);
@@ -1294,7 +1301,7 @@ fn format_reduction(before: u64, after: u64) -> String {
 }
 
 /// Output shell integration code.
-pub fn hook_init(shell: Option<&str>) -> bird::Result<()> {
+pub fn hook_init(shell: Option<&str>, inactive: bool, prompt_indicator: bool, quiet: bool) -> bird::Result<()> {
     // Auto-detect shell from $SHELL if not specified
     let shell_type = shell
         .map(|s| s.to_string())
@@ -1310,9 +1317,19 @@ pub fn hook_init(shell: Option<&str>) -> bird::Result<()> {
         })
         .unwrap_or("unknown");
 
-    match shell_type {
-        "zsh" => print!("{}", ZSH_HOOK),
-        "bash" => print!("{}", BASH_HOOK),
+    // Output quiet mode variable if requested
+    if quiet {
+        println!("__shq_quiet=1");
+    }
+
+    // Select appropriate hook based on shell, inactive mode, and prompt indicator
+    match (shell_type, inactive, prompt_indicator) {
+        ("zsh", true, _) => print!("{}", ZSH_HOOK_INACTIVE),
+        ("zsh", false, true) => print!("{}", ZSH_HOOK),
+        ("zsh", false, false) => print!("{}", ZSH_HOOK_NO_INDICATOR),
+        ("bash", true, _) => print!("{}", BASH_HOOK_INACTIVE),
+        ("bash", false, true) => print!("{}", BASH_HOOK),
+        ("bash", false, false) => print!("{}", BASH_HOOK_NO_INDICATOR),
         _ => {
             eprintln!("Unknown shell type. Use --shell zsh or --shell bash");
             std::process::exit(1);
@@ -2134,10 +2151,31 @@ shqr() {
     return $exit_code
 }
 
+# --- On/Off functions ---
+shq-off() {
+    add-zsh-hook -d preexec __shq_preexec
+    add-zsh-hook -d precmd __shq_precmd
+    unset __shq_cmd __shq_start_time __shq_session_id
+    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %% 2>/dev/null
+    [[ -n "$__shq_orig_ps1" ]] && PS1="$__shq_orig_ps1"
+    unset __shq_orig_ps1 SHQ_INDICATOR
+    [[ -z "$__shq_quiet" ]] && echo "shq disabled (use shq-on to re-enable)"
+    unset __shq_quiet
+}
+
+shq-on() {
+    eval "$(shq hook init --shell zsh)"
+}
+
 # Register hooks
 autoload -Uz add-zsh-hook
 add-zsh-hook preexec __shq_preexec
 add-zsh-hook precmd __shq_precmd
+
+# --- Prompt indicator ---
+__shq_orig_ps1="$PS1"
+export SHQ_INDICATOR="%F{242}●%f "
+PS1="${SHQ_INDICATOR}${PS1}"
 
 # --- Convenience aliases ---
 # % <command> -> shq run <command>
@@ -2171,6 +2209,100 @@ alias %e='shq events'
 # %% -> shq (general)
 alias %%='shq'
 "#;
+
+const ZSH_HOOK_INACTIVE: &str = r#"# shq shell integration for zsh (inactive mode)
+# Hooks are not enabled by default - use shq-on to activate
+
+# --- On/Off functions ---
+shq-off() {
+    add-zsh-hook -d preexec __shq_preexec
+    add-zsh-hook -d precmd __shq_precmd
+    unset __shq_cmd __shq_start_time __shq_session_id
+    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %% 2>/dev/null
+    # Restore prompt
+    [[ -n "$__shq_orig_ps1" ]] && PS1="$__shq_orig_ps1"
+    unset __shq_orig_ps1 SHQ_INDICATOR
+    [[ -z "$__shq_quiet" ]] && echo "shq disabled"
+    unset __shq_quiet
+}
+
+shq-on() {
+    eval "$(shq hook init --shell zsh)"
+}
+
+# --- Prompt indicator (pause = inactive) ---
+__shq_orig_ps1="$PS1"
+export SHQ_INDICATOR="%F{242}⏸%f "
+PS1="${SHQ_INDICATOR}${PS1}"
+
+# --- Convenience aliases (always available) ---
+alias %='shq run'
+alias %run='shq run'
+alias %r='shq run'
+alias %rerun='shq rerun'
+alias %R='shq rerun'
+alias %history='shq history'
+alias %h='shq history'
+alias %i='shq history'
+alias %output='shq output'
+alias %o='shq output'
+alias %info='shq info'
+alias %I='shq info'
+alias %events='shq events'
+alias %e='shq events'
+alias %%='shq'
+
+[[ -z "$__shq_quiet" ]] && echo "shq loaded (inactive). Use shq-on to enable hooks."
+"#;
+
+// ZSH hook without prompt indicator - same as ZSH_HOOK but without PS1 modification
+const ZSH_HOOK_NO_INDICATOR: &str = concat!(
+    r#"# shq shell integration for zsh (no prompt indicator)
+# Add to ~/.zshrc: eval "$(shq hook init --no-prompt-indicator)"
+
+__shq_session_id="zsh-$$"
+typeset -g __shq_cmd=""
+typeset -g __shq_start_time=""
+
+__shq_preexec() { __shq_cmd="$1"; __shq_start_time=$EPOCHREALTIME; }
+
+__shq_precmd() {
+    local exit_code=$?
+    [[ -z "$__shq_cmd" ]] && return
+    local cmd="$__shq_cmd"
+    __shq_cmd=""
+    local duration=0
+    if [[ -n "$__shq_start_time" ]]; then
+        duration=$(( (EPOCHREALTIME - __shq_start_time) * 1000 ))
+        duration=${duration%.*}
+    fi
+    ( shq save -c "$cmd" -x "$exit_code" -d "$duration" --session-id "$__shq_session_id" --invoker-pid $$ --invoker zsh --extract --compact -q < /dev/null 2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log" ) &!
+}
+
+shq-off() {
+    add-zsh-hook -d preexec __shq_preexec
+    add-zsh-hook -d precmd __shq_precmd
+    unset __shq_cmd __shq_start_time __shq_session_id
+    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %% 2>/dev/null
+    [[ -z "$__shq_quiet" ]] && echo "shq disabled (use shq-on to re-enable)"
+    unset __shq_quiet
+}
+
+shq-on() { eval "$(shq hook init --shell zsh --no-prompt-indicator)"; }
+
+autoload -Uz add-zsh-hook
+add-zsh-hook preexec __shq_preexec
+add-zsh-hook precmd __shq_precmd
+
+alias %='shq run' %run='shq run' %r='shq run'
+alias %rerun='shq rerun' %R='shq rerun'
+alias %history='shq history' %h='shq history' %i='shq history'
+alias %output='shq output' %o='shq output'
+alias %info='shq info' %I='shq info'
+alias %events='shq events' %e='shq events'
+alias %%='shq'
+"#
+);
 
 // Format hints management
 
@@ -2782,6 +2914,32 @@ shqr() {
     return $exit_code
 }
 
+# --- On/Off functions ---
+shq-off() {
+    # Remove our function from PROMPT_COMMAND (handle various formats)
+    PROMPT_COMMAND="${PROMPT_COMMAND//__shq_prompt_command; /}"
+    PROMPT_COMMAND="${PROMPT_COMMAND//__shq_prompt_command;/}"
+    PROMPT_COMMAND="${PROMPT_COMMAND//__shq_prompt_command/}"
+    # Clean up leading/trailing semicolons and spaces
+    PROMPT_COMMAND="${PROMPT_COMMAND#; }"
+    PROMPT_COMMAND="${PROMPT_COMMAND#;}"
+    PROMPT_COMMAND="${PROMPT_COMMAND%; }"
+    PROMPT_COMMAND="${PROMPT_COMMAND%;}"
+    unset __shq_cmd __shq_start_ms __shq_session_id __shq_loaded
+    unset PS0
+    # Remove convenience aliases
+    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %% 2>/dev/null
+    # Restore prompt
+    [[ -n "$__shq_orig_ps1" ]] && PS1="$__shq_orig_ps1"
+    unset __shq_orig_ps1 SHQ_INDICATOR
+    [[ -z "$__shq_quiet" ]] && echo "shq disabled (use shq-on to re-enable)"
+    unset __shq_quiet
+}
+
+shq-on() {
+    eval "$(shq hook init --shell bash)"
+}
+
 # --- Register ---
 # Prepend to PROMPT_COMMAND so we capture exit code before other hooks modify it
 if [[ -z "$PROMPT_COMMAND" ]]; then
@@ -2789,6 +2947,11 @@ if [[ -z "$PROMPT_COMMAND" ]]; then
 else
     PROMPT_COMMAND="__shq_prompt_command; $PROMPT_COMMAND"
 fi
+
+# --- Prompt indicator ---
+__shq_orig_ps1="$PS1"
+export SHQ_INDICATOR='\[\033[90m\]●\[\033[0m\] '
+PS1="${SHQ_INDICATOR}${PS1}"
 
 # --- Convenience aliases ---
 # % <command> -> shq run <command>
@@ -2823,4 +2986,123 @@ alias %e='shq events'
 alias %%='shq'
 
 fi  # End of guard/version check else block
+"#;
+
+const BASH_HOOK_INACTIVE: &str = r#"# shq shell integration for bash (inactive mode)
+# Hooks are not enabled by default - use shq-on to activate
+
+# --- On/Off functions ---
+shq-off() {
+    PROMPT_COMMAND="${PROMPT_COMMAND//__shq_prompt_command; /}"
+    PROMPT_COMMAND="${PROMPT_COMMAND//__shq_prompt_command;/}"
+    PROMPT_COMMAND="${PROMPT_COMMAND//__shq_prompt_command/}"
+    PROMPT_COMMAND="${PROMPT_COMMAND#; }"; PROMPT_COMMAND="${PROMPT_COMMAND#;}"
+    unset __shq_cmd __shq_start_ms __shq_session_id __shq_loaded PS0
+    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %% 2>/dev/null
+    # Restore prompt
+    [[ -n "$__shq_orig_ps1" ]] && PS1="$__shq_orig_ps1"
+    unset __shq_orig_ps1 SHQ_INDICATOR
+    [[ -z "$__shq_quiet" ]] && echo "shq disabled"
+    unset __shq_quiet
+}
+
+shq-on() {
+    eval "$(shq hook init --shell bash)"
+}
+
+# --- Prompt indicator (pause = inactive) ---
+__shq_orig_ps1="$PS1"
+export SHQ_INDICATOR='\[\033[90m\]⏸\[\033[0m\] '
+PS1="${SHQ_INDICATOR}${PS1}"
+
+# --- Convenience aliases (always available) ---
+alias %='shq run'
+alias %run='shq run'
+alias %r='shq run'
+alias %rerun='shq rerun'
+alias %R='shq rerun'
+alias %history='shq history'
+alias %h='shq history'
+alias %i='shq history'
+alias %output='shq output'
+alias %o='shq output'
+alias %info='shq info'
+alias %I='shq info'
+alias %events='shq events'
+alias %e='shq events'
+alias %%='shq'
+
+[[ -z "$__shq_quiet" ]] && echo "shq loaded (inactive). Use shq-on to enable hooks."
+"#;
+
+// BASH hook without prompt indicator
+const BASH_HOOK_NO_INDICATOR: &str = r#"# shq shell integration for bash (no prompt indicator)
+# Requires bash 4.4+. Add to ~/.bashrc: eval "$(shq hook init --shell bash --no-prompt-indicator)"
+
+if [[ -n "$__shq_loaded" && "$__shq_loaded" == "1" ]]; then
+    : # Already loaded
+else
+__shq_loaded=1
+__shq_session_id="bash-$$"
+
+__shq_now_ms() {
+    if [[ -n "$EPOCHREALTIME" ]]; then
+        local sec=${EPOCHREALTIME%.*}
+        local frac=${EPOCHREALTIME#*.}
+        echo $(( sec * 1000 + 10#${frac:0:3} ))
+    else
+        echo $(( $(date +%s) * 1000 ))
+    fi
+}
+
+__shq_prompt_command() {
+    local exit_code=$?
+    [[ -z "$__shq_cmd" ]] && return
+    local cmd="$__shq_cmd"
+    __shq_cmd=""
+    local now_ms=$(__shq_now_ms)
+    local duration=$(( now_ms - __shq_start_ms ))
+    (( duration < 0 )) && duration=0
+    ( shq save -c "$cmd" -x "$exit_code" -d "$duration" --session-id "$__shq_session_id" --invoker-pid $$ --invoker bash -q < /dev/null 2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log" ) &
+    disown 2>/dev/null
+}
+
+PS0='${__shq_cmd:+$(__shq_start_ms=$(__shq_now_ms))}${__shq_cmd=$(HISTTIMEFORMAT= history 1 | sed "s/^[ ]*[0-9]*[ ]*//")}'
+
+shq-off() {
+    PROMPT_COMMAND="${PROMPT_COMMAND//__shq_prompt_command; /}"
+    PROMPT_COMMAND="${PROMPT_COMMAND//__shq_prompt_command;/}"
+    PROMPT_COMMAND="${PROMPT_COMMAND//__shq_prompt_command/}"
+    PROMPT_COMMAND="${PROMPT_COMMAND#; }"; PROMPT_COMMAND="${PROMPT_COMMAND#;}"
+    unset __shq_cmd __shq_start_ms __shq_session_id __shq_loaded PS0
+    unalias % %run %r %rerun %R %history %h %i %output %o %info %I %events %e %% 2>/dev/null
+    [[ -z "$__shq_quiet" ]] && echo "shq disabled (use shq-on to re-enable)"
+    unset __shq_quiet
+}
+
+shq-on() { eval "$(shq hook init --shell bash --no-prompt-indicator)"; }
+
+if [[ -z "$PROMPT_COMMAND" ]]; then
+    PROMPT_COMMAND="__shq_prompt_command"
+else
+    PROMPT_COMMAND="__shq_prompt_command; $PROMPT_COMMAND"
+fi
+
+alias %='shq run'
+alias %run='shq run'
+alias %r='shq run'
+alias %rerun='shq rerun'
+alias %R='shq rerun'
+alias %history='shq history'
+alias %h='shq history'
+alias %i='shq history'
+alias %output='shq output'
+alias %o='shq output'
+alias %info='shq info'
+alias %I='shq info'
+alias %events='shq events'
+alias %e='shq events'
+alias %%='shq'
+
+fi
 "#;

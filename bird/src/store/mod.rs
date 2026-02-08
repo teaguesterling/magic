@@ -219,6 +219,37 @@ impl ConnectionOptions {
     }
 }
 
+/// Ensure a DuckDB extension is loaded, installing if necessary.
+///
+/// Attempts in order:
+/// 1. LOAD (extension might already be available)
+/// 2. INSTALL from default repository, then LOAD
+/// 3. INSTALL FROM community, then LOAD
+///
+/// Returns Ok(true) if loaded successfully, Ok(false) if extension unavailable.
+fn ensure_extension(conn: &Connection, name: &str) -> Result<bool> {
+    // Try loading directly first (already installed/cached)
+    if conn.execute(&format!("LOAD {}", name), []).is_ok() {
+        return Ok(true);
+    }
+
+    // Try installing from default repository
+    if conn.execute(&format!("INSTALL {}", name), []).is_ok() {
+        if conn.execute(&format!("LOAD {}", name), []).is_ok() {
+            return Ok(true);
+        }
+    }
+
+    // Try installing from community repository
+    if conn.execute(&format!("INSTALL {} FROM community", name), []).is_ok() {
+        if conn.execute(&format!("LOAD {}", name), []).is_ok() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 /// A BIRD store for reading and writing records.
 pub struct Store {
     config: Config,
@@ -306,41 +337,27 @@ impl Store {
     pub fn connect(&self, opts: ConnectionOptions) -> Result<Connection> {
         let conn = self.open_connection_with_retry()?;
 
-        // ===== Set extension directory to BIRD_ROOT/db/extensions =====
-        let ext_dir = self.config.extensions_dir();
-        std::fs::create_dir_all(&ext_dir)?;
-        conn.execute(
-            &format!("SET extension_directory = '{}'", ext_dir.display()),
-            [],
-        )?;
+        // ===== Load required extensions =====
+        // Uses default extension directory (typically ~/.duckdb/extensions)
+        // Falls back to community repository if not in default
+        conn.execute("SET allow_community_extensions = true", [])?;
 
-        // ===== Load required extensions (install if missing) =====
         for ext in ["parquet", "icu"] {
-            if conn.execute(&format!("LOAD {}", ext), []).is_err() {
-                conn.execute(&format!("INSTALL {}", ext), [])?;
-                conn.execute(&format!("LOAD {}", ext), [])?;
+            if !ensure_extension(&conn, ext)? {
+                return Err(Error::Extension(format!(
+                    "Required extension '{}' could not be loaded",
+                    ext
+                )));
             }
         }
 
-        conn.execute("SET allow_community_extensions = true", [])?;
-
-        // Optional community extensions - install and load, warn if missing
+        // Optional community extensions - warn if missing
         for (ext, desc) in [
             ("scalarfs", "data: URL support for inline blobs"),
             ("duck_hunt", "log/output parsing for event extraction"),
         ] {
-            if conn.execute(&format!("LOAD {}", ext), []).is_err() {
-                // Try to install from community
-                if let Err(e) = conn.execute(&format!("INSTALL {} FROM community", ext), []) {
-                    eprintln!("Warning: {} extension not available ({}): {}", ext, desc, e);
-                    continue;
-                }
-                if let Err(e) = conn.execute(&format!("LOAD {}", ext), []) {
-                    eprintln!(
-                        "Warning: {} extension not available ({}): {}",
-                        ext, desc, e
-                    );
-                }
+            if !ensure_extension(&conn, ext)? {
+                eprintln!("Warning: {} extension not available ({})", ext, desc);
             }
         }
 
@@ -1542,5 +1559,64 @@ mod tests {
         let result = store.write_batch(&batch);
 
         assert!(result.is_err());
+    }
+
+    // Extension loading tests
+
+    #[test]
+    fn test_ensure_extension_parquet() {
+        // Parquet is an official extension, should always be available
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let result = ensure_extension(&conn, "parquet").unwrap();
+        assert!(result, "parquet extension should be loadable");
+    }
+
+    #[test]
+    fn test_ensure_extension_icu() {
+        // ICU is an official extension, should always be available
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let result = ensure_extension(&conn, "icu").unwrap();
+        assert!(result, "icu extension should be loadable");
+    }
+
+    #[test]
+    fn test_ensure_extension_community() {
+        // Community extensions require allow_community_extensions
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute("SET allow_community_extensions = true", []).unwrap();
+
+        // scalarfs and duck_hunt are community extensions
+        let result = ensure_extension(&conn, "scalarfs").unwrap();
+        assert!(result, "scalarfs extension should be loadable from community");
+
+        let result = ensure_extension(&conn, "duck_hunt").unwrap();
+        assert!(result, "duck_hunt extension should be loadable from community");
+    }
+
+    #[test]
+    fn test_ensure_extension_nonexistent() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute("SET allow_community_extensions = true", []).unwrap();
+
+        // A made-up extension should return false (not error)
+        let result = ensure_extension(&conn, "nonexistent_fake_extension_xyz").unwrap();
+        assert!(!result, "nonexistent extension should return false");
+    }
+
+    #[test]
+    fn test_extension_loading_is_cached() {
+        // Once installed, extensions should load quickly from cache
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+
+        // First load might install
+        ensure_extension(&conn, "parquet").unwrap();
+
+        // Second load should be fast (from cache)
+        let start = std::time::Instant::now();
+        ensure_extension(&conn, "parquet").unwrap();
+        let elapsed = start.elapsed();
+
+        // Should be very fast if cached (< 100ms)
+        assert!(elapsed.as_millis() < 100, "cached extension load took {:?}", elapsed);
     }
 }

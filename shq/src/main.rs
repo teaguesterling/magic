@@ -20,6 +20,10 @@ enum Commands {
         /// Storage mode: duckdb (single-writer, simpler) or parquet (multi-writer, needs compaction)
         #[arg(short = 'm', long = "mode", default_value = "duckdb")]
         mode: String,
+
+        /// Force re-initialization (deletes existing database)
+        #[arg(short = 'f', long = "force")]
+        force: bool,
     },
 
     /// Run a command and capture it to BIRD
@@ -55,6 +59,7 @@ enum Commands {
     },
 
     /// Save output from stdin or file to BIRD
+    #[command(visible_alias = "S")]
     Save {
         /// File to read output from (reads stdin if not provided, unless --stdout/--stderr used)
         file: Option<String>,
@@ -225,6 +230,7 @@ enum Commands {
     QuickHelp,
 
     /// Show statistics
+    #[command(visible_alias = "s")]
     Stats {
         /// Output format: table, json
         #[arg(short = 'f', long = "format", default_value = "table")]
@@ -420,6 +426,18 @@ enum HookAction {
         /// Shell type (zsh, bash). Auto-detected from $SHELL if not specified.
         #[arg(short, long)]
         shell: Option<String>,
+
+        /// Only define shq-on function, don't activate hooks immediately
+        #[arg(long)]
+        inactive: bool,
+
+        /// Disable prompt indicator (green dot when active)
+        #[arg(long)]
+        no_prompt_indicator: bool,
+
+        /// Suppress status messages
+        #[arg(short, long)]
+        quiet: bool,
     },
 }
 
@@ -541,7 +559,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Init { mode } => commands::init(&mode),
+        Commands::Init { mode, force } => commands::init(&mode, force),
         Commands::Run { shell_cmd, tag, extract, no_extract, format, compact, cmd } => {
             // Resolve extract behavior: --extract forces on, --no-extract forces off, otherwise use config
             let extract_override = if extract {
@@ -605,7 +623,7 @@ fn main() {
             commands::compact(file_threshold, recompact_threshold, consolidate, extract_first, session.as_deref(), today_only, quiet, recent_only, archive_only, dry_run)
         }
         Commands::Hook { action } => match action {
-            HookAction::Init { shell } => commands::hook_init(shell.as_deref()),
+            HookAction::Init { shell, inactive, no_prompt_indicator, quiet } => commands::hook_init(shell.as_deref(), inactive, !no_prompt_indicator, quiet),
         },
         Commands::FormatHints { action } => match action {
             FormatHintsAction::List { filter, user_only, builtin_only } => {

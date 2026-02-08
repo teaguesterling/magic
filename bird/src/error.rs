@@ -27,6 +27,9 @@ pub enum Error {
 
     #[error("Not found: {0}")]
     NotFound(String),
+
+    #[error("Extension error: {0}")]
+    Extension(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
