@@ -1328,6 +1328,7 @@ pub fn events(
     limit: usize,
     order: LimitOrder,
     reparse: bool,
+    extract: bool,
     format: Option<&str>,
 ) -> bird::Result<()> {
     let config = Config::load()?;
@@ -1362,6 +1363,19 @@ pub fn events(
     if invocations.is_empty() {
         println!("No invocations found.");
         return Ok(());
+    }
+
+    // Extract events if requested and not already extracted
+    if extract {
+        for inv in &invocations {
+            let existing = store.event_count(&EventFilters {
+                invocation_id: Some(inv.id.clone()),
+                ..Default::default()
+            })?;
+            if existing == 0 {
+                let _ = store.extract_events(&inv.id, format);
+            }
+        }
     }
 
     // Build filters
@@ -1565,6 +1579,7 @@ fn truncate_cmd(cmd: &str, max_len: usize) -> String {
 
 /// Resolve a selector (negative offset or UUID) to an invocation ID.
 fn resolve_invocation_id(store: &Store, selector: &str) -> bird::Result<String> {
+    // Handle negative offset (e.g., -1 for last, -2 for second-to-last)
     if let Ok(offset) = selector.parse::<i64>() {
         if offset < 0 {
             let n = (-offset) as usize;
@@ -1579,7 +1594,13 @@ fn resolve_invocation_id(store: &Store, selector: &str) -> bird::Result<String> 
             }
         }
     }
-    // Assume it's a UUID
+
+    // Try short ID lookup
+    if let Some(id) = try_find_by_id(store, selector)? {
+        return Ok(id);
+    }
+
+    // Assume it's a full UUID
     Ok(selector.to_string())
 }
 

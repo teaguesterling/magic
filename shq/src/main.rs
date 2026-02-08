@@ -353,6 +353,10 @@ enum Commands {
         #[arg(long = "reparse")]
         reparse: bool,
 
+        /// Extract events if not already extracted
+        #[arg(short = 'x', long = "extract")]
+        extract: bool,
+
         /// Override format detection (e.g., gcc, pytest, cargo)
         #[arg(short = 'f', long = "format")]
         format: Option<String>,
@@ -623,10 +627,10 @@ fn main() {
         Commands::Pull { remote, client, since } => {
             commands::pull(remote.as_deref(), client.as_deref(), since.as_deref())
         },
-        Commands::Events { query, severity, count_only, lines, reparse, format } => {
+        Commands::Events { query, severity, count_only, lines, reparse, extract, format } => {
             // Parse lines: N (any), +N (first N), -N (last N)
             let (limit, order) = parse_lines_arg(&lines);
-            commands::events(&query, severity.as_deref(), count_only, limit, order, reparse, format.as_deref())
+            commands::events(&query, severity.as_deref(), count_only, limit, order, reparse, extract, format.as_deref())
         }
         Commands::UpdateExtensions { dry_run } => commands::update_extensions(dry_run),
         Commands::ExtractEvents { selector, format, quiet, force, all, since, limit, dry_run } => {
