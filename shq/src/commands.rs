@@ -85,7 +85,7 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
     let invocation_id = uuid::Uuid::now_v7();
 
     // Allocate PTY
-    let (mut pty, pts) = pty_open().map_err(|e| bird::Error::Io(io::Error::new(io::ErrorKind::Other, e)))?;
+    let (mut pty, pts) = pty_open().map_err(|e| bird::Error::Io(io::Error::other(e)))?;
 
     // Try to match terminal size
     if let Ok(size) = terminal_size() {
@@ -107,7 +107,7 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
     // Spawn process in PTY - it becomes session leader with PTY as controlling terminal
     let start = Instant::now();
     let mut child = cmd.spawn(pts)
-        .map_err(|e| bird::Error::Io(io::Error::new(io::ErrorKind::Other, e)))?;
+        .map_err(|e| bird::Error::Io(io::Error::other(e)))?;
 
     // Set up raw mode for stdin if it's a terminal
     let orig_termios = if stdin_is_tty {
@@ -213,7 +213,7 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
     }
 
     // Wait for child to fully exit and get status
-    let status = child.wait().map_err(|e| bird::Error::Io(io::Error::new(io::ErrorKind::Other, e)))?;
+    let status = child.wait().map_err(|e| bird::Error::Io(io::Error::other(e)))?;
     let duration_ms = start.elapsed().as_millis() as i64;
     let exit_code = status.code().unwrap_or(-1);
 
@@ -230,7 +230,7 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
     let session = SessionRecord::new(
         &sid,
         &config.client_id,
-        &invoker_name(),
+        invoker_name(),
         invoker_pid(),
         "shell",
     );
@@ -399,9 +399,9 @@ pub fn save(
     };
 
     // Check for nosave marker - command opted out of recording
-    let has_nosave = stdout_content.as_ref().map_or(false, |c| contains_nosave_marker(c))
-        || stderr_content.as_ref().map_or(false, |c| contains_nosave_marker(c))
-        || single_content.as_ref().map_or(false, |c| contains_nosave_marker(c));
+    let has_nosave = stdout_content.as_ref().is_some_and(|c| contains_nosave_marker(c))
+        || stderr_content.as_ref().is_some_and(|c| contains_nosave_marker(c))
+        || single_content.as_ref().is_some_and(|c| contains_nosave_marker(c));
 
     if has_nosave {
         return Ok(());
@@ -777,7 +777,7 @@ pub fn invocations(query_str: &str, format: &str) -> bird::Result<()> {
         }
         "table" => {
             // Detailed table output
-            println!("{:<20} {:<6} {:<10} {:<4} {}", "TIMESTAMP", "EXIT", "DURATION", "OUT", "COMMAND");
+            println!("{:<20} {:<6} {:<10} {:<4} COMMAND", "TIMESTAMP", "EXIT", "DURATION", "OUT");
             println!("{}", "-".repeat(80));
 
             for inv in invocations {
@@ -1557,6 +1557,7 @@ pub enum LimitOrder {
 }
 
 /// Query parsed events from invocation outputs.
+#[allow(clippy::too_many_arguments)]
 pub fn events(
     query_str: &str,
     severity: Option<&str>,
@@ -1642,8 +1643,8 @@ pub fn events(
 
     // Display events
     println!(
-        "{:<8} {:<40} {:<30} {}",
-        "SEVERITY", "FILE:LINE", "CODE", "MESSAGE"
+        "{:<8} {:<40} {:<30} MESSAGE",
+        "SEVERITY", "FILE:LINE", "CODE"
     );
     println!("{}", "-".repeat(100));
 
@@ -1684,6 +1685,7 @@ pub fn events(
 }
 
 /// Extract events from an invocation's output.
+#[allow(clippy::too_many_arguments)]
 pub fn extract_events(
     selector: &str,
     format: Option<&str>,
@@ -2114,7 +2116,7 @@ pub fn rerun(query_str: &str, dry_run: bool, no_capture: bool) -> bird::Result<(
         let session = SessionRecord::new(
             &sid,
             &config.client_id,
-            &invoker_name(),
+            invoker_name(),
             invoker_pid(),
             "shell",
         );
@@ -2270,7 +2272,7 @@ pub fn format_hints_list(show_builtin: bool, show_user: bool, filter: Option<&st
             }
         } else {
             println!("User-defined format hints:");
-            println!("{:<6} {:<30} {}", "PRI", "PATTERN", "FORMAT");
+            println!("{:<6} {:<30} FORMAT", "PRI", "PATTERN");
             println!("{}", "-".repeat(60));
             for hint in user_hints {
                 println!("{:<6} {:<30} {}", hint.priority, hint.pattern, hint.format);
@@ -2295,7 +2297,7 @@ pub fn format_hints_list(show_builtin: bool, show_user: bool, filter: Option<&st
                     }
                 } else {
                     println!("Available formats (from duck_hunt):");
-                    println!("{:<6} {:<20} {}", "PRI", "FORMAT", "DESCRIPTION");
+                    println!("{:<6} {:<20} DESCRIPTION", "PRI", "FORMAT");
                     println!("{}", "-".repeat(70));
                     for fmt in filtered {
                         // pattern field contains description for builtin formats
@@ -2457,7 +2459,7 @@ pub fn remote_list() -> bird::Result<()> {
         return Ok(());
     }
 
-    println!("{:<12} {:<12} {:<10} {:<8} {}", "NAME", "TYPE", "MODE", "ATTACH", "URI");
+    println!("{:<12} {:<12} {:<10} {:<8} URI", "NAME", "TYPE", "MODE", "ATTACH");
     println!("{}", "-".repeat(70));
 
     for remote in &config.remotes {

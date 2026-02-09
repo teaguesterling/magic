@@ -234,17 +234,17 @@ fn ensure_extension(conn: &Connection, name: &str) -> Result<bool> {
     }
 
     // Try installing from default repository
-    if conn.execute(&format!("INSTALL {}", name), []).is_ok() {
-        if conn.execute(&format!("LOAD {}", name), []).is_ok() {
-            return Ok(true);
-        }
+    if conn.execute(&format!("INSTALL {}", name), []).is_ok()
+        && conn.execute(&format!("LOAD {}", name), []).is_ok()
+    {
+        return Ok(true);
     }
 
     // Try installing from community repository
-    if conn.execute(&format!("INSTALL {} FROM community", name), []).is_ok() {
-        if conn.execute(&format!("LOAD {}", name), []).is_ok() {
-            return Ok(true);
-        }
+    if conn.execute(&format!("INSTALL {} FROM community", name), []).is_ok()
+        && conn.execute(&format!("LOAD {}", name), []).is_ok()
+    {
+        return Ok(true);
     }
 
     Ok(false)
@@ -766,7 +766,7 @@ impl Store {
             let schema = remote.quoted_schema_name();
             let name = &remote.name;
             // Sanitize name for use in macro identifier
-            let safe_name = name.replace('-', "_").replace('.', "_");
+            let safe_name = name.replace(['-', '.'], "_");
 
             for table in &["sessions", "invocations", "outputs", "events"] {
                 let macro_name = format!("\"remote_{safe_name}_{table}\"");
@@ -790,7 +790,7 @@ impl Store {
             let mut union_parts: Vec<String> = remotes
                 .iter()
                 .map(|r| {
-                    let safe_name = r.name.replace('-', "_").replace('.', "_");
+                    let safe_name = r.name.replace(['-', '.'], "_");
                     format!("SELECT * FROM \"remote_{safe_name}_{table}\"()", safe_name = safe_name, table = table)
                 })
                 .collect();
@@ -1180,7 +1180,7 @@ impl Store {
                 }
 
                 let rel_path = blob_path
-                    .strip_prefix(&self.config.data_dir())
+                    .strip_prefix(self.config.data_dir())
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| blob_path.to_string_lossy().to_string());
 

@@ -625,7 +625,7 @@ impl Store {
                 FROM events e
                 JOIN invocations i ON e.invocation_id = i.id
                 {}
-                {} i.cmd LIKE '{}'
+                i.cmd LIKE '%{}%'
                 ORDER BY i.timestamp DESC
                 {}
                 "#,
@@ -634,7 +634,6 @@ impl Store {
                 } else {
                     &format!("{} AND", where_clause)
                 },
-                if conditions.is_empty() { "" } else { "" },
                 cmd_pattern,
                 limit_clause
             )

@@ -80,7 +80,7 @@ impl Store {
 
                     // Compute relative path for storage_ref
                     let rel_path = blob_path
-                        .strip_prefix(&self.config.data_dir())
+                        .strip_prefix(self.config.data_dir())
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_else(|_| blob_path.to_string_lossy().to_string());
 

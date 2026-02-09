@@ -225,7 +225,7 @@ fn extract_executable(cmd: &str) -> Option<String> {
         if !part.contains('=') {
             // This is the actual command
             // Extract basename if it's a path
-            let exe = part.split('/').last().unwrap_or(part);
+            let exe = part.rsplit('/').next().unwrap_or(part);
             return Some(exe.to_string());
         }
     }

@@ -667,8 +667,8 @@ impl Store {
                 // Consolidate using DuckDB's COPY
                 let conn = self.connection()?;
                 let src_glob = format!("{}/*.parquet", partition_path.display());
-                let dest_file = dest_dir.join(format!("data_0.parquet"));
-                let temp_file = dest_dir.join(format!(".data_0.parquet.tmp"));
+                let dest_file = dest_dir.join("data_0.parquet");
+                let temp_file = dest_dir.join(".data_0.parquet.tmp");
 
                 conn.execute(
                     &format!(

@@ -170,13 +170,13 @@ impl super::Store {
         // Ensure cached schema exists with required tables
         ensure_cached_schema(&conn, &cached_schema, &remote.name)?;
 
-        let mut stats = PullStats::default();
-
         // Pull in dependency order (sessions first, then invocations, outputs, events)
-        stats.sessions = pull_sessions(&conn, &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?;
-        stats.invocations = pull_table(&conn, "invocations", &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?;
-        stats.outputs = pull_table(&conn, "outputs", &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?;
-        stats.events = pull_table(&conn, "events", &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?;
+        let stats = PullStats {
+            sessions: pull_sessions(&conn, &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?,
+            invocations: pull_table(&conn, "invocations", &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?,
+            outputs: pull_table(&conn, "outputs", &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?,
+            events: pull_table(&conn, "events", &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?,
+        };
 
         // Rebuild caches union views to include this cached schema
         self.rebuild_caches_schema(&conn)?;

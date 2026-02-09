@@ -29,6 +29,7 @@ pub struct SourceSelector {
 }
 
 impl Default for SourceSelector {
+    #[inline]
     fn default() -> Self {
         Self {
             host: None,
@@ -337,7 +338,7 @@ fn try_parse_range(input: &str) -> Option<(RangeSelector, &str)> {
 
         // Parse ~N
         let mut end = 1;
-        while end < input.len() && input[end..].chars().next().map_or(false, |c| c.is_ascii_digit()) {
+        while end < input.len() && input[end..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
             end += 1;
         }
 
@@ -347,19 +348,14 @@ fn try_parse_range(input: &str) -> Option<(RangeSelector, &str)> {
         if input[end..].starts_with(':') {
             let after_colon = &input[end + 1..];
             // Skip optional ~
-            let (range_rest, skip) = if after_colon.starts_with('~') {
-                (&after_colon[1..], 0)
-            } else {
-                (after_colon, 0)
-            };
-            let _ = skip; // suppress warning
+            let range_rest = after_colon.strip_prefix('~').unwrap_or(after_colon);
 
             let mut range_end = 0;
             while range_end < range_rest.len()
                 && range_rest[range_end..]
                     .chars()
                     .next()
-                    .map_or(false, |c| c.is_ascii_digit())
+                    .is_some_and(|c| c.is_ascii_digit())
             {
                 range_end += 1;
             }
@@ -387,7 +383,7 @@ fn try_parse_range(input: &str) -> Option<(RangeSelector, &str)> {
     let first = input.chars().next()?;
     if first.is_ascii_digit() {
         let mut end = 0;
-        while end < input.len() && input[end..].chars().next().map_or(false, |c| c.is_ascii_digit()) {
+        while end < input.len() && input[end..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
             end += 1;
         }
 
@@ -412,11 +408,11 @@ fn try_parse_filter(input: &str) -> Option<(QueryComponent, &str)> {
     let after_percent = &input[1..];
 
     // Command regex: %/pattern/
-    if after_percent.starts_with('/') {
+    if let Some(after_slash) = after_percent.strip_prefix('/') {
         // Find closing /
-        if let Some(end) = after_percent[1..].find('/') {
-            let pattern = &after_percent[1..end + 1];
-            let rest = &after_percent[end + 2..];
+        if let Some(end) = after_slash.find('/') {
+            let pattern = &after_slash[..end];
+            let rest = &after_slash[end + 1..];
             return Some((QueryComponent::CommandRegex(pattern.to_string()), rest));
         }
     }
@@ -469,16 +465,14 @@ fn try_parse_field_filter(input: &str) -> Option<(FieldFilter, &str)> {
     let fields = ["cmd", "exit", "cwd", "duration", "host", "type", "client", "session"];
 
     for field in &fields {
-        if input.starts_with(field) {
-            let after_field = &input[field.len()..];
+        if let Some(after_field) = input.strip_prefix(field) {
 
             // Try each operator (order matters: check 2-char ops before 1-char)
             let (op, op_len) = if after_field.starts_with("~=") {
                 (CompareOp::Regex, 2)
-            } else if after_field.starts_with("<>") {
-                (CompareOp::NotEq, 2) // Preferred: no shell escaping needed
-            } else if after_field.starts_with("!=") {
-                (CompareOp::NotEq, 2) // Also supported but needs shell escaping
+            } else if after_field.starts_with("<>") || after_field.starts_with("!=") {
+                // Both <> and != mean not-equal (<> preferred since ! needs shell escaping)
+                (CompareOp::NotEq, 2)
             } else if after_field.starts_with(">=") {
                 (CompareOp::Gte, 2)
             } else if after_field.starts_with("<=") {

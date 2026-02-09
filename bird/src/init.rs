@@ -88,7 +88,7 @@ fn create_directories(config: &Config) -> Result<()> {
 
 /// Initialize the DuckDB database with schema architecture.
 fn init_database(config: &Config) -> Result<()> {
-    let conn = duckdb::Connection::open(&config.db_path())?;
+    let conn = duckdb::Connection::open(config.db_path())?;
 
     // Enable community extensions
     conn.execute("SET allow_community_extensions = true", [])?;
@@ -523,17 +523,17 @@ fn ensure_extension(conn: &duckdb::Connection, name: &str) -> Result<bool> {
     }
 
     // Try installing from default repository
-    if conn.execute(&format!("INSTALL {}", name), []).is_ok() {
-        if conn.execute(&format!("LOAD {}", name), []).is_ok() {
-            return Ok(true);
-        }
+    if conn.execute(&format!("INSTALL {}", name), []).is_ok()
+        && conn.execute(&format!("LOAD {}", name), []).is_ok()
+    {
+        return Ok(true);
     }
 
     // Try installing from community repository
-    if conn.execute(&format!("INSTALL {} FROM community", name), []).is_ok() {
-        if conn.execute(&format!("LOAD {}", name), []).is_ok() {
-            return Ok(true);
-        }
+    if conn.execute(&format!("INSTALL {} FROM community", name), []).is_ok()
+        && conn.execute(&format!("LOAD {}", name), []).is_ok()
+    {
+        return Ok(true);
     }
 
     Ok(false)
