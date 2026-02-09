@@ -734,8 +734,41 @@ impl Store {
     /// Attach configured remotes to the connection.
     /// Note: S3 credentials are already set up by setup_s3_credentials().
     fn attach_remotes(&self, conn: &Connection) -> Result<()> {
-        for remote in self.config.auto_attach_remotes() {
-            // Attach the remote database
+        let remotes = self.config.auto_attach_remotes();
+
+        // Collect all file remote data directories to add to file_search_path
+        let remote_data_dirs: Vec<String> = remotes
+            .iter()
+            .filter_map(|r| r.data_dir())
+            .map(|p| p.display().to_string())
+            .collect();
+
+        // Add remote data directories to file_search_path (for parquet-mode remotes)
+        if !remote_data_dirs.is_empty() {
+            let current_path: String = conn
+                .query_row("SELECT current_setting('file_search_path')", [], |r| r.get(0))
+                .unwrap_or_default();
+
+            let mut paths: Vec<&str> = if current_path.is_empty() {
+                vec![]
+            } else {
+                current_path.split(',').collect()
+            };
+
+            for dir in &remote_data_dirs {
+                if !paths.contains(&dir.as_str()) {
+                    paths.push(dir);
+                }
+            }
+
+            let new_path = paths.join(",");
+            if let Err(e) = conn.execute(&format!("SET file_search_path = '{}'", new_path), []) {
+                eprintln!("Warning: Failed to set file_search_path: {}", e);
+            }
+        }
+
+        // Attach each remote
+        for remote in &remotes {
             let attach_sql = remote.attach_sql();
             if let Err(e) = conn.execute(&attach_sql, []) {
                 eprintln!("Warning: Failed to attach remote {}: {}", remote.name, e);
@@ -753,7 +786,7 @@ impl Store {
     /// - Standalone: tables may be at top level
     ///
     /// Returns the schema prefix to use (e.g., "local." or "").
-    fn detect_remote_table_path(&self, conn: &Connection, remote_schema: &str) -> String {
+    pub(crate) fn detect_remote_table_path(&self, conn: &Connection, remote_schema: &str) -> String {
         // Check if this remote has a `local` schema with tables (BIRD DuckDB mode)
         let check_sql = format!(
             "SELECT 1 FROM information_schema.tables \
@@ -939,6 +972,27 @@ impl Store {
                 );
                 conn.execute(&secret_sql, [])?;
             }
+        }
+
+        // For file remotes, add the remote's data directory to file_search_path
+        // This allows parquet-mode remotes to resolve their relative file paths
+        if let Some(remote_data_dir) = remote.data_dir() {
+            // Get current file_search_path and append the remote's data directory
+            let current_path: String = conn
+                .query_row("SELECT current_setting('file_search_path')", [], |r| r.get(0))
+                .unwrap_or_default();
+
+            let remote_path = remote_data_dir.display().to_string();
+            let new_path = if current_path.is_empty() {
+                remote_path
+            } else if current_path.contains(&remote_path) {
+                // Already in the path
+                current_path
+            } else {
+                format!("{},{}", current_path, remote_path)
+            };
+
+            conn.execute(&format!("SET file_search_path = '{}'", new_path), [])?;
         }
 
         // Attach

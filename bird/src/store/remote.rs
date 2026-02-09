@@ -1519,4 +1519,340 @@ mod tests {
             .unwrap();
         assert_eq!(count, 2, "main should union local + caches");
     }
+
+    // ===== Heterogeneous Storage Mode Tests =====
+    // Test querying across different storage modes (parquet and duckdb)
+
+    fn setup_store_parquet() -> (TempDir, Store) {
+        let tmp = TempDir::new().unwrap();
+        let config = Config::with_root(tmp.path()); // Parquet is the default
+        initialize(&config).unwrap();
+        let store = Store::open(config).unwrap();
+        (tmp, store)
+    }
+
+    #[test]
+    fn test_heterogeneous_parquet_local_duckdb_remote() {
+        // Local store uses parquet mode
+        let (_local_tmp, local_store) = setup_store_parquet();
+
+        // Remote store uses duckdb mode
+        let remote_tmp = TempDir::new().unwrap();
+        let remote_config = Config::with_duckdb_mode(remote_tmp.path());
+        initialize(&remote_config).unwrap();
+        let remote_store = Store::open(remote_config).unwrap();
+
+        // Write data to remote (DuckDB mode - stored in local.invocations table)
+        let remote_inv = InvocationRecord::new(
+            "remote-session",
+            "remote command",
+            "/home/remote",
+            0,
+            "remote@client",
+        );
+        remote_store.write_invocation(&remote_inv).unwrap();
+
+        // Verify remote has data
+        let remote_conn = remote_store.connection().unwrap();
+        let remote_count: i64 = remote_conn
+            .query_row("SELECT COUNT(*) FROM local.invocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remote_count, 1, "Remote should have data in local schema");
+        drop(remote_conn);
+
+        // Write data to local (Parquet mode - stored in parquet files)
+        let local_inv = InvocationRecord::new(
+            "local-session",
+            "local command",
+            "/home/local",
+            0,
+            "local@client",
+        );
+        local_store.write_invocation(&local_inv).unwrap();
+
+        // Configure local to attach the remote (read-only)
+        let remote_db_path = remote_tmp.path().join("db/bird.duckdb");
+        let remote_config = RemoteConfig {
+            name: "duckdb-store".to_string(),
+            remote_type: RemoteType::File,
+            uri: format!("file://{}", remote_db_path.display()),
+            mode: RemoteMode::ReadOnly,
+            auto_attach: true,
+            credential_provider: None,
+        };
+
+        // Manually attach the remote to test heterogeneous querying
+        let conn = local_store.connection_with_options(false).unwrap();
+        local_store.attach_remote(&conn, &remote_config).unwrap();
+
+        // Create remote macros (this tests detect_remote_table_path)
+        // The remote is a DuckDB-mode BIRD database, so tables are in local schema
+        let schema = remote_config.quoted_schema_name();
+        let table_prefix = local_store.detect_remote_table_path(&conn, &schema);
+        assert_eq!(table_prefix, "local.", "Should detect DuckDB mode remote has local. prefix");
+
+        // Query the remote directly
+        let remote_count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {}.local.invocations", schema),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remote_count, 1, "Should be able to query DuckDB remote from Parquet local");
+    }
+
+    #[test]
+    fn test_heterogeneous_duckdb_local_parquet_remote() {
+        // Local store uses duckdb mode
+        let (_local_tmp, local_store) = setup_store_duckdb();
+
+        // Remote store uses parquet mode
+        let remote_tmp = TempDir::new().unwrap();
+        let remote_config = Config::with_root(remote_tmp.path());
+        initialize(&remote_config).unwrap();
+        let remote_store = Store::open(remote_config).unwrap();
+
+        // Write data to remote (Parquet mode - stored in parquet files)
+        let remote_inv = InvocationRecord::new(
+            "remote-session",
+            "remote command",
+            "/home/remote",
+            0,
+            "remote@client",
+        );
+        remote_store.write_invocation(&remote_inv).unwrap();
+
+        // Write data to local (DuckDB mode - stored in local.invocations table)
+        let local_inv = InvocationRecord::new(
+            "local-session",
+            "local command",
+            "/home/local",
+            0,
+            "local@client",
+        );
+        local_store.write_invocation(&local_inv).unwrap();
+
+        // Configure local to attach the remote (read-only)
+        let remote_db_path = remote_tmp.path().join("db/bird.duckdb");
+        let remote_config = RemoteConfig {
+            name: "parquet-store".to_string(),
+            remote_type: RemoteType::File,
+            uri: format!("file://{}", remote_db_path.display()),
+            mode: RemoteMode::ReadOnly,
+            auto_attach: true,
+            credential_provider: None,
+        };
+
+        // Manually attach the remote (this should also set file_search_path)
+        let conn = local_store.connection_with_options(false).unwrap();
+        local_store.attach_remote(&conn, &remote_config).unwrap();
+
+        // Verify detection works - both modes have local.invocations
+        let schema = remote_config.quoted_schema_name();
+        let table_prefix = local_store.detect_remote_table_path(&conn, &schema);
+        assert_eq!(table_prefix, "local.", "BIRD databases have local schema in both modes");
+
+        // Query the remote directly (parquet mode views should resolve via file_search_path)
+        let remote_count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {}.local.invocations", schema),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remote_count, 1, "Should be able to query Parquet remote from DuckDB local");
+    }
+
+    #[test]
+    fn test_heterogeneous_unified_views() {
+        // This tests the full heterogeneous setup with unified views
+        let (local_tmp, local_store) = setup_store_parquet();
+
+        // Create a DuckDB-mode remote
+        let remote_tmp = TempDir::new().unwrap();
+        let remote_config = Config::with_duckdb_mode(remote_tmp.path());
+        initialize(&remote_config).unwrap();
+        let remote_store = Store::open(remote_config).unwrap();
+
+        // Write unique data to remote
+        let remote_inv = InvocationRecord::new(
+            "remote-session",
+            "remote-specific-cmd",
+            "/home/remote",
+            42,
+            "remote@client",
+        );
+        remote_store.write_invocation(&remote_inv).unwrap();
+
+        // Write unique data to local
+        let local_inv = InvocationRecord::new(
+            "local-session",
+            "local-specific-cmd",
+            "/home/local",
+            0,
+            "local@client",
+        );
+        local_store.write_invocation(&local_inv).unwrap();
+
+        // Create config with remote
+        let remote_db_path = remote_tmp.path().join("db/bird.duckdb");
+        let mut config = Config::with_root(local_tmp.path());
+        config.remotes.push(RemoteConfig {
+            name: "heterogeneous-test".to_string(),
+            remote_type: RemoteType::File,
+            uri: format!("file://{}", remote_db_path.display()),
+            mode: RemoteMode::ReadOnly,
+            auto_attach: true,
+            credential_provider: None,
+        });
+
+        // Open store with remote config
+        let store = Store::open(config).unwrap();
+
+        // Connection with auto-attach should set up unified views
+        let conn = store.connection().unwrap();
+
+        // Query local data
+        let local_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local.invocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(local_count, 1, "Local should have 1 record");
+
+        // Query unified view - should include both local and remote
+        let unified_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM unified.invocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unified_count, 2, "Unified view should have local + remote records");
+
+        // Verify we can see both commands
+        let cmds: Vec<String> = conn
+            .prepare("SELECT cmd FROM unified.invocations ORDER BY cmd")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(cmds.len(), 2);
+        assert!(cmds.contains(&"local-specific-cmd".to_string()));
+        assert!(cmds.contains(&"remote-specific-cmd".to_string()));
+    }
+
+    #[test]
+    fn test_detect_remote_table_path_standalone_db() {
+        // Test detection of standalone databases (not BIRD, no local schema)
+        let (_tmp, store) = setup_store_duckdb();
+
+        // Create a standalone database (not a BIRD database)
+        let standalone_tmp = TempDir::new().unwrap();
+        let standalone_db_path = standalone_tmp.path().join("standalone.duckdb");
+        {
+            let conn = duckdb::Connection::open(&standalone_db_path).unwrap();
+            conn.execute(
+                "CREATE TABLE invocations (id UUID, cmd VARCHAR)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO invocations VALUES (gen_random_uuid(), 'test')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Attach as remote
+        let remote = RemoteConfig {
+            name: "standalone".to_string(),
+            remote_type: RemoteType::File,
+            uri: format!("file://{}", standalone_db_path.display()),
+            mode: RemoteMode::ReadOnly,
+            auto_attach: true,
+            credential_provider: None,
+        };
+
+        let conn = store.connection_with_options(false).unwrap();
+        store.attach_remote(&conn, &remote).unwrap();
+
+        // Detect table path (should be empty - no local schema)
+        let schema = remote.quoted_schema_name();
+        let table_prefix = store.detect_remote_table_path(&conn, &schema);
+        assert_eq!(table_prefix, "", "Standalone DB should have no prefix");
+
+        // Query should work
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {}.invocations", schema),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_push_to_readonly_remote_fails() {
+        let (_tmp, store) = setup_store_duckdb();
+
+        // Write local data
+        let inv = InvocationRecord::new(
+            "test-session",
+            "echo hello",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&inv).unwrap();
+
+        // Create a read-only remote
+        let remote_tmp = TempDir::new().unwrap();
+        let remote_path = remote_tmp.path().join("remote.duckdb");
+        let remote = RemoteConfig {
+            name: "readonly".to_string(),
+            remote_type: RemoteType::File,
+            uri: format!("file://{}", remote_path.display()),
+            mode: RemoteMode::ReadOnly,
+            auto_attach: true,
+            credential_provider: None,
+        };
+
+        // Push to read-only should fail
+        let result = store.push(&remote, PushOptions::default());
+        assert!(result.is_err(), "Push to read-only remote should fail");
+        assert!(
+            result.unwrap_err().to_string().contains("Cannot push to read-only"),
+            "Error should mention read-only"
+        );
+    }
+
+    #[test]
+    fn test_push_to_readonly_remote_dry_run_returns_empty() {
+        let (_tmp, store) = setup_store_duckdb();
+
+        // Write local data
+        let inv = InvocationRecord::new(
+            "test-session",
+            "echo hello",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&inv).unwrap();
+
+        // Create a read-only remote
+        let remote_tmp = TempDir::new().unwrap();
+        let remote_path = remote_tmp.path().join("remote.duckdb");
+        let remote = RemoteConfig {
+            name: "readonly".to_string(),
+            remote_type: RemoteType::File,
+            uri: format!("file://{}", remote_path.display()),
+            mode: RemoteMode::ReadOnly,
+            auto_attach: true,
+            credential_provider: None,
+        };
+
+        // Dry run on read-only should return empty stats (nothing to push)
+        let stats = store.push(&remote, PushOptions { dry_run: true, ..Default::default() }).unwrap();
+        assert_eq!(stats.invocations, 0);
+        assert_eq!(stats.sessions, 0);
+    }
 }

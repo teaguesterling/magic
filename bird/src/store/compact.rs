@@ -820,6 +820,14 @@ mod tests {
         (tmp, store)
     }
 
+    fn setup_store_duckdb() -> (TempDir, Store) {
+        let tmp = TempDir::new().unwrap();
+        let config = Config::with_duckdb_mode(tmp.path());
+        initialize(&config).unwrap();
+        let store = Store::open(config).unwrap();
+        (tmp, store)
+    }
+
     #[test]
     fn test_extract_session() {
         assert_eq!(
@@ -998,5 +1006,132 @@ mod tests {
         let name = compacted_files[0].file_name().to_string_lossy().to_string();
         assert!(name.starts_with("zsh-9999--__compacted-0__--"));
         assert!(name.ends_with(".parquet"));
+    }
+
+    // ===== DuckDB Mode Tests =====
+    // In DuckDB mode, compact should be a no-op since there are no parquet files.
+
+    #[test]
+    fn test_compact_duckdb_mode_no_op() {
+        let (_tmp, store) = setup_store_duckdb();
+
+        // Write data in DuckDB mode (goes to local.invocations table, not parquet files)
+        for i in 0..10 {
+            let record = InvocationRecord::new(
+                "test-session",
+                format!("command-{}", i),
+                "/home/user",
+                0,
+                "test@client",
+            );
+            store.write_invocation(&record).unwrap();
+        }
+
+        // Verify data is stored (not in parquet files)
+        let conn = store.connection().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local.invocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 10, "Data should be in DuckDB table");
+
+        // Compact should be a no-op (no parquet files to compact)
+        let stats = store.compact_recent(2, false).unwrap();
+        assert_eq!(stats.partitions_compacted, 0);
+        assert_eq!(stats.sessions_compacted, 0);
+        assert_eq!(stats.files_before, 0);
+        assert_eq!(stats.files_after, 0);
+
+        // Data should still be there
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local.invocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 10, "Data should be unaffected");
+    }
+
+    #[test]
+    fn test_compact_for_session_duckdb_mode_no_op() {
+        let (_tmp, store) = setup_store_duckdb();
+
+        // Write data in DuckDB mode
+        for i in 0..5 {
+            let record = InvocationRecord::new(
+                "session-a",
+                format!("command-{}", i),
+                "/home/user",
+                0,
+                "test@client",
+            );
+            store.write_invocation(&record).unwrap();
+        }
+
+        // Session-specific compact should also be a no-op
+        let stats = store.compact_for_session("session-a", 2, false).unwrap();
+        assert_eq!(stats.partitions_compacted, 0);
+        assert_eq!(stats.sessions_compacted, 0);
+    }
+
+    #[test]
+    fn test_compact_session_today_duckdb_mode_no_op() {
+        let (_tmp, store) = setup_store_duckdb();
+
+        // Write data in DuckDB mode
+        let record = InvocationRecord::new(
+            "test-session",
+            "echo hello",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&record).unwrap();
+
+        // Today's session compact should be a no-op
+        let stats = store.compact_session_today("test-session", 2, false).unwrap();
+        assert_eq!(stats.partitions_compacted, 0);
+        assert_eq!(stats.sessions_compacted, 0);
+    }
+
+    #[test]
+    fn test_auto_compact_duckdb_mode_no_op() {
+        let (_tmp, store) = setup_store_duckdb();
+
+        // Write data
+        for i in 0..5 {
+            let record = InvocationRecord::new(
+                "test-session",
+                format!("command-{}", i),
+                "/home/user",
+                0,
+                "test@client",
+            );
+            store.write_invocation(&record).unwrap();
+        }
+
+        // Auto-compact should be a no-op
+        let opts = AutoCompactOptions::default();
+        let (compact_stats, archive_stats) = store.auto_compact(&opts).unwrap();
+
+        assert_eq!(compact_stats.partitions_compacted, 0);
+        assert_eq!(compact_stats.sessions_compacted, 0);
+        assert_eq!(archive_stats.partitions_archived, 0);
+    }
+
+    #[test]
+    fn test_archive_old_data_duckdb_mode_no_op() {
+        let (_tmp, store) = setup_store_duckdb();
+
+        // Write data
+        let record = InvocationRecord::new(
+            "test-session",
+            "echo hello",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&record).unwrap();
+
+        // Archive should be a no-op (no parquet partitions to archive)
+        let stats = store.archive_old_data(0, false).unwrap(); // 0 days = archive everything
+        assert_eq!(stats.partitions_archived, 0);
+        assert_eq!(stats.files_moved, 0);
     }
 }

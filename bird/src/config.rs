@@ -210,6 +210,23 @@ impl RemoteConfig {
             _ => None,
         }
     }
+
+    /// Get the data directory for file remotes.
+    ///
+    /// For a remote URI like `file:///path/to/db/bird.duckdb`, returns `/path/to/db/data`.
+    /// This is needed so parquet-mode remotes can resolve their relative file paths.
+    pub fn data_dir(&self) -> Option<std::path::PathBuf> {
+        if self.remote_type != RemoteType::File {
+            return None;
+        }
+
+        // Parse file:// URI to get the database path
+        let db_path = self.uri.strip_prefix("file://")?;
+        let db_path = std::path::Path::new(db_path);
+
+        // Data directory is sibling to the .duckdb file: /path/to/db/bird.duckdb -> /path/to/db/data
+        db_path.parent().map(|p| p.join("data"))
+    }
 }
 
 /// Sync configuration for push/pull operations.
