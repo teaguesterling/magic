@@ -659,9 +659,6 @@ impl Store {
             return Ok(());
         }
 
-        // Load httpfs for S3 support
-        conn.execute("LOAD httpfs", [])?;
-
         // Set up credentials for each S3 remote
         for remote in &self.config.remotes {
             if remote.remote_type == crate::config::RemoteType::S3 {
@@ -854,9 +851,6 @@ impl Store {
 
     /// Manually attach a specific remote.
     pub fn attach_remote(&self, conn: &Connection, remote: &crate::RemoteConfig) -> Result<()> {
-        // Load httpfs if needed
-        conn.execute("LOAD httpfs", [])?;
-
         // Set up credentials
         if let Some(provider) = &remote.credential_provider {
             if remote.remote_type == crate::config::RemoteType::S3 {

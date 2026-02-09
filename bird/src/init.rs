@@ -543,7 +543,7 @@ fn ensure_extension(conn: &duckdb::Connection, name: &str) -> Result<bool> {
 /// This pre-populates the extension cache so connect() is fast.
 fn install_extensions(conn: &duckdb::Connection) -> Result<()> {
     // Required extensions - fail if not available
-    for name in ["parquet", "icu"] {
+    for name in ["parquet", "icu", "httpfs", "json"] {
         if !ensure_extension(conn, name)? {
             return Err(Error::Config(format!(
                 "Required extension '{}' could not be installed",
