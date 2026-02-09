@@ -36,7 +36,7 @@ impl Store {
 
     /// Write invocation to a Parquet file (multi-writer safe).
     fn write_invocation_parquet(&self, record: &InvocationRecord) -> Result<()> {
-        let conn = self.connection()?;
+        let conn = self.connection_with_options(false)?;
         let date = record.date();
 
         // Ensure the partition directory exists

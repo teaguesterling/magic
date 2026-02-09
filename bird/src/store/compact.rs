@@ -205,7 +205,8 @@ impl Store {
             });
         }
 
-        let conn = self.connection()?;
+        // Use minimal connection to avoid view setup overhead
+        let conn = self.connection_with_options(false)?;
 
         // Build list of files to read
         let file_list: Vec<String> = files_to_compact
@@ -299,7 +300,8 @@ impl Store {
             });
         }
 
-        let conn = self.connection()?;
+        // Use minimal connection to avoid view setup overhead
+        let conn = self.connection_with_options(false)?;
 
         // Build list of files to read
         let file_list_sql = files
@@ -605,6 +607,9 @@ impl Store {
             }
 
             // Collect partitions to archive
+            // Use <= so that "older_than_days=0" archives everything including today
+            // Skip seed partitions (date=1970-01-01) which contain schema-only files
+            let seed_date = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
             let partitions_to_archive: Vec<(NaiveDate, PathBuf, String)> = fs::read_dir(&recent_data_dir)?
                 .filter_map(|e| e.ok())
                 .filter_map(|e| {
@@ -615,7 +620,11 @@ impl Store {
                     let dir_name = e.file_name().to_string_lossy().to_string();
                     let date_str = dir_name.strip_prefix("date=")?;
                     let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d").ok()?;
-                    if date < cutoff_date {
+                    // Skip seed partition
+                    if date == seed_date {
+                        return None;
+                    }
+                    if date <= cutoff_date {
                         Some((date, path, dir_name))
                     } else {
                         None
@@ -665,7 +674,9 @@ impl Store {
                 fs::create_dir_all(&dest_dir)?;
 
                 // Consolidate using DuckDB's COPY
-                let conn = self.connection()?;
+                // Use minimal connection to avoid view setup (which can fail if
+                // some data type directories are empty)
+                let conn = self.connection_with_options(false)?;
                 let src_glob = format!("{}/*.parquet", partition_path.display());
                 let dest_file = dest_dir.join("data_0.parquet");
                 let temp_file = dest_dir.join(".data_0.parquet.tmp");
@@ -1133,5 +1144,339 @@ mod tests {
         let stats = store.archive_old_data(0, false).unwrap(); // 0 days = archive everything
         assert_eq!(stats.partitions_archived, 0);
         assert_eq!(stats.files_moved, 0);
+    }
+
+    // ===== Archive Tests (Parquet Mode) =====
+
+    #[test]
+    fn test_archive_old_data_moves_partitions() {
+        let (_tmp, store) = setup_store();
+
+        // Write multiple invocations
+        for i in 0..3 {
+            let record = InvocationRecord::new(
+                "test-session",
+                format!("command-{}", i),
+                "/home/user",
+                0,
+                "test@client",
+            );
+            store.write_invocation(&record).unwrap();
+        }
+
+        // Verify files exist in recent
+        let date = chrono::Utc::now().date_naive();
+        let recent_dir = store.config().invocations_dir(&date);
+        let recent_count = std::fs::read_dir(&recent_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "parquet")
+                    .unwrap_or(false)
+            })
+            .filter(|e| !e.file_name().to_string_lossy().starts_with("_seed"))
+            .count();
+        assert_eq!(recent_count, 3, "Should have 3 files in recent");
+
+        // Archive with 0 days (archive everything)
+        let stats = store.archive_old_data(0, false).unwrap();
+
+        // Archives 4 data types: invocations, outputs, sessions, events
+        // Only invocations has data, but all 4 partitions exist
+        assert!(stats.partitions_archived >= 1, "Should archive at least 1 partition");
+        assert!(stats.files_moved > 0, "Should move files");
+
+        // Verify files moved to archive
+        let archive_dir = store
+            .config()
+            .archive_dir()
+            .join("invocations")
+            .join(format!("date={}", date));
+        assert!(archive_dir.exists(), "Archive partition should exist");
+
+        // Archive consolidates to single file
+        let archive_files: Vec<_> = std::fs::read_dir(&archive_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "parquet")
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(archive_files.len(), 1, "Archive should have 1 consolidated file");
+
+        // Recent partition should be removed or empty (only seed files remain)
+        let remaining = std::fs::read_dir(&recent_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| !e.file_name().to_string_lossy().starts_with("_seed"))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(remaining, 0, "Recent partition should have no data files");
+    }
+
+    #[test]
+    fn test_archive_dry_run() {
+        let (_tmp, store) = setup_store();
+
+        // Write data
+        for i in 0..3 {
+            let record = InvocationRecord::new(
+                "test-session",
+                format!("command-{}", i),
+                "/home/user",
+                0,
+                "test@client",
+            );
+            store.write_invocation(&record).unwrap();
+        }
+
+        // Dry run should report stats but not move files
+        let stats = store.archive_old_data(0, true).unwrap();
+        // Archives 4 data types, but counts partitions with files
+        assert!(stats.partitions_archived >= 1, "Should report at least 1 partition");
+        assert!(stats.files_moved > 0, "Should report files to move");
+
+        // Files should still be in recent
+        let date = chrono::Utc::now().date_naive();
+        let recent_dir = store.config().invocations_dir(&date);
+        let recent_count = std::fs::read_dir(&recent_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "parquet")
+                    .unwrap_or(false)
+            })
+            .filter(|e| !e.file_name().to_string_lossy().starts_with("_seed"))
+            .count();
+        assert_eq!(recent_count, 3, "Files should still be in recent after dry run");
+    }
+
+    #[test]
+    fn test_archive_respects_age_threshold() {
+        let (_tmp, store) = setup_store();
+
+        // Write data today
+        let record = InvocationRecord::new(
+            "test-session",
+            "echo hello",
+            "/home/user",
+            0,
+            "test@client",
+        );
+        store.write_invocation(&record).unwrap();
+
+        // Archive with 7 days threshold - today's data should NOT be archived
+        let stats = store.archive_old_data(7, false).unwrap();
+        assert_eq!(stats.partitions_archived, 0, "Today's data should not be archived with 7 day threshold");
+
+        // Verify data is still queryable (via filesystem check, not view)
+        let date = chrono::Utc::now().date_naive();
+        let recent_dir = store.config().invocations_dir(&date);
+        let file_count = std::fs::read_dir(&recent_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| !e.file_name().to_string_lossy().starts_with("_seed"))
+            .count();
+        assert_eq!(file_count, 1, "Data file should still exist");
+    }
+
+    // ===== Consolidation Tests =====
+
+    #[test]
+    fn test_consolidate_merges_all_files() {
+        let (_tmp, store) = setup_store();
+
+        // Write multiple files
+        for i in 0..5 {
+            let record = InvocationRecord::new(
+                "test-session",
+                format!("command-{}", i),
+                "/home/user",
+                0,
+                "test@client",
+            );
+            store.write_invocation(&record).unwrap();
+        }
+
+        // Compact first to create a compacted file
+        store.compact_recent(2, false).unwrap();
+
+        // Now consolidate everything
+        let opts = CompactOptions {
+            consolidate: true,
+            ..Default::default()
+        };
+        let stats = store.compact_recent_with_opts(&opts).unwrap();
+
+        // Should consolidate all files (compacted + remaining) into one
+        assert!(stats.sessions_compacted > 0, "Should consolidate session files");
+
+        // Verify single file remains
+        let date = chrono::Utc::now().date_naive();
+        let inv_dir = store.config().invocations_dir(&date);
+        let file_count = std::fs::read_dir(&inv_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "parquet")
+                    .unwrap_or(false)
+            })
+            .filter(|e| !e.file_name().to_string_lossy().starts_with("_seed"))
+            .count();
+        assert_eq!(file_count, 1, "Should have single consolidated file");
+    }
+
+    #[test]
+    fn test_recompact_threshold() {
+        let (_tmp, store) = setup_store();
+
+        // Create many compacted files by doing multiple compact cycles
+        // First, write and compact several batches
+        for batch in 0..3 {
+            for i in 0..5 {
+                let record = InvocationRecord::new(
+                    "test-session",
+                    format!("batch-{}-cmd-{}", batch, i),
+                    "/home/user",
+                    0,
+                    "test@client",
+                );
+                store.write_invocation(&record).unwrap();
+            }
+            // Compact after each batch (creates compacted files)
+            store.compact_recent(2, false).unwrap();
+        }
+
+        // Count compacted files
+        let date = chrono::Utc::now().date_naive();
+        let inv_dir = store.config().invocations_dir(&date);
+        let compacted_count = std::fs::read_dir(&inv_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| is_compacted_file(&e.file_name().to_string_lossy()))
+            .count();
+
+        // With recompact_threshold=2, should trigger re-compaction
+        let opts = CompactOptions {
+            file_threshold: 50, // High threshold so we don't compact non-compacted
+            recompact_threshold: 2,
+            ..Default::default()
+        };
+        let stats = store.compact_recent_with_opts(&opts).unwrap();
+
+        // If we had enough compacted files, should have re-compacted
+        if compacted_count >= 2 {
+            assert!(
+                stats.sessions_compacted > 0 || stats.files_before > 0,
+                "Should trigger re-compaction when threshold exceeded"
+            );
+        }
+    }
+
+    #[test]
+    fn test_auto_compact_parquet_mode() {
+        let (_tmp, store) = setup_store();
+
+        // Write enough files to trigger compaction
+        for i in 0..10 {
+            let record = InvocationRecord::new(
+                "test-session",
+                format!("command-{}", i),
+                "/home/user",
+                0,
+                "test@client",
+            );
+            store.write_invocation(&record).unwrap();
+        }
+
+        // Verify files before compact
+        let date = chrono::Utc::now().date_naive();
+        let inv_dir = store.config().invocations_dir(&date);
+        let files_before = std::fs::read_dir(&inv_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| !e.file_name().to_string_lossy().starts_with("_seed"))
+            .count();
+        assert_eq!(files_before, 10, "Should have 10 files before compact");
+
+        // Run auto_compact with low threshold
+        let opts = AutoCompactOptions {
+            compact: CompactOptions {
+                file_threshold: 3,
+                ..Default::default()
+            },
+            archive_days: 14, // Don't archive today's data
+        };
+        let (compact_stats, archive_stats) = store.auto_compact(&opts).unwrap();
+
+        // Should compact but not archive (data is from today)
+        assert!(compact_stats.sessions_compacted > 0, "Should compact files");
+        assert_eq!(archive_stats.partitions_archived, 0, "Should not archive today's data");
+
+        // Verify files were compacted (fewer files now)
+        let files_after = std::fs::read_dir(&inv_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| !e.file_name().to_string_lossy().starts_with("_seed"))
+            .count();
+        assert!(files_after < files_before, "Should have fewer files after compact");
+    }
+
+    #[test]
+    fn test_compact_preserves_data_integrity() {
+        let (_tmp, store) = setup_store();
+
+        // Write known data
+        let commands: Vec<String> = (0..10).map(|i| format!("command-{}", i)).collect();
+        for cmd in &commands {
+            let record = InvocationRecord::new(
+                "test-session",
+                cmd.clone(),
+                "/home/user",
+                0,
+                "test@client",
+            );
+            store.write_invocation(&record).unwrap();
+        }
+
+        // Verify data before compact
+        let conn = store.connection().unwrap();
+        let count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local.invocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_before, 10);
+
+        // Compact
+        store.compact_recent(2, false).unwrap();
+
+        // Verify data after compact - count should be same
+        let count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local.invocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_after, 10, "Compaction should preserve all records");
+
+        // Verify all commands are present
+        let mut found_cmds: Vec<String> = conn
+            .prepare("SELECT cmd FROM local.invocations ORDER BY cmd")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        found_cmds.sort();
+        let mut expected = commands.clone();
+        expected.sort();
+        assert_eq!(found_cmds, expected, "All commands should be preserved");
     }
 }

@@ -26,6 +26,8 @@ BIRD stores every shell command execution as:
 $BIRD_ROOT/                          # Default: ~/.local/share/bird
 ├── db/
 │   ├── bird.duckdb                  # DuckDB database (views, tables, or both)
+│   ├── pending/                     # In-flight invocations (crash recovery)
+│   │   └── <session>--<uuid>.pending
 │   ├── data/
 │   │   ├── recent/                  # Last 14 days (hot data)
 │   │   │   ├── invocations/         # Command execution records
@@ -528,6 +530,79 @@ match fs::rename(&temp, &final_path) {
 
 - Uses `compaction.lock` for parquet compaction
 - Blob pool requires no locking (content-addressed)
+
+### In-Flight Invocation Tracking
+
+To handle crashes/interrupts during command execution, BIRD tracks in-flight invocations in a lightweight file that doesn't require DuckDB access:
+
+```
+$BIRD_ROOT/db/pending/<session_id>--<uuid>.pending
+```
+
+**Lifecycle:**
+
+1. **Command starts**: Create pending file with initial metadata
+2. **Command runs**: Output captured to temp files/buffers
+3. **Command ends**: Write final invocation record, delete pending file
+
+**Pending File Format (JSON Lines):**
+
+```json
+{"id":"01937a2b-3c4d-7e8f-9012-3456789abcde","session_id":"zsh-12345","timestamp":"2024-01-15T10:30:00Z","cmd":"make test","cwd":"/home/user/project","client_id":"user@hostname"}
+```
+
+**On Startup/Recovery:**
+
+```rust
+fn recover_pending_invocations(bird_root: &Path) -> Vec<IncompleteInvocation> {
+    let pending_dir = bird_root.join("db/pending");
+    fs::read_dir(&pending_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension()? == "pending" {
+                let content = fs::read_to_string(&path).ok()?;
+                let inv: IncompleteInvocation = serde_json::from_str(&content).ok()?;
+                Some(inv)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+```
+
+**Recovery Options:**
+
+| Scenario | Action |
+|----------|--------|
+| Pending file exists, no output | Record as incomplete (exit_code=-1, duration=unknown) |
+| Pending file exists, partial output | Record with partial output, mark as interrupted |
+| Pending file stale (>24h) | Archive to `incomplete/` or delete |
+
+**Schema Addition:**
+
+```sql
+-- Optional: Track invocation status
+ALTER TABLE invocations ADD COLUMN status VARCHAR DEFAULT 'completed';
+-- Values: 'running', 'completed', 'interrupted', 'timeout'
+```
+
+**Benefits:**
+
+- **Fast**: Single file write at command start (~1ms)
+- **Crash-safe**: Plain file survives DuckDB crashes
+- **Concurrent-safe**: Unique filename per invocation
+- **Debuggable**: Human-readable JSON
+- **Recoverable**: Can reconstruct incomplete records on restart
+
+**Cleanup:**
+
+Pending files are automatically cleaned up:
+- On normal command completion: deleted immediately
+- On startup: any files older than `hot_days` are archived or deleted
+- Background task: periodic cleanup of orphaned pending files
 
 ## Error Handling
 

@@ -27,7 +27,7 @@ impl Store {
 
     /// Write session to a Parquet file (multi-writer safe).
     fn write_session_parquet(&self, record: &SessionRecord) -> Result<()> {
-        let conn = self.connection()?;
+        let conn = self.connection_with_options(false)?;
 
         // Ensure the partition directory exists
         let partition_dir = self.config.sessions_dir(&record.date);

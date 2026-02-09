@@ -138,7 +138,7 @@ impl Store {
 
     /// Write output to a Parquet file (multi-writer safe).
     fn write_output_parquet(&self, record: &OutputRecord) -> Result<()> {
-        let conn = self.connection()?;
+        let conn = self.connection_with_options(false)?;
 
         // Ensure the partition directory exists
         let partition_dir = self.config.outputs_dir(&record.date);

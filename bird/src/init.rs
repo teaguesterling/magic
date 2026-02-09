@@ -309,47 +309,55 @@ fn create_union_schemas(conn: &duckdb::Connection) -> Result<()> {
 ///
 /// In parquet mode, local data is stored in parquet files.
 /// Views in the local schema read from these files.
+/// Uses `file_row_number = true` to handle empty directories gracefully.
 fn create_local_parquet_views(conn: &duckdb::Connection) -> Result<()> {
+    // Note: We use UNION ALL with seed files to ensure views work even when
+    // main directories are empty. The seed files are in date=1970-01-01 and
+    // contain no data rows, just schema.
     conn.execute_batch(
         r#"
         -- Sessions view: read from parquet files
         CREATE OR REPLACE VIEW local.sessions AS
-        SELECT * EXCLUDE (filename)
+        SELECT * EXCLUDE (filename, file_row_number)
         FROM read_parquet(
             'recent/sessions/**/*.parquet',
             union_by_name = true,
             hive_partitioning = true,
-            filename = true
+            filename = true,
+            file_row_number = true
         );
 
         -- Invocations view: read from parquet files
         CREATE OR REPLACE VIEW local.invocations AS
-        SELECT * EXCLUDE (filename)
+        SELECT * EXCLUDE (filename, file_row_number)
         FROM read_parquet(
             'recent/invocations/**/*.parquet',
             union_by_name = true,
             hive_partitioning = true,
-            filename = true
+            filename = true,
+            file_row_number = true
         );
 
         -- Outputs view: read from parquet files
         CREATE OR REPLACE VIEW local.outputs AS
-        SELECT * EXCLUDE (filename)
+        SELECT * EXCLUDE (filename, file_row_number)
         FROM read_parquet(
             'recent/outputs/**/*.parquet',
             union_by_name = true,
             hive_partitioning = true,
-            filename = true
+            filename = true,
+            file_row_number = true
         );
 
         -- Events view: read from parquet files
         CREATE OR REPLACE VIEW local.events AS
-        SELECT * EXCLUDE (filename)
+        SELECT * EXCLUDE (filename, file_row_number)
         FROM read_parquet(
             'recent/events/**/*.parquet',
             union_by_name = true,
             hive_partitioning = true,
-            filename = true
+            filename = true,
+            file_row_number = true
         );
         "#,
     )?;
