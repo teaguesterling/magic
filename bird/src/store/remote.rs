@@ -242,6 +242,21 @@ impl super::Store {
     /// Only pushes records that don't already exist on the remote (by id).
     /// When `sync_blobs` is enabled, also syncs blob files for file remotes.
     pub fn push(&self, remote: &RemoteConfig, opts: PushOptions) -> Result<PushStats> {
+        use crate::config::RemoteMode;
+
+        // Read-only remotes can't be pushed to - return empty stats for dry_run
+        if remote.mode == RemoteMode::ReadOnly {
+            if opts.dry_run {
+                // Nothing to push to a read-only remote
+                return Ok(PushStats::default());
+            } else {
+                return Err(Error::Config(format!(
+                    "Cannot push to read-only remote '{}'",
+                    remote.name
+                )));
+            }
+        }
+
         // Use connection without auto-attach to avoid conflicts and unnecessary views
         let conn = self.connection_with_options(false)?;
 

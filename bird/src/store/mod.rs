@@ -745,11 +745,41 @@ impl Store {
         Ok(())
     }
 
+    /// Detect the table path for an attached remote.
+    ///
+    /// BIRD databases can have different structures:
+    /// - DuckDB mode: tables are in `local` schema (e.g., `remote_name.local.invocations`)
+    /// - Parquet mode: tables are at top level (e.g., `remote_name.invocations`)
+    /// - Standalone: tables may be at top level
+    ///
+    /// Returns the schema prefix to use (e.g., "local." or "").
+    fn detect_remote_table_path(&self, conn: &Connection, remote_schema: &str) -> String {
+        // Check if this remote has a `local` schema with tables (BIRD DuckDB mode)
+        let check_sql = format!(
+            "SELECT 1 FROM information_schema.tables \
+             WHERE table_catalog = '{}' AND table_schema = 'local' AND table_name = 'invocations' \
+             LIMIT 1",
+            remote_schema.trim_matches('"')
+        );
+        if conn.execute(&check_sql, []).is_ok() {
+            if let Ok(mut stmt) = conn.prepare(&check_sql) {
+                if stmt.query([]).is_ok_and(|mut rows| rows.next().is_ok_and(|r| r.is_some())) {
+                    return "local.".to_string();
+                }
+            }
+        }
+
+        // Default: tables at top level
+        String::new()
+    }
+
     /// Create TEMPORARY macros for accessing remote data.
     ///
     /// We use TEMPORARY macros to avoid persisting references to attached databases
     /// in the catalog. Persisted references cause database corruption when the
     /// attachment is not present.
+    ///
+    /// Handles both BIRD databases (with `local` schema) and standalone databases.
     ///
     /// Usage: `SELECT * FROM remotes_invocations()` or `SELECT * FROM remote_<name>_invocations()`
     fn create_remote_macros(&self, conn: &Connection) -> Result<()> {
@@ -765,15 +795,19 @@ impl Store {
             // Sanitize name for use in macro identifier
             let safe_name = name.replace(['-', '.'], "_");
 
+            // Detect if this is a BIRD database with tables in `local` schema
+            let table_prefix = self.detect_remote_table_path(conn, &schema);
+
             for table in &["sessions", "invocations", "outputs", "events"] {
                 let macro_name = format!("\"remote_{safe_name}_{table}\"");
                 let sql = format!(
                     r#"CREATE OR REPLACE TEMPORARY MACRO {macro_name}() AS TABLE (
-                        SELECT *, '{name}' as _source FROM {schema}.{table}
+                        SELECT *, '{name}' as _source FROM {schema}.{prefix}{table}
                     )"#,
                     macro_name = macro_name,
                     name = name,
                     schema = schema,
+                    prefix = table_prefix,
                     table = table
                 );
                 if let Err(e) = conn.execute(&sql, []) {
@@ -805,6 +839,51 @@ impl Store {
             if let Err(e) = conn.execute(&sql, []) {
                 eprintln!("Warning: Failed to create remotes_{} macro: {}", table, e);
             }
+        }
+
+        // Rebuild remotes.* and unified.* views to include attached remote data
+        // These are regular views (not TEMPORARY) that reference attached databases.
+        // They're rebuilt on every connection open, so stale references are updated.
+        for table in &["sessions", "invocations", "outputs", "events"] {
+            // Build union of all remote data for this table
+            let mut union_parts: Vec<String> = remotes
+                .iter()
+                .map(|r| {
+                    let safe_name = r.name.replace(['-', '.'], "_");
+                    format!(
+                        "SELECT * FROM \"remote_{safe_name}_{table}\"()",
+                        safe_name = safe_name,
+                        table = table
+                    )
+                })
+                .collect();
+
+            // Always include placeholder for empty case
+            union_parts.push(format!("SELECT * FROM remote_placeholder.{}", table));
+
+            let remotes_sql = format!(
+                "CREATE OR REPLACE VIEW remotes.{table} AS {union}",
+                table = table,
+                union = union_parts.join(" UNION ALL BY NAME ")
+            );
+            if let Err(e) = conn.execute(&remotes_sql, []) {
+                eprintln!("Warning: Failed to rebuild remotes.{} view: {}", table, e);
+            }
+        }
+
+        // Rebuild unified.* views (they reference main.* and remotes.*)
+        let unified_views = r#"
+            CREATE OR REPLACE VIEW unified.sessions AS
+                SELECT * FROM main.sessions UNION ALL BY NAME SELECT * FROM remotes.sessions;
+            CREATE OR REPLACE VIEW unified.invocations AS
+                SELECT * FROM main.invocations UNION ALL BY NAME SELECT * FROM remotes.invocations;
+            CREATE OR REPLACE VIEW unified.outputs AS
+                SELECT * FROM main.outputs UNION ALL BY NAME SELECT * FROM remotes.outputs;
+            CREATE OR REPLACE VIEW unified.events AS
+                SELECT * FROM main.events UNION ALL BY NAME SELECT * FROM remotes.events;
+        "#;
+        if let Err(e) = conn.execute_batch(unified_views) {
+            eprintln!("Warning: Failed to rebuild unified views: {}", e);
         }
 
         Ok(())
