@@ -267,12 +267,22 @@ impl Store {
         let partition_dir = self.config.events_dir(&date);
         fs::create_dir_all(&partition_dir)?;
 
-        // Set up blob_roots for resolving file:// refs
+        // Get output storage refs for this invocation
+        // Note: DuckDB table functions don't support lateral joins with column refs,
+        // so we iterate in Rust and call read_duck_hunt_log with literal paths.
         let data_dir = self.config.data_dir();
-        conn.execute(
-            "SET VARIABLE blob_roots = ?",
-            params![format!("['{}']", data_dir.display())],
+        let mut stmt = conn.prepare(
+            "SELECT storage_ref FROM outputs
+             WHERE invocation_id = ? AND stream IN ('stdout', 'stderr', 'combined')",
         )?;
+        let storage_refs: Vec<String> = stmt
+            .query_map(params![invocation_id], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if storage_refs.is_empty() {
+            return Ok(0);
+        }
 
         // Create temp table for events
         conn.execute_batch(
@@ -297,11 +307,7 @@ impl Store {
             "#,
         )?;
 
-        // Build SQL that reads directly from storage refs using read_duck_hunt_log.
-        // This avoids loading content into Rust memory - duck_hunt reads files directly.
-        //
-        // For file:// refs, we resolve to absolute paths using blob_roots.
-        // For data: refs (inline), we pass through directly (scalarfs handles these).
+        // Escape values for SQL
         let escaped_format = format.replace("'", "''");
         let escaped_client_id = client_id.replace("'", "''");
         let hostname_sql = hostname
@@ -309,51 +315,51 @@ impl Store {
             .map(|h| format!("'{}'", h.replace("'", "''")))
             .unwrap_or_else(|| "NULL".to_string());
 
-        let sql = format!(
-            r#"
-            INSERT INTO temp_events
-            SELECT
-                uuid() as id,
-                '{invocation_id}'::UUID as invocation_id,
-                '{client_id}' as client_id,
-                {hostname} as hostname,
-                dh.event_type,
-                dh.severity,
-                dh.ref_file,
-                dh.ref_line::INTEGER,
-                dh.ref_column::INTEGER,
-                dh.message,
-                dh.error_code,
-                dh.test_name,
-                dh.status,
-                '{format}' as format_used,
-                '{date}'::DATE as date
-            FROM (
-                SELECT storage_ref,
-                    CASE
-                        WHEN storage_ref[:5] = 'file:' THEN
-                            getvariable('blob_roots')[1] || '/' || storage_ref[8:]
-                        ELSE storage_ref
-                    END as resolved_ref
-                FROM outputs
-                WHERE invocation_id = '{invocation_id}'::UUID
-                  AND stream IN ('stdout', 'stderr', 'combined')
-            ) o,
-            read_duck_hunt_log(o.resolved_ref, '{format}') dh
-            WHERE dh.event_type IS NOT NULL OR dh.message IS NOT NULL;
-            "#,
-            invocation_id = invocation_id,
-            client_id = escaped_client_id,
-            hostname = hostname_sql,
-            format = escaped_format,
-            date = date,
-        );
+        // Process each output stream separately (DuckDB table functions need literal args)
+        for storage_ref in &storage_refs {
+            // Resolve file:// refs to absolute paths, pass data: refs through
+            let resolved_ref = if let Some(suffix) = storage_ref.strip_prefix("file://") {
+                data_dir.join(suffix).display().to_string()
+            } else {
+                storage_ref.clone()
+            };
 
-        if let Err(e) = conn.execute_batch(&sql) {
-            // duck_hunt might fail on some formats - log and continue
-            eprintln!("Warning: duck_hunt parsing failed: {}", e);
-            conn.execute("DROP TABLE IF EXISTS temp_events", [])?;
-            return Ok(0);
+            let escaped_ref = resolved_ref.replace("'", "''");
+
+            let sql = format!(
+                r#"
+                INSERT INTO temp_events
+                SELECT
+                    uuid() as id,
+                    '{invocation_id}'::UUID as invocation_id,
+                    '{client_id}' as client_id,
+                    {hostname} as hostname,
+                    dh.event_type,
+                    dh.severity,
+                    dh.ref_file,
+                    dh.ref_line::INTEGER,
+                    dh.ref_column::INTEGER,
+                    dh.message,
+                    dh.error_code,
+                    dh.test_name,
+                    dh.status,
+                    '{format}' as format_used,
+                    '{date}'::DATE as date
+                FROM read_duck_hunt_log('{ref}', '{format}') dh
+                WHERE dh.event_type IS NOT NULL OR dh.message IS NOT NULL;
+                "#,
+                invocation_id = invocation_id,
+                client_id = escaped_client_id,
+                hostname = hostname_sql,
+                format = escaped_format,
+                date = date,
+                ref = escaped_ref,
+            );
+
+            if let Err(e) = conn.execute_batch(&sql) {
+                // duck_hunt might fail on some formats - log and continue to next stream
+                eprintln!("Warning: duck_hunt parsing failed for {}: {}", storage_ref, e);
+            }
         }
 
         // Count how many events were extracted

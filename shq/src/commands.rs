@@ -71,7 +71,13 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
                     "No command specified. Use -c \"cmd\" or provide command args".to_string(),
                 ));
             }
-            (cmd_args.join(" "), cmd_args[0].clone(), cmd_args[1..].to_vec())
+            // If single arg with spaces, treat as shell command (common UX pattern)
+            if cmd_args.len() == 1 && cmd_args[0].contains(' ') {
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+                (cmd_args[0].clone(), shell, vec!["-c".to_string(), cmd_args[0].clone()])
+            } else {
+                (cmd_args.join(" "), cmd_args[0].clone(), cmd_args[1..].to_vec())
+            }
         }
     };
 
@@ -736,12 +742,18 @@ pub fn update_extensions(dry_run: bool) -> bird::Result<()> {
 }
 
 /// List invocation history.
-pub fn invocations(query_str: &str, format: &str) -> bird::Result<()> {
+pub fn invocations(query_str: &str, format: &str, limit: Option<usize>) -> bird::Result<()> {
     let config = Config::load()?;
     let store = Store::open(config)?;
 
     // Parse query and apply filters
-    let query = parse_query(query_str);
+    let mut query = parse_query(query_str);
+
+    // Override range if -n/--limit is provided
+    if let Some(n) = limit {
+        query.range = Some(bird::RangeSelector { start: n, end: None });
+    }
+
     let invocations = store.query_invocations(&query)?;
 
     if invocations.is_empty() {
@@ -1815,8 +1827,25 @@ fn truncate_cmd(cmd: &str, max_len: usize) -> String {
     }
 }
 
-/// Resolve a selector (negative offset or UUID) to an invocation ID.
+/// Resolve a selector (negative offset, ~N syntax, or UUID) to an invocation ID.
 fn resolve_invocation_id(store: &Store, selector: &str) -> bird::Result<String> {
+    // Handle ~N syntax (e.g., ~1 for most recent, ~2 for second-to-last)
+    if let Some(stripped) = selector.strip_prefix('~') {
+        if let Ok(n) = stripped.parse::<usize>() {
+            if n > 0 {
+                let invocations = store.recent_invocations(n)?;
+                if let Some(inv) = invocations.last() {
+                    return Ok(inv.id.clone());
+                } else {
+                    return Err(bird::Error::NotFound(format!(
+                        "No invocation found at offset ~{}",
+                        n
+                    )));
+                }
+            }
+        }
+    }
+
     // Handle negative offset (e.g., -1 for last, -2 for second-to-last)
     if let Ok(offset) = selector.parse::<i64>() {
         if offset < 0 {

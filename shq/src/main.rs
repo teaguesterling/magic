@@ -172,7 +172,7 @@ enum Commands {
     },
 
     /// List invocation history
-    #[command(visible_aliases = ["i", "history"])]
+    #[command(visible_aliases = ["i", "history", "list"])]
     Invocations {
         /// Query selector (e.g., ~20, shell:~10, %failed~5)
         #[arg(default_value = "~20")]
@@ -185,6 +185,10 @@ enum Commands {
         /// Show detailed table view (same as -f table)
         #[arg(short = 'd', long = "details")]
         details: bool,
+
+        /// Limit to N most recent invocations (overrides ~N in query)
+        #[arg(short = 'n', long = "limit")]
+        limit: Option<usize>,
     },
 
     /// Show detailed info about an invocation
@@ -621,9 +625,9 @@ fn main() {
             };
             commands::output(&query, resolved_stream, &opts)
         }
-        Commands::Invocations { query, format, details } => {
+        Commands::Invocations { query, format, details, limit } => {
             let fmt = if details { "table" } else { &format };
-            commands::invocations(&query, fmt)
+            commands::invocations(&query, fmt, limit)
         }
         Commands::Info { query, format, field } => commands::info(&query, &format, field.as_deref()),
         Commands::Rerun { query, dry_run, no_capture } => commands::rerun(&query, dry_run, no_capture),
