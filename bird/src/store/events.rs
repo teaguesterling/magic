@@ -610,6 +610,11 @@ impl Store {
         // If filtering by command pattern, we need to join with invocations
         let sql = if filters.cmd_pattern.is_some() {
             let cmd_pattern = filters.cmd_pattern.as_ref().unwrap().replace("'", "''");
+            let where_prefix = if conditions.is_empty() {
+                "WHERE".to_string()
+            } else {
+                format!("{} AND", where_clause)
+            };
             format!(
                 r#"
                 SELECT
@@ -629,11 +634,7 @@ impl Store {
                 ORDER BY i.timestamp DESC
                 {}
                 "#,
-                if conditions.is_empty() {
-                    "WHERE"
-                } else {
-                    &format!("{} AND", where_clause)
-                },
+                where_prefix,
                 cmd_pattern,
                 limit_clause
             )
