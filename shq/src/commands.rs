@@ -2581,7 +2581,10 @@ pub fn remote_attach(name: &str) -> bird::Result<()> {
 
 /// Show remote sync status.
 pub fn remote_status() -> bird::Result<()> {
+    use bird::PushOptions;
+
     let config = Config::load()?;
+    let store = Store::open(config.clone())?;
 
     println!("Sync Configuration:");
     println!("  Default remote:    {}", config.sync.default_remote.as_deref().unwrap_or("(none)"));
@@ -2608,6 +2611,26 @@ pub fn remote_status() -> bird::Result<()> {
         println!("Configured Remotes:");
         for remote in &config.remotes {
             println!("  {} ({}, {})", remote.name, remote.remote_type, remote.mode);
+
+            // Show pending sync stats (dry-run)
+            let opts = PushOptions {
+                since: None,
+                dry_run: true,
+                sync_blobs: true,
+            };
+            match store.push(remote, opts) {
+                Ok(stats) => {
+                    let total = stats.sessions + stats.invocations + stats.outputs + stats.events;
+                    if total > 0 || stats.blobs.count > 0 {
+                        println!("    Pending push: {}", stats);
+                    } else {
+                        println!("    Pending push: (up to date)");
+                    }
+                }
+                Err(e) => {
+                    println!("    Status: error - {}", e);
+                }
+            }
         }
     }
 
@@ -2617,7 +2640,7 @@ pub fn remote_status() -> bird::Result<()> {
 // Push/Pull commands
 
 /// Push local data to a remote.
-pub fn push(remote: Option<&str>, since: Option<&str>, dry_run: bool) -> bird::Result<()> {
+pub fn push(remote: Option<&str>, since: Option<&str>, dry_run: bool, sync_blobs: bool) -> bird::Result<()> {
     use bird::{parse_since, PushOptions};
 
     let config = Config::load()?;
@@ -2640,6 +2663,7 @@ pub fn push(remote: Option<&str>, since: Option<&str>, dry_run: bool) -> bird::R
     let opts = PushOptions {
         since: since_date,
         dry_run,
+        sync_blobs,
     };
 
     let stats = store.push(remote_config, opts)?;
@@ -2654,7 +2678,7 @@ pub fn push(remote: Option<&str>, since: Option<&str>, dry_run: bool) -> bird::R
 }
 
 /// Pull data from a remote to local.
-pub fn pull(remote: Option<&str>, client: Option<&str>, since: Option<&str>) -> bird::Result<()> {
+pub fn pull(remote: Option<&str>, client: Option<&str>, since: Option<&str>, sync_blobs: bool) -> bird::Result<()> {
     use bird::{parse_since, PullOptions};
 
     let config = Config::load()?;
@@ -2677,6 +2701,7 @@ pub fn pull(remote: Option<&str>, client: Option<&str>, since: Option<&str>) -> 
     let opts = PullOptions {
         since: since_date,
         client_id: client.map(String::from),
+        sync_blobs,
     };
 
     let stats = store.pull(remote_config, opts)?;

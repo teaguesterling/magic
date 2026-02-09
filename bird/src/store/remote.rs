@@ -9,11 +9,51 @@
 //!
 //! Remote databases have tables: `sessions`, `invocations`, `outputs`, `events`
 //! (no `_table` suffix - consistent naming across all schemas).
+//!
+//! # Blob Sync
+//!
+//! When `sync_blobs` is enabled, blob files (outputs stored as file:// refs) are
+//! also synced. For file remotes, we prefer hard links (fast, no disk duplication)
+//! and fall back to copying when hard links fail (cross-filesystem).
+
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use chrono::{NaiveDate, TimeDelta, Utc};
 use duckdb::Connection;
 
+use crate::config::RemoteType;
 use crate::{Error, RemoteConfig, Result};
+
+/// Statistics from blob sync operations.
+#[derive(Debug, Default)]
+pub struct BlobStats {
+    /// Number of blobs synced.
+    pub count: usize,
+    /// Total bytes synced.
+    pub bytes: u64,
+    /// Number of blobs hard-linked (no copy needed).
+    pub linked: usize,
+    /// Number of blobs copied (hard link failed).
+    pub copied: usize,
+    /// Number of blobs skipped (already exist).
+    pub skipped: usize,
+}
+
+impl std::fmt::Display for BlobStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.count == 0 {
+            write!(f, "0 blobs")
+        } else {
+            let kb = self.bytes / 1024;
+            write!(
+                f,
+                "{} blobs ({}KB, {} linked, {} copied, {} skipped)",
+                self.count, kb, self.linked, self.copied, self.skipped
+            )
+        }
+    }
+}
 
 /// Statistics from a push operation.
 #[derive(Debug, Default)]
@@ -22,6 +62,7 @@ pub struct PushStats {
     pub invocations: usize,
     pub outputs: usize,
     pub events: usize,
+    pub blobs: BlobStats,
 }
 
 impl std::fmt::Display for PushStats {
@@ -30,7 +71,11 @@ impl std::fmt::Display for PushStats {
             f,
             "{} sessions, {} invocations, {} outputs, {} events",
             self.sessions, self.invocations, self.outputs, self.events
-        )
+        )?;
+        if self.blobs.count > 0 {
+            write!(f, ", {}", self.blobs)?;
+        }
+        Ok(())
     }
 }
 
@@ -41,6 +86,7 @@ pub struct PullStats {
     pub invocations: usize,
     pub outputs: usize,
     pub events: usize,
+    pub blobs: BlobStats,
 }
 
 impl std::fmt::Display for PullStats {
@@ -49,7 +95,11 @@ impl std::fmt::Display for PullStats {
             f,
             "{} sessions, {} invocations, {} outputs, {} events",
             self.sessions, self.invocations, self.outputs, self.events
-        )
+        )?;
+        if self.blobs.count > 0 {
+            write!(f, ", {}", self.blobs)?;
+        }
+        Ok(())
     }
 }
 
@@ -60,6 +110,8 @@ pub struct PushOptions {
     pub since: Option<NaiveDate>,
     /// Show what would be pushed without actually pushing.
     pub dry_run: bool,
+    /// Sync blob files (not just metadata).
+    pub sync_blobs: bool,
 }
 
 /// Options for pull operation.
@@ -69,6 +121,8 @@ pub struct PullOptions {
     pub since: Option<NaiveDate>,
     /// Only pull data from this client.
     pub client_id: Option<String>,
+    /// Sync blob files (not just metadata).
+    pub sync_blobs: bool,
 }
 
 /// Parse a "since" string into a date.
@@ -116,11 +170,77 @@ pub fn quoted_cached_schema_name(remote_name: &str) -> String {
     format!("\"cached_{}\"", remote_name)
 }
 
+/// Get the data directory for a file remote.
+///
+/// For a remote URI like `file:///path/to/remote.duckdb`, returns `/path/to`.
+/// This is where blob paths (like `recent/blobs/content/...`) are relative to.
+fn file_remote_data_dir(remote: &RemoteConfig) -> Option<PathBuf> {
+    if remote.remote_type != RemoteType::File {
+        return None;
+    }
+
+    // Parse file:// URI to get the database path
+    let db_path = remote.uri.strip_prefix("file://")?;
+    let db_path = Path::new(db_path);
+
+    // Data directory is the parent of the .duckdb file
+    // e.g., /path/to/remote.duckdb -> /path/to
+    db_path.parent().map(PathBuf::from)
+}
+
+/// Information about a blob to sync.
+#[derive(Debug)]
+struct BlobInfo {
+    content_hash: String,
+    storage_path: String,
+    byte_length: i64,
+}
+
+/// Sync a single blob file using hard link or copy.
+///
+/// Returns `Ok(true)` if the blob was synced (linked or copied),
+/// `Ok(false)` if it already exists at destination.
+fn sync_blob_file(src: &Path, dst: &Path, stats: &mut BlobStats) -> Result<bool> {
+    // Check if destination already exists
+    if dst.exists() {
+        stats.skipped += 1;
+        return Ok(false);
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Try hard link first (fast, no disk duplication)
+    match fs::hard_link(src, dst) {
+        Ok(()) => {
+            stats.linked += 1;
+            stats.count += 1;
+            if let Ok(meta) = fs::metadata(dst) {
+                stats.bytes += meta.len();
+            }
+            Ok(true)
+        }
+        Err(_) => {
+            // Fall back to copy (cross-filesystem)
+            fs::copy(src, dst)?;
+            stats.copied += 1;
+            stats.count += 1;
+            if let Ok(meta) = fs::metadata(dst) {
+                stats.bytes += meta.len();
+            }
+            Ok(true)
+        }
+    }
+}
+
 impl super::Store {
     /// Push local data to a remote.
     ///
     /// Reads from `local` schema, writes to remote's tables.
     /// Only pushes records that don't already exist on the remote (by id).
+    /// When `sync_blobs` is enabled, also syncs blob files for file remotes.
     pub fn push(&self, remote: &RemoteConfig, opts: PushOptions) -> Result<PushStats> {
         // Use connection without auto-attach to avoid conflicts and unnecessary views
         let conn = self.connection_with_options(false)?;
@@ -130,7 +250,7 @@ impl super::Store {
 
         let remote_schema = remote.quoted_schema_name();
 
-        // Ensure remote has the required tables
+        // Ensure remote has the required tables (including blob_registry)
         ensure_remote_schema(&conn, &remote_schema)?;
 
         let mut stats = PushStats::default();
@@ -141,12 +261,85 @@ impl super::Store {
             stats.invocations = count_table_to_push(&conn, "invocations", &remote_schema, opts.since)?;
             stats.outputs = count_table_to_push(&conn, "outputs", &remote_schema, opts.since)?;
             stats.events = count_table_to_push(&conn, "events", &remote_schema, opts.since)?;
+            if opts.sync_blobs {
+                stats.blobs = count_blobs_to_push(&conn, &remote_schema, opts.since)?;
+            }
         } else {
+            // Sync blobs first (before pushing output metadata)
+            if opts.sync_blobs {
+                stats.blobs = self.push_blobs(&conn, remote, &remote_schema, opts.since)?;
+            }
+
             // Actually push in dependency order
             stats.sessions = push_sessions(&conn, &remote_schema, opts.since)?;
             stats.invocations = push_table(&conn, "invocations", &remote_schema, opts.since)?;
-            stats.outputs = push_table(&conn, "outputs", &remote_schema, opts.since)?;
+            stats.outputs = push_outputs(&conn, &remote_schema, opts.since, opts.sync_blobs)?;
             stats.events = push_table(&conn, "events", &remote_schema, opts.since)?;
+        }
+
+        Ok(stats)
+    }
+
+    /// Push blob files to a file remote.
+    ///
+    /// Syncs blob files using hard links (preferred) or copies (fallback).
+    /// Also syncs blob_registry entries.
+    fn push_blobs(
+        &self,
+        conn: &Connection,
+        remote: &RemoteConfig,
+        remote_schema: &str,
+        since: Option<NaiveDate>,
+    ) -> Result<BlobStats> {
+        let mut stats = BlobStats::default();
+
+        // Only file remotes support blob sync for now
+        let remote_data_dir = match file_remote_data_dir(remote) {
+            Some(dir) => dir,
+            None => return Ok(stats), // Not a file remote, skip blob sync
+        };
+
+        // Find blobs that need to be synced
+        let blobs = get_blobs_to_push(conn, remote_schema, since)?;
+        if blobs.is_empty() {
+            return Ok(stats);
+        }
+
+        let local_data_dir = self.config.data_dir();
+
+        for blob in &blobs {
+            // Build source and destination paths
+            // storage_path is relative to data_dir (e.g., "recent/blobs/content/ab/hash.bin")
+            let src = local_data_dir.join(&blob.storage_path);
+            let dst = remote_data_dir.join(&blob.storage_path);
+
+            if !src.exists() {
+                // Source blob missing, skip
+                continue;
+            }
+
+            // Sync the blob file
+            sync_blob_file(&src, &dst, &mut stats)?;
+
+            // Sync blob_registry entry
+            let escaped_hash = blob.content_hash.replace('\'', "''");
+            let escaped_path = blob.storage_path.replace('\'', "''");
+            conn.execute(
+                &format!(
+                    r#"
+                    INSERT INTO {schema}.blob_registry (content_hash, byte_length, storage_path)
+                    SELECT '{hash}', {len}, '{path}'
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM {schema}.blob_registry WHERE content_hash = '{hash}'
+                    )
+                    "#,
+                    schema = remote_schema,
+                    hash = escaped_hash,
+                    len = blob.byte_length,
+                    path = escaped_path,
+                ),
+                [],
+            )?;
         }
 
         Ok(stats)
@@ -157,6 +350,7 @@ impl super::Store {
     /// Reads from remote's tables, writes to `cached_<name>` schema.
     /// Only pulls records that don't already exist in the cached schema (by id).
     /// After pulling, rebuilds the `caches` union views.
+    /// When `sync_blobs` is enabled, also syncs blob files for file remotes.
     pub fn pull(&self, remote: &RemoteConfig, opts: PullOptions) -> Result<PullStats> {
         // Use connection without auto-attach to avoid conflicts
         let conn = self.connection_with_options(false)?;
@@ -171,15 +365,87 @@ impl super::Store {
         ensure_cached_schema(&conn, &cached_schema, &remote.name)?;
 
         // Pull in dependency order (sessions first, then invocations, outputs, events)
-        let stats = PullStats {
+        let mut stats = PullStats {
             sessions: pull_sessions(&conn, &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?,
             invocations: pull_table(&conn, "invocations", &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?,
-            outputs: pull_table(&conn, "outputs", &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?,
+            outputs: pull_outputs(&conn, &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref(), opts.sync_blobs)?,
             events: pull_table(&conn, "events", &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?,
+            blobs: BlobStats::default(),
         };
+
+        // Sync blob files after pulling output metadata
+        if opts.sync_blobs {
+            stats.blobs = self.pull_blobs(&conn, remote, &remote_schema, &cached_schema)?;
+        }
 
         // Rebuild caches union views to include this cached schema
         self.rebuild_caches_schema(&conn)?;
+
+        Ok(stats)
+    }
+
+    /// Pull blob files from a file remote.
+    ///
+    /// Syncs blob files using hard links (preferred) or copies (fallback).
+    /// Also registers blobs in the local blob_registry.
+    fn pull_blobs(
+        &self,
+        conn: &Connection,
+        remote: &RemoteConfig,
+        remote_schema: &str,
+        cached_schema: &str,
+    ) -> Result<BlobStats> {
+        let mut stats = BlobStats::default();
+
+        // Only file remotes support blob sync for now
+        let remote_data_dir = match file_remote_data_dir(remote) {
+            Some(dir) => dir,
+            None => return Ok(stats), // Not a file remote, skip blob sync
+        };
+
+        // Find blobs that were pulled (in cached outputs but not in local blob_registry)
+        let blobs = get_blobs_to_pull(conn, remote_schema, cached_schema)?;
+        if blobs.is_empty() {
+            return Ok(stats);
+        }
+
+        let local_data_dir = self.config.data_dir();
+
+        for blob in &blobs {
+            // Build source and destination paths
+            // storage_path is relative to data_dir (e.g., "recent/blobs/content/ab/hash.bin")
+            let src = remote_data_dir.join(&blob.storage_path);
+            let dst = local_data_dir.join(&blob.storage_path);
+
+            if !src.exists() {
+                // Source blob missing on remote, skip
+                continue;
+            }
+
+            // Sync the blob file
+            let synced = sync_blob_file(&src, &dst, &mut stats)?;
+
+            // Register in local blob_registry if we synced a new blob
+            if synced {
+                let escaped_hash = blob.content_hash.replace('\'', "''");
+                let escaped_path = blob.storage_path.replace('\'', "''");
+                conn.execute(
+                    &format!(
+                        r#"
+                        INSERT INTO blob_registry (content_hash, byte_length, storage_path)
+                        SELECT '{hash}', {len}, '{path}'
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM blob_registry WHERE content_hash = '{hash}'
+                        )
+                        "#,
+                        hash = escaped_hash,
+                        len = blob.byte_length,
+                        path = escaped_path,
+                    ),
+                    [],
+                )?;
+            }
+        }
 
         Ok(stats)
     }
@@ -260,6 +526,14 @@ fn ensure_remote_schema(conn: &Connection, schema: &str) -> Result<()> {
             event_type VARCHAR, severity VARCHAR, ref_file VARCHAR, ref_line INTEGER,
             ref_column INTEGER, message VARCHAR, error_code VARCHAR, test_name VARCHAR,
             status VARCHAR, format_used VARCHAR, date DATE
+        );
+        CREATE TABLE IF NOT EXISTS {schema}.blob_registry (
+            content_hash VARCHAR PRIMARY KEY,
+            byte_length BIGINT NOT NULL,
+            ref_count INTEGER DEFAULT 1,
+            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            storage_path VARCHAR NOT NULL
         );
         "#,
         schema = schema
@@ -634,6 +908,181 @@ fn pull_table(
             )
         }
     };
+
+    let count = conn.execute(&sql, [])?;
+    Ok(count)
+}
+
+/// Count blobs that would be pushed (for dry run).
+fn count_blobs_to_push(
+    conn: &Connection,
+    remote_schema: &str,
+    since: Option<NaiveDate>,
+) -> Result<BlobStats> {
+    let since_filter = since_clause(since, "i.timestamp");
+
+    let sql = format!(
+        r#"
+        SELECT COUNT(DISTINCT o.content_hash), COALESCE(SUM(o.byte_length), 0)
+        FROM local.outputs o
+        JOIN local.invocations i ON i.id = o.invocation_id
+        WHERE o.storage_type = 'blob'
+          AND NOT EXISTS (
+              SELECT 1 FROM {remote}.blob_registry r WHERE r.content_hash = o.content_hash
+          )
+        {since}
+        "#,
+        remote = remote_schema,
+        since = since_filter,
+    );
+
+    let (count, bytes): (i64, i64) = conn.query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(BlobStats {
+        count: count as usize,
+        bytes: bytes as u64,
+        ..Default::default()
+    })
+}
+
+/// Get blobs that need to be pushed to remote.
+fn get_blobs_to_push(
+    conn: &Connection,
+    remote_schema: &str,
+    since: Option<NaiveDate>,
+) -> Result<Vec<BlobInfo>> {
+    let since_filter = since_clause(since, "i.timestamp");
+
+    let sql = format!(
+        r#"
+        SELECT DISTINCT o.content_hash, b.storage_path, o.byte_length
+        FROM local.outputs o
+        JOIN local.invocations i ON i.id = o.invocation_id
+        JOIN blob_registry b ON b.content_hash = o.content_hash
+        WHERE o.storage_type = 'blob'
+          AND NOT EXISTS (
+              SELECT 1 FROM {remote}.blob_registry r WHERE r.content_hash = o.content_hash
+          )
+        {since}
+        "#,
+        remote = remote_schema,
+        since = since_filter,
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let blobs = stmt
+        .query_map([], |row| {
+            Ok(BlobInfo {
+                content_hash: row.get(0)?,
+                storage_path: row.get(1)?,
+                byte_length: row.get(2)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(blobs)
+}
+
+/// Get blobs that were pulled (in remote outputs but not in local blob_registry).
+fn get_blobs_to_pull(
+    conn: &Connection,
+    remote_schema: &str,
+    cached_schema: &str,
+) -> Result<Vec<BlobInfo>> {
+    let sql = format!(
+        r#"
+        SELECT DISTINCT o.content_hash, b.storage_path, o.byte_length
+        FROM {cached}.outputs o
+        JOIN {remote}.blob_registry b ON b.content_hash = o.content_hash
+        WHERE o.storage_type = 'blob'
+          AND NOT EXISTS (
+              SELECT 1 FROM blob_registry r WHERE r.content_hash = o.content_hash
+          )
+        "#,
+        cached = cached_schema,
+        remote = remote_schema,
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let blobs = stmt
+        .query_map([], |row| {
+            Ok(BlobInfo {
+                content_hash: row.get(0)?,
+                storage_path: row.get(1)?,
+                byte_length: row.get(2)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(blobs)
+}
+
+/// Push outputs to remote, optionally converting storage_ref paths.
+fn push_outputs(
+    conn: &Connection,
+    remote_schema: &str,
+    since: Option<NaiveDate>,
+    _sync_blobs: bool,
+) -> Result<usize> {
+    let since_filter = since_clause(since, "i.timestamp");
+
+    // For now, we keep storage_ref as-is. The blob files are synced separately.
+    // The storage_ref format (file://recent/blobs/...) is relative and works on both sides.
+    let sql = format!(
+        r#"
+        INSERT INTO {remote}.outputs
+        SELECT l.*
+        FROM local.outputs l
+        JOIN local.invocations i ON i.id = l.invocation_id
+        WHERE NOT EXISTS (
+            SELECT 1 FROM {remote}.outputs r WHERE r.id = l.id
+        )
+        {since}
+        "#,
+        remote = remote_schema,
+        since = since_filter,
+    );
+
+    let count = conn.execute(&sql, [])?;
+    Ok(count)
+}
+
+/// Pull outputs from remote, optionally handling storage_ref paths.
+fn pull_outputs(
+    conn: &Connection,
+    remote_schema: &str,
+    cached_schema: &str,
+    since: Option<NaiveDate>,
+    client_id: Option<&str>,
+    _sync_blobs: bool,
+) -> Result<usize> {
+    let since_filter = since_clause(since, "i.timestamp");
+    let client_filter = if client_id.is_some() {
+        format!("AND i.client_id = '{}'", client_id.unwrap().replace('\'', "''"))
+    } else {
+        String::new()
+    };
+
+    // For now, we keep storage_ref as-is. The blob files are synced separately.
+    // The storage_ref format (file://recent/blobs/...) is relative and works on both sides.
+    let sql = format!(
+        r#"
+        INSERT INTO {cached}.outputs (id, invocation_id, stream, content_hash, byte_length, storage_type, storage_ref, content_type, date)
+        SELECT r.*
+        FROM {remote}.outputs r
+        JOIN {remote}.invocations i ON i.id = r.invocation_id
+        WHERE NOT EXISTS (
+            SELECT 1 FROM {cached}.outputs l WHERE l.id = r.id
+        )
+        {since}
+        {client}
+        "#,
+        cached = cached_schema,
+        remote = remote_schema,
+        since = since_filter,
+        client = client_filter,
+    );
 
     let count = conn.execute(&sql, [])?;
     Ok(count)

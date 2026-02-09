@@ -340,6 +340,10 @@ enum Commands {
         /// Show what would be pushed without actually pushing
         #[arg(long)]
         dry_run: bool,
+
+        /// Sync blob files (not just metadata)
+        #[arg(short, long)]
+        blobs: bool,
     },
 
     /// Pull data from a remote to local
@@ -355,6 +359,10 @@ enum Commands {
         /// Only pull data since this date or duration (e.g., "7d", "2024-01-15")
         #[arg(short, long)]
         since: Option<String>,
+
+        /// Sync blob files (not just metadata)
+        #[arg(short, long)]
+        blobs: bool,
     },
 
     /// Query parsed events (errors, warnings, test results) from invocation outputs
@@ -665,11 +673,11 @@ fn main() {
             RemoteAction::Attach { name } => commands::remote_attach(&name),
             RemoteAction::Status => commands::remote_status(),
         },
-        Commands::Push { remote, since, dry_run } => {
-            commands::push(remote.as_deref(), since.as_deref(), dry_run)
+        Commands::Push { remote, since, dry_run, blobs } => {
+            commands::push(remote.as_deref(), since.as_deref(), dry_run, blobs)
         },
-        Commands::Pull { remote, client, since } => {
-            commands::pull(remote.as_deref(), client.as_deref(), since.as_deref())
+        Commands::Pull { remote, client, since, blobs } => {
+            commands::pull(remote.as_deref(), client.as_deref(), since.as_deref(), blobs)
         },
         Commands::Events { query, severity, count_only, lines, reparse, extract, format } => {
             // Parse lines: N (any), +N (first N), -N (last N)
