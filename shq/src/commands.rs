@@ -1,6 +1,7 @@
 //! CLI command implementations.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::process::Command;
 use std::time::Instant;
 
@@ -8,6 +9,7 @@ use bird::{
     init, parse_query, CompactOptions, Config, EventFilters, InvocationBatch, InvocationRecord,
     Query, SessionRecord, StorageMode, Store, BIRD_INVOCATION_UUID_VAR, BIRD_PARENT_CLIENT_VAR,
 };
+use pty_process::blocking::{Command as PtyCommand, open as pty_open};
 
 /// Generate a session ID for grouping related invocations.
 fn session_id() -> String {
@@ -45,23 +47,23 @@ fn contains_nosave_marker(data: &[u8]) -> bool {
         || data.windows(NOSAVE_OSC_ST.len()).any(|w| w == NOSAVE_OSC_ST)
 }
 
-/// Run a command and capture it to BIRD.
+/// Run a command and capture it to BIRD using PTY for proper job control.
+///
+/// The command runs in a pseudo-terminal, which means:
+/// - Ctrl-Z suspends the command (not shq)
+/// - Interactive programs (vim, less) work correctly
+/// - Output is displayed in real-time
 ///
 /// `tag`: Optional tag (unique alias) for this invocation.
 /// `extract_override`: Some(true) forces extraction, Some(false) disables it, None uses config.
 /// `format_override`: Override format detection for event extraction.
 /// `auto_compact`: If true, spawn background compaction after saving.
 pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extract_override: Option<bool>, format_override: Option<&str>, auto_compact: bool) -> bird::Result<()> {
-    use std::io::Write;
-
-    // Determine command string and how to execute
-    let (cmd_str, mut command) = match shell_cmd {
+    // Determine command string and build PTY command
+    let (cmd_str, shell, args): (String, String, Vec<String>) = match shell_cmd {
         Some(cmd) => {
-            // Use $SHELL -c "cmd" (or fallback to sh)
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
-            let mut c = Command::new(&shell);
-            c.arg("-c").arg(cmd);
-            (cmd.to_string(), c)
+            (cmd.to_string(), shell, vec!["-c".to_string(), cmd.to_string()])
         }
         None => {
             if cmd_args.is_empty() {
@@ -69,68 +71,161 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
                     "No command specified. Use -c \"cmd\" or provide command args".to_string(),
                 ));
             }
-            let mut c = Command::new(&cmd_args[0]);
-            c.args(&cmd_args[1..]);
-            (cmd_args.join(" "), c)
+            (cmd_args.join(" "), cmd_args[0].clone(), cmd_args[1..].to_vec())
         }
     };
 
     let config = Config::load()?;
     let store = Store::open(config.clone())?;
 
-    // Get current working directory
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
-    // Generate invocation ID upfront so we can pass it to child processes
-    // This allows nested BIRD clients (e.g., blq inside shq run) to use the same UUID
     let invocation_id = uuid::Uuid::now_v7();
 
-    // Set environment variables for nested BIRD clients
-    command.env(BIRD_INVOCATION_UUID_VAR, invocation_id.to_string());
-    command.env(BIRD_PARENT_CLIENT_VAR, "shq");
+    // Allocate PTY
+    let (mut pty, pts) = pty_open().map_err(|e| bird::Error::Io(io::Error::new(io::ErrorKind::Other, e)))?;
 
-    // Execute the command and capture output
+    // Try to match terminal size
+    if let Ok(size) = terminal_size() {
+        let _ = pty.resize(pty_process::Size::new(size.0, size.1));
+    }
+
+    // Check if stdin is a terminal - if not, disable PTY echo to prevent duplicates
+    let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+    if !stdin_is_tty {
+        disable_pty_echo(pty.as_raw_fd());
+    }
+
+    // Build command to run in PTY (builder pattern takes ownership)
+    let cmd = PtyCommand::new(&shell)
+        .args(&args)
+        .env(BIRD_INVOCATION_UUID_VAR, invocation_id.to_string())
+        .env(BIRD_PARENT_CLIENT_VAR, "shq");
+
+    // Spawn process in PTY - it becomes session leader with PTY as controlling terminal
     let start = Instant::now();
-    let output = command.output();
-    let duration_ms = start.elapsed().as_millis() as i64;
+    let mut child = cmd.spawn(pts)
+        .map_err(|e| bird::Error::Io(io::Error::new(io::ErrorKind::Other, e)))?;
 
-    let (exit_code, stdout, stderr) = match &output {
-        Ok(o) => (
-            o.status.code().unwrap_or(-1),
-            o.stdout.clone(),
-            o.stderr.clone(),
-        ),
-        Err(_) => (-1, Vec::new(), Vec::new()),
+    // Set up raw mode for stdin if it's a terminal
+    let orig_termios = if stdin_is_tty {
+        set_raw_mode(libc::STDIN_FILENO)
+    } else {
+        None
     };
 
-    // Display output to user
-    if !stdout.is_empty() {
-        io::stdout().write_all(&stdout)?;
-    }
-    if !stderr.is_empty() {
-        io::stderr().write_all(&stderr)?;
-    }
+    // Clone PTY fd for the stdin forwarding thread
+    let pty_write_fd = pty.as_raw_fd();
 
-    // Check for nosave marker - command opted out of recording
-    if contains_nosave_marker(&stdout) || contains_nosave_marker(&stderr) {
-        // Exit with appropriate code but don't save
-        match output {
-            Ok(o) => {
-                if !o.status.success() {
-                    std::process::exit(exit_code);
+    // Spawn thread to forward stdin to PTY (both tty and piped modes)
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let running = Arc::new(AtomicBool::new(true));
+    let running_clone = running.clone();
+
+    let stdin_handle = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let stdin_fd = libc::STDIN_FILENO;
+
+        // Set stdin to non-blocking
+        set_nonblocking(stdin_fd, true);
+
+        while running_clone.load(Ordering::Relaxed) {
+            let n = unsafe {
+                libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            };
+
+            if n > 0 {
+                let _ = unsafe {
+                    libc::write(pty_write_fd, buf.as_ptr() as *const libc::c_void, n as usize)
+                };
+            } else if n == 0 {
+                // EOF on stdin - send Ctrl-D to signal EOF to child
+                let ctrl_d = [4u8]; // ASCII EOT (Ctrl-D)
+                let _ = unsafe {
+                    libc::write(pty_write_fd, ctrl_d.as_ptr() as *const libc::c_void, 1)
+                };
+                break;
+            } else {
+                // EAGAIN/EWOULDBLOCK - no data available
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    });
+
+    // Read output from PTY and pass through to our stdout while collecting it
+    let mut output_buffer = Vec::new();
+    let mut buf = [0u8; 4096];
+
+    // Set PTY to non-blocking for reading
+    set_nonblocking(pty.as_raw_fd(), true);
+
+    loop {
+        // Check if child has exited
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                // Child exited, drain remaining output
+                set_nonblocking(pty.as_raw_fd(), false);
+                while let Ok(n) = pty.read(&mut buf) {
+                    if n == 0 { break; }
+                    output_buffer.extend_from_slice(&buf[..n]);
+                    let _ = io::stdout().write_all(&buf[..n]);
+                    let _ = io::stdout().flush();
+                }
+                break;
+            }
+            Ok(None) => {
+                // Child still running, read available output
+                match pty.read(&mut buf) {
+                    Ok(0) => {
+                        // EOF - child closed PTY
+                        break;
+                    }
+                    Ok(n) => {
+                        output_buffer.extend_from_slice(&buf[..n]);
+                        let _ = io::stdout().write_all(&buf[..n]);
+                        let _ = io::stdout().flush();
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // No data available, sleep briefly
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => {
+                        // Read error, child may have exited
+                        break;
+                    }
                 }
             }
-            Err(e) => {
-                eprintln!("shq: failed to execute command: {}", e);
-                std::process::exit(127);
-            }
+            Err(_) => break,
+        }
+    }
+
+    // Stop stdin forwarding thread
+    running.store(false, Ordering::Relaxed);
+    let _ = stdin_handle.join();
+
+    // Restore terminal mode
+    if let Some(termios) = orig_termios {
+        restore_termios(libc::STDIN_FILENO, &termios);
+    }
+
+    // Wait for child to fully exit and get status
+    let status = child.wait().map_err(|e| bird::Error::Io(io::Error::new(io::ErrorKind::Other, e)))?;
+    let duration_ms = start.elapsed().as_millis() as i64;
+    let exit_code = status.code().unwrap_or(-1);
+
+    // Check for nosave marker
+    if contains_nosave_marker(&output_buffer) {
+        if !status.success() {
+            std::process::exit(exit_code);
         }
         return Ok(());
     }
 
-    // Create session and invocation records
+    // Create and save records
     let sid = session_id();
     let session = SessionRecord::new(
         &sid,
@@ -140,7 +235,6 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
         "shell",
     );
 
-    // Use the pre-generated invocation ID (which was passed to child process)
     let mut record = InvocationRecord::with_id(
         invocation_id,
         &sid,
@@ -151,27 +245,21 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
     )
     .with_duration(duration_ms);
 
-    // Add tag if provided
     if let Some(t) = tag {
         record = record.with_tag(t);
     }
 
     let inv_id = record.id;
-
-    // Build batch with all related records
     let mut batch = InvocationBatch::new(record).with_session(session);
 
-    if !stdout.is_empty() {
-        batch = batch.with_output("stdout", stdout);
-    }
-    if !stderr.is_empty() {
-        batch = batch.with_output("stderr", stderr);
+    // PTY merges stdout/stderr into a single stream - store as "combined"
+    if !output_buffer.is_empty() {
+        batch = batch.with_output("combined", output_buffer);
     }
 
-    // Write everything atomically
     store.write_batch(&batch)?;
 
-    // Extract events if enabled (via flag or config)
+    // Extract events if enabled
     let should_extract = extract_override.unwrap_or(config.auto_extract);
     if should_extract {
         let count = store.extract_events(&inv_id.to_string(), format_override)?;
@@ -183,7 +271,6 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
     // Spawn background compaction if requested
     if auto_compact {
         let session_id = sid.clone();
-        // Spawn shq compact in background
         let _ = Command::new(std::env::current_exe().unwrap_or_else(|_| "shq".into()))
             .args(["compact", "-s", &session_id, "--today", "-q"])
             .stdin(std::process::Stdio::null())
@@ -192,20 +279,85 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
             .spawn();
     }
 
-    // Exit with the same code as the wrapped command
-    match output {
-        Ok(o) => {
-            if !o.status.success() {
-                std::process::exit(exit_code);
-            }
-        }
-        Err(e) => {
-            eprintln!("shq: failed to execute command: {}", e);
-            std::process::exit(127);
-        }
+    if !status.success() {
+        std::process::exit(exit_code);
     }
 
     Ok(())
+}
+
+/// Get terminal size (rows, cols)
+fn terminal_size() -> io::Result<(u16, u16)> {
+    use std::mem::MaybeUninit;
+
+    let mut size = MaybeUninit::<libc::winsize>::uninit();
+    let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, size.as_mut_ptr()) };
+
+    if ret == 0 {
+        let size = unsafe { size.assume_init() };
+        Ok((size.ws_row, size.ws_col))
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Set file descriptor to non-blocking mode
+fn set_nonblocking(fd: i32, nonblocking: bool) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if nonblocking {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        } else {
+            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+}
+
+/// Set terminal to raw mode, returning original termios for restoration
+fn set_raw_mode(fd: i32) -> Option<libc::termios> {
+    unsafe {
+        let mut orig: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut orig) != 0 {
+            return None;
+        }
+
+        let mut raw = orig;
+        // Disable canonical mode, echo, and signal generation
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
+        // Disable input processing
+        raw.c_iflag &= !(libc::IXON | libc::ICRNL | libc::BRKINT | libc::INPCK | libc::ISTRIP);
+        // Disable output processing
+        raw.c_oflag &= !libc::OPOST;
+        // Set character size to 8 bits
+        raw.c_cflag |= libc::CS8;
+        // Read returns immediately with whatever is available
+        raw.c_cc[libc::VMIN] = 0;
+        raw.c_cc[libc::VTIME] = 0;
+
+        if libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) != 0 {
+            return None;
+        }
+
+        Some(orig)
+    }
+}
+
+/// Restore terminal to original mode
+fn restore_termios(fd: i32, termios: &libc::termios) {
+    unsafe {
+        libc::tcsetattr(fd, libc::TCSAFLUSH, termios);
+    }
+}
+
+/// Disable echo on PTY (for piped input to prevent duplicates)
+fn disable_pty_echo(fd: i32) {
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut termios) == 0 {
+            termios.c_lflag &= !libc::ECHO;
+            libc::tcsetattr(fd, libc::TCSANOW, &termios);
+        }
+    }
 }
 
 /// Save output from stdin or file with an explicit command.
