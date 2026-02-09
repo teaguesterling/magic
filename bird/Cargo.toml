@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+doctest = false  # Disabled due to libLLVM linkage issues with rustdoc
+
 [dependencies]
 duckdb.workspace = true
 thiserror.workspace = true
