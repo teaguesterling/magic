@@ -8,28 +8,64 @@ fn test_empty_query() {
     assert!(q.is_match_all());
 }
 
+// Git-style positional range tests
+
 #[test]
-fn test_simple_range() {
+fn test_single_item() {
+    // ~1 = single item at position 1 (most recent)
     let q = parse_query("~1");
     assert_eq!(q.range, Some(RangeSelector { start: 1, end: None }));
+    assert!(q.range.unwrap().is_single());
     assert!(q.source.is_none());
     assert!(q.path.is_none());
 }
 
 #[test]
-fn test_bare_integer_range() {
-    let q = parse_query("5");
-    assert_eq!(q.range, Some(RangeSelector { start: 5, end: None }));
+fn test_single_item_position_5() {
+    // ~5 = single item at position 5 (5th most recent)
+    let q = parse_query("~5");
+    let range = q.range.unwrap();
+    assert_eq!(range.start, 5);
+    assert!(range.is_single());
+    assert_eq!(range.last_n_count(), None);
 }
 
 #[test]
-fn test_bare_integer_range_large() {
+fn test_bare_integer_single() {
+    // Bare 5 = single item at position 5
+    let q = parse_query("5");
+    assert_eq!(q.range, Some(RangeSelector { start: 5, end: None }));
+    assert!(q.range.unwrap().is_single());
+}
+
+#[test]
+fn test_bare_integer_large() {
     let q = parse_query("100");
     assert_eq!(q.range, Some(RangeSelector { start: 100, end: None }));
 }
 
 #[test]
-fn test_range_span() {
+fn test_last_n_open_range() {
+    // ~10: = last 10 items (open range to now)
+    let q = parse_query("~10:");
+    let range = q.range.unwrap();
+    assert_eq!(range.start, 10);
+    assert_eq!(range.end, Some(0));
+    assert!(range.is_last_n());
+    assert_eq!(range.last_n_count(), Some(10));
+}
+
+#[test]
+fn test_last_5_open_range() {
+    let q = parse_query("~5:");
+    let range = q.range.unwrap();
+    assert!(range.is_last_n());
+    assert_eq!(range.last_n_count(), Some(5));
+}
+
+#[test]
+fn test_closed_range_span() {
+    // ~5:~2 = range from position 5 to position 2
     let q = parse_query("~5:~2");
     assert_eq!(
         q.range,
@@ -38,10 +74,12 @@ fn test_range_span() {
             end: Some(2)
         })
     );
+    assert!(!q.range.unwrap().is_single());
+    assert!(!q.range.unwrap().is_last_n());
 }
 
 #[test]
-fn test_range_span_no_second_tilde() {
+fn test_closed_range_no_second_tilde() {
     // ~5:2 is equivalent to ~5:~2
     let q = parse_query("~5:2");
     assert_eq!(
@@ -307,12 +345,26 @@ fn test_complex_source_filter_range() {
 }
 
 #[test]
-fn test_complex_all_sources_filter_range() {
+fn test_complex_all_sources_filter_single() {
+    // ~10 = single item at position 10
     let q = parse_query("*:*:*:*:%/cargo test/~10");
     assert!(q.is_all_sources());
     assert_eq!(q.filters.len(), 1);
     assert!(matches!(&q.filters[0], QueryComponent::CommandRegex(p) if p == "cargo test"));
     assert_eq!(q.range, Some(RangeSelector { start: 10, end: None }));
+    assert!(q.range.unwrap().is_single());
+}
+
+#[test]
+fn test_complex_all_sources_filter_last_n() {
+    // ~10: = last 10 items
+    let q = parse_query("*:*:*:*:%/cargo test/~10:");
+    assert!(q.is_all_sources());
+    assert_eq!(q.filters.len(), 1);
+    assert!(matches!(&q.filters[0], QueryComponent::CommandRegex(p) if p == "cargo test"));
+    let range = q.range.unwrap();
+    assert!(range.is_last_n());
+    assert_eq!(range.last_n_count(), Some(10));
 }
 
 #[test]

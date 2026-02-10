@@ -6,8 +6,9 @@ use std::process::Command;
 use std::time::Instant;
 
 use bird::{
-    init, parse_query, CompactOptions, Config, EventFilters, InvocationBatch, InvocationRecord,
-    Query, SessionRecord, StorageMode, Store, BIRD_INVOCATION_UUID_VAR, BIRD_PARENT_CLIENT_VAR,
+    init, parse_query, CompactOptions, Config, ContextMetadata, EventFilters, InvocationBatch,
+    InvocationRecord, Query, SessionRecord, StorageMode, Store, BIRD_INVOCATION_UUID_VAR,
+    BIRD_PARENT_CLIENT_VAR,
 };
 use pty_process::blocking::{Command as PtyCommand, open as pty_open};
 
@@ -241,6 +242,9 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
         "shell",
     );
 
+    // Collect context metadata (VCS, CI)
+    let context = ContextMetadata::collect(Some(std::path::Path::new(&cwd)));
+
     let mut record = InvocationRecord::with_id(
         invocation_id,
         &sid,
@@ -249,7 +253,8 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
         exit_code,
         &config.client_id,
     )
-    .with_duration(duration_ms);
+    .with_duration(duration_ms)
+    .with_metadata(context.into_map());
 
     if let Some(t) = tag {
         record = record.with_tag(t);
@@ -439,13 +444,18 @@ pub fn save(
         explicit_invoker_type,
     );
 
+    // Collect context metadata (VCS, CI)
+    let context = ContextMetadata::collect(Some(std::path::Path::new(&cwd)));
+
     let mut inv_record = InvocationRecord::new(
         &sid,
         command,
         &cwd,
         exit_code,
         &config.client_id,
-    );
+    )
+    .with_metadata(context.into_map());
+
     if let Some(ms) = duration_ms {
         inv_record = inv_record.with_duration(ms);
     }
@@ -749,9 +759,9 @@ pub fn invocations(query_str: &str, format: &str, limit: Option<usize>) -> bird:
     // Parse query and apply filters
     let mut query = parse_query(query_str);
 
-    // Override range if -n/--limit is provided
+    // Override range if -n/--last is provided (last N items)
     if let Some(n) = limit {
-        query.range = Some(bird::RangeSelector { start: n, end: None });
+        query.range = Some(bird::RangeSelector { start: n, end: Some(0) });
     }
 
     let invocations = store.query_invocations(&query)?;
@@ -1944,16 +1954,17 @@ fn try_find_by_id(store: &Store, query_str: &str) -> bird::Result<Option<String>
 
 /// Resolve a query to a single invocation ID.
 fn resolve_query_to_invocation(store: &Store, query: &Query) -> bird::Result<String> {
-    // Apply filters and get matching invocations (default to 1 for single-item commands)
+    // For single-item commands, the range selector determines which item:
+    // - ~N = single item at position N (1 = most recent)
+    // - ~N: = last N items, we take the most recent (position 1)
+    // - ~N:~M = range from N to M, we take position M (most recent in range)
+    // - No range = default to position 1 (most recent)
+
+    // query_invocations_with_limit handles the range semantics, returning
+    // the correct subset. For single-item commands, we just take the first result.
     let invocations = store.query_invocations_with_limit(query, 1)?;
 
-    // The range.start indicates how many results we want, and we take the last one
-    // e.g., ~1 means "last 1" so we get 1 result and take it
-    // e.g., ~5 means "last 5" so we get 5 results and take the 5th (oldest of those)
-    let n = query.range.map(|r| r.start).unwrap_or(1);
-    let idx = n.min(invocations.len()).saturating_sub(1);
-
-    if let Some(inv) = invocations.get(idx) {
+    if let Some(inv) = invocations.first() {
         Ok(inv.id.clone())
     } else {
         Err(bird::Error::NotFound("No matching invocation found".to_string()))
@@ -2150,6 +2161,9 @@ pub fn rerun(query_str: &str, dry_run: bool, no_capture: bool) -> bird::Result<(
             "shell",
         );
 
+        // Collect context metadata (VCS, CI)
+        let context = ContextMetadata::collect(Some(std::path::Path::new(cwd)));
+
         let record = InvocationRecord::new(
             &sid,
             cmd,
@@ -2157,7 +2171,8 @@ pub fn rerun(query_str: &str, dry_run: bool, no_capture: bool) -> bird::Result<(
             exit_code,
             &config.client_id,
         )
-        .with_duration(duration_ms);
+        .with_duration(duration_ms)
+        .with_metadata(context.into_map());
 
         // Build batch with all related records
         let mut batch = InvocationBatch::new(record).with_session(session);
@@ -2187,8 +2202,8 @@ SHQ QUICK REFERENCE
 COMMANDS                                    EXAMPLES
 ────────────────────────────────────────────────────────────────────────────────
 output (o, show)   Show captured output     shq o ~1          shq o %/make/~1
-invocations (i)    List command history     shq i ~20         shq i %exit<>0~10
-events (e)         Show parsed events       shq e ~10         shq e -s error ~5
+invocations (i)    List command history     shq i -n 20       shq i %exit<>0~10:
+events (e)         Show parsed events       shq e -n 10       shq e -s error~5:
 info (I)           Invocation details       shq I ~1          shq I %/test/~1
 rerun (R, !!)      Re-run a command         shq R ~1          shq R %/make/~1
 run (r)            Run and capture          shq r cargo test  shq r -c "make all"
@@ -2196,9 +2211,11 @@ sql (q)            Execute SQL query        shq q "SELECT * FROM invocations LIM
 
 QUERY SYNTAX: [source][path][filters][range]
 ────────────────────────────────────────────────────────────────────────────────
-RANGE         1 or ~1     Last command
-              5 or ~5     Last 5 commands
-              ~10:5       Commands 10 to 5 ago
+RANGE         ~1          Most recent command (position 1)
+              ~5          5th most recent command (position 5)
+              ~10:        Last 10 commands (positions 1-10)
+              ~10:~5      Range from position 10 to 5
+              -n 10       CLI flag: last 10 (same as ~10:)
 
 SOURCE        Format: host:type:client:session:
               shell:           Shell commands on this host

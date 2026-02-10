@@ -214,6 +214,12 @@ fn create_placeholder_schemas(conn: &duckdb::Connection) -> Result<()> {
             o.signal,
             o.timeout,
             o.completed_at,
+            CASE
+                WHEN a.metadata IS NULL AND o.metadata IS NULL THEN NULL
+                WHEN a.metadata IS NULL THEN o.metadata
+                WHEN o.metadata IS NULL THEN a.metadata
+                ELSE map_concat(a.metadata::MAP(VARCHAR, JSON), o.metadata::MAP(VARCHAR, JSON))
+            END AS metadata,
             a.date,
             a._source
         FROM cached_placeholder.attempts a
@@ -277,6 +283,12 @@ fn create_placeholder_schemas(conn: &duckdb::Connection) -> Result<()> {
             o.signal,
             o.timeout,
             o.completed_at,
+            CASE
+                WHEN a.metadata IS NULL AND o.metadata IS NULL THEN NULL
+                WHEN a.metadata IS NULL THEN o.metadata
+                WHEN o.metadata IS NULL THEN a.metadata
+                ELSE map_concat(a.metadata::MAP(VARCHAR, JSON), o.metadata::MAP(VARCHAR, JSON))
+            END AS metadata,
             a.date,
             a._source
         FROM remote_placeholder.attempts a
@@ -364,6 +376,12 @@ fn create_union_schemas(conn: &duckdb::Connection) -> Result<()> {
             o.signal,
             o.timeout,
             o.completed_at,
+            CASE
+                WHEN a.metadata IS NULL AND o.metadata IS NULL THEN NULL
+                WHEN a.metadata IS NULL THEN o.metadata
+                WHEN o.metadata IS NULL THEN a.metadata
+                ELSE map_concat(a.metadata::MAP(VARCHAR, JSON), o.metadata::MAP(VARCHAR, JSON))
+            END AS metadata,
             a.date,
             a._source
         FROM main.attempts a
@@ -414,6 +432,12 @@ fn create_union_schemas(conn: &duckdb::Connection) -> Result<()> {
             o.signal,
             o.timeout,
             o.completed_at,
+            CASE
+                WHEN a.metadata IS NULL AND o.metadata IS NULL THEN NULL
+                WHEN a.metadata IS NULL THEN o.metadata
+                WHEN o.metadata IS NULL THEN a.metadata
+                ELSE map_concat(a.metadata::MAP(VARCHAR, JSON), o.metadata::MAP(VARCHAR, JSON))
+            END AS metadata,
             a.date,
             a._source
         FROM unified.attempts a
@@ -534,7 +558,7 @@ fn create_local_parquet_views(conn: &duckdb::Connection) -> Result<()> {
                 WHEN a.metadata IS NULL AND o.metadata IS NULL THEN NULL
                 WHEN a.metadata IS NULL THEN o.metadata
                 WHEN o.metadata IS NULL THEN a.metadata
-                ELSE map_concat(a.metadata, o.metadata)
+                ELSE map_concat(a.metadata::MAP(VARCHAR, JSON), o.metadata::MAP(VARCHAR, JSON))
             END AS metadata,
             a.date
         FROM local.attempts a
@@ -640,7 +664,7 @@ fn create_local_tables(conn: &duckdb::Connection) -> Result<()> {
                 WHEN a.metadata IS NULL AND o.metadata IS NULL THEN NULL
                 WHEN a.metadata IS NULL THEN o.metadata
                 WHEN o.metadata IS NULL THEN a.metadata
-                ELSE map_concat(a.metadata, o.metadata)
+                ELSE map_concat(a.metadata::MAP(VARCHAR, JSON), o.metadata::MAP(VARCHAR, JSON))
             END AS metadata,
             a.date
         FROM local.attempts a

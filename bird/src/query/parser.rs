@@ -95,12 +95,38 @@ pub enum CompareOp {
 }
 
 /// Range selector for limiting results.
+///
+/// Uses git-style positional semantics:
+/// - `~N` = single item at position N (1 = most recent)
+/// - `~N:` = range from position N to now (last N items)
+/// - `~N:~M` = range from position N to position M
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RangeSelector {
-    /// Start offset from most recent (e.g., 5 = 5th most recent)
+    /// Start position from most recent (1 = most recent, 2 = second most recent)
     pub start: usize,
-    /// End offset (None = just start count, Some = range)
+    /// End position: None = single item, Some(0) = open range to now, Some(N) = to position N
     pub end: Option<usize>,
+}
+
+impl RangeSelector {
+    /// Returns true if this selects a single item (no range).
+    pub fn is_single(&self) -> bool {
+        self.end.is_none()
+    }
+
+    /// Returns true if this is an open range to now (last N items).
+    pub fn is_last_n(&self) -> bool {
+        self.end == Some(0)
+    }
+
+    /// Returns the count of items if this is a "last N" range.
+    pub fn last_n_count(&self) -> Option<usize> {
+        if self.end == Some(0) {
+            Some(self.start)
+        } else {
+            None
+        }
+    }
 }
 
 /// Parse a query string into structured components.
@@ -326,7 +352,13 @@ fn find_path_end(input: &str) -> usize {
     input.len()
 }
 
-/// Try to parse a range selector (~N, ~N:~M, or bare N).
+/// Try to parse a range selector.
+///
+/// Git-style positional semantics:
+/// - `~N` = single item at position N
+/// - `~N:` = last N items (range from N to now)
+/// - `~N:~M` or `~N:M` = range from position N to M
+/// - Bare `N` = single item at position N (shorthand for ~N)
 fn try_parse_range(input: &str) -> Option<(RangeSelector, &str)> {
     // Try ~N format first
     if input.starts_with('~') {
@@ -344,12 +376,13 @@ fn try_parse_range(input: &str) -> Option<(RangeSelector, &str)> {
 
         let start: usize = input[1..end].parse().ok()?;
 
-        // Check for :M or :~M range
+        // Check for colon (range indicator)
         if input[end..].starts_with(':') {
             let after_colon = &input[end + 1..];
             // Skip optional ~
             let range_rest = after_colon.strip_prefix('~').unwrap_or(after_colon);
 
+            // Check if there's a number after the colon
             let mut range_end = 0;
             while range_end < range_rest.len()
                 && range_rest[range_end..]
@@ -361,6 +394,7 @@ fn try_parse_range(input: &str) -> Option<(RangeSelector, &str)> {
             }
 
             if range_end > 0 {
+                // ~N:M or ~N:~M - closed range from N to M
                 let end_val: usize = range_rest[..range_end].parse().ok()?;
                 let rest = &range_rest[range_end..];
                 return Some((
@@ -370,16 +404,28 @@ fn try_parse_range(input: &str) -> Option<(RangeSelector, &str)> {
                     },
                     rest,
                 ));
+            } else {
+                // ~N: - open range (last N items)
+                // Consume the colon, rest is after it
+                let rest = after_colon;
+                return Some((
+                    RangeSelector {
+                        start,
+                        end: Some(0), // 0 indicates "to now"
+                    },
+                    rest,
+                ));
             }
         }
 
+        // ~N alone - single item at position N
         return Some((
             RangeSelector { start, end: None },
             &input[end..],
         ));
     }
 
-    // Try bare integer (N = ~N)
+    // Try bare integer (N = ~N, single item)
     let first = input.chars().next()?;
     if first.is_ascii_digit() {
         let mut end = 0;

@@ -69,6 +69,11 @@ pub struct InvocationRecord {
 
     /// User-defined tag (unique alias for this invocation, like git tags).
     pub tag: Option<String>,
+
+    /// Extensible metadata (VCS info, CI context, etc.).
+    /// Stored on the AttemptRecord when converted to v5 schema.
+    #[serde(default)]
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 // =============================================================================
@@ -368,6 +373,7 @@ impl InvocationRecord {
             hostname: gethostname::gethostname().to_str().map(|s| s.to_string()),
             username: std::env::var("USER").ok(),
             tag: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -400,6 +406,7 @@ impl InvocationRecord {
             hostname: gethostname::gethostname().to_str().map(|s| s.to_string()),
             username: std::env::var("USER").ok(),
             tag: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -444,6 +451,7 @@ impl InvocationRecord {
             hostname: gethostname::gethostname().to_str().map(|s| s.to_string()),
             username: std::env::var("USER").ok(),
             tag: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -508,6 +516,26 @@ impl InvocationRecord {
         self
     }
 
+    /// Add a single metadata entry.
+    pub fn with_metadata_entry(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.metadata.insert(key.into(), value);
+        self
+    }
+
+    /// Set all metadata from a HashMap.
+    pub fn with_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Merge metadata from a HashMap (existing entries are preserved).
+    pub fn merge_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
+        for (key, value) in metadata {
+            self.metadata.entry(key).or_insert(value);
+        }
+        self
+    }
+
     /// Get the date portion of the timestamp (for partitioning).
     pub fn date(&self) -> NaiveDate {
         self.timestamp.date_naive()
@@ -532,7 +560,7 @@ impl InvocationRecord {
             hostname: self.hostname.clone(),
             executable: self.executable.clone(),
             format_hint: self.format_hint.clone(),
-            metadata: HashMap::new(),
+            metadata: self.metadata.clone(),
             date: self.date(),
         }
     }
@@ -588,6 +616,7 @@ impl InvocationRecord {
             hostname: attempt.hostname.clone(),
             username: None,
             tag: attempt.tag.clone(),
+            metadata: attempt.metadata.clone(),
         }
     }
 }

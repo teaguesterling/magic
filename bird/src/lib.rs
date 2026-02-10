@@ -3,6 +3,7 @@
 //! Storage layer for shell command history using DuckDB and Parquet.
 
 pub mod config;
+pub mod context;
 pub mod error;
 pub mod format_hints;
 pub mod init;
@@ -26,6 +27,7 @@ pub use schema::{
     // Environment variables
     BIRD_INVOCATION_UUID_VAR, BIRD_PARENT_CLIENT_VAR,
 };
+pub use context::ContextMetadata;
 pub use store::{
     parse_since, ArchiveStats, AutoCompactOptions, BuiltinFormat, CompactOptions, CompactStats,
     ConnectionOptions, EventFilters, EventSummary, FormatMatch, FormatSource, InvocationBatch,

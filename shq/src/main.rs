@@ -174,8 +174,8 @@ enum Commands {
     /// List invocation history
     #[command(visible_aliases = ["i", "history", "list"])]
     Invocations {
-        /// Query selector (e.g., ~20, shell:~10, %failed~5)
-        #[arg(default_value = "~20")]
+        /// Query selector (e.g., ~20:, shell:~10:, %failed~5:)
+        #[arg(default_value = "~20:")]
         query: String,
 
         /// Output format: compact (default), table, json
@@ -186,9 +186,9 @@ enum Commands {
         #[arg(short = 'd', long = "details")]
         details: bool,
 
-        /// Limit to N most recent invocations (overrides ~N in query)
-        #[arg(short = 'n', long = "limit")]
-        limit: Option<usize>,
+        /// Show last N invocations (equivalent to ~N: in query)
+        #[arg(short = 'n', long = "last")]
+        last: Option<usize>,
     },
 
     /// Show detailed info about an invocation
@@ -368,8 +368,8 @@ enum Commands {
     /// Query parsed events (errors, warnings, test results) from invocation outputs
     #[command(visible_alias = "e")]
     Events {
-        /// Query selector (e.g., ~10, %exit<>0~5, %/cargo/~10)
-        #[arg(default_value = "~10")]
+        /// Query selector (e.g., ~10:, %exit<>0~5:, %/cargo/~10:)
+        #[arg(default_value = "~10:")]
         query: String,
 
         /// Filter by severity (error, warning, info, note)
@@ -633,9 +633,9 @@ fn main() {
             };
             commands::output(&query, resolved_stream, &opts)
         }
-        Commands::Invocations { query, format, details, limit } => {
+        Commands::Invocations { query, format, details, last } => {
             let fmt = if details { "table" } else { &format };
-            commands::invocations(&query, fmt, limit)
+            commands::invocations(&query, fmt, last)
         }
         Commands::Info { query, format, field } => commands::info(&query, &format, field.as_deref()),
         Commands::Rerun { query, dry_run, no_capture } => commands::rerun(&query, dry_run, no_capture),

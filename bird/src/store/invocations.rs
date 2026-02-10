@@ -165,7 +165,28 @@ impl Store {
             format!("WHERE {}", where_clauses.join(" AND "))
         };
 
-        let limit = query.range.map(|r| r.start).unwrap_or(default_limit);
+        // Determine limit and offset based on range selector semantics:
+        // - Single item (end: None): position N means OFFSET N-1, LIMIT 1
+        // - Last N (end: Some(0)): LIMIT N
+        // - Range (end: Some(M)): positions from N to M
+        let (limit, offset) = if let Some(range) = query.range {
+            if range.is_single() {
+                // ~N = single item at position N (1-indexed)
+                (1, range.start.saturating_sub(1))
+            } else if range.is_last_n() {
+                // ~N: = last N items
+                (range.start, 0)
+            } else {
+                // ~N:~M = range from position N to M
+                // Position N is offset N-1, position M is offset M-1
+                // So we need M items starting at offset (start - 1)
+                let end_pos = range.end.unwrap_or(1);
+                let count = range.start.saturating_sub(end_pos) + 1;
+                (count, end_pos.saturating_sub(1))
+            }
+        } else {
+            (default_limit, 0)
+        };
 
         let sql = format!(
             r#"
@@ -173,8 +194,9 @@ impl Store {
             FROM recent_invocations
             {}
             LIMIT {}
+            OFFSET {}
             "#,
-            where_sql, limit
+            where_sql, limit, offset
         );
 
         let mut stmt = match conn.prepare(&sql) {

@@ -2011,3 +2011,55 @@ fn test_parquet_mode_compact_works() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("5"), "Should still have 5 invocations after compact: {}", stdout);
 }
+
+// ============================================================================
+// Context Metadata Tests
+// ============================================================================
+
+#[test]
+fn test_metadata_vcs_context_collected() {
+    // This test runs in a git repo, so VCS metadata should be collected
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command - metadata should be collected
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "metadata test"])
+        .output()
+        .expect("failed to run");
+
+    // Query metadata - should have VCS context
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT metadata::VARCHAR FROM attempts WHERE cmd LIKE '%metadata test%'"])
+        .output()
+        .expect("failed to query");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should contain vcs metadata with branch, commit, dirty fields
+    assert!(stdout.contains("vcs"), "Should have VCS metadata: {}", stdout);
+    assert!(stdout.contains("branch"), "Should have branch in VCS: {}", stdout);
+    assert!(stdout.contains("commit"), "Should have commit in VCS: {}", stdout);
+}
+
+#[test]
+fn test_metadata_accessible_via_invocations_view() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "view metadata"])
+        .output()
+        .expect("failed to run");
+
+    // Query via invocations VIEW - metadata should be merged
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT metadata::VARCHAR FROM invocations WHERE cmd LIKE '%view metadata%'"])
+        .output()
+        .expect("failed to query");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("vcs"), "Should have VCS metadata in VIEW: {}", stdout);
+}
