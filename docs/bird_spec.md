@@ -1,8 +1,8 @@
-# BIRD Specification v3 (Dual Storage Backends + Remote Sync)
+# BIRD Specification v4 (In-Flight Tracking + Crash Recovery)
 
 **BIRD**: Buffer and Invocation Record Database
 
-BIRD is the database backend for shq, using DuckDB for queries and either Parquet files or DuckDB tables for storage. This version adds **dual storage backends** and **remote sync** capabilities.
+BIRD is the database backend for shq, using DuckDB for queries and either Parquet files or DuckDB tables for storage. This version adds **in-flight invocation tracking** with crash recovery, **status partitioning**, and the **clean/prune** command.
 
 ## Overview
 
@@ -16,9 +16,11 @@ BIRD stores every shell command execution as:
 
 - **Dual storage backends**: Choose parquet (multi-writer safe) or duckdb (simpler, single-writer)
 - **Content-addressed blobs**: Automatic deduplication for large outputs (70-90% savings)
+- **In-flight tracking**: Track pending invocations with crash recovery support
+- **Status partitioning**: Separate pending, completed, and orphaned invocations
 - **Remote sync**: Push/pull data to S3, MotherDuck, PostgreSQL, or file-based remotes
 - **Event parsing**: Extract structured diagnostics from build output (gcc, cargo, pytest, etc.)
-- **Date partitioning**: Efficient archival and time-based queries
+- **Clean/prune**: Recover orphaned invocations and clean up old data
 
 ## Directory Structure
 

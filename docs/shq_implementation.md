@@ -9,7 +9,7 @@ The `shq` binary provides:
 - **Query interface**: `invocations`, `output`, `info`, `events`, `sql` - query history
 - **Command replay**: `rerun` - re-execute previous commands
 - **Event parsing**: `events`, `extract-events`, `format-hints` - structured diagnostics
-- **Database management**: `init`, `compact`, `archive`, `stats` - storage lifecycle
+- **Database management**: `init`, `compact`, `archive`, `clean`, `stats` - storage lifecycle
 - **Remote sync**: `remote`, `push`, `pull` - multi-machine data sharing
 - **Shell integration**: `hook init` - zsh/bash hooks
 
@@ -31,6 +31,7 @@ Commands (with aliases):
   stats                    Show database statistics
   archive                  Move old data to archive tier
   compact                  Compact parquet files
+  clean                    Recover orphaned invocations, prune old data
   extract-events           Extract events from outputs
   format-hints             Manage format detection hints
   remote                   Manage remote storage
@@ -803,6 +804,58 @@ Where:
 - `<uuid>` - Unique identifier for the compacted file
 
 This allows queries to track compaction history and maintain proper session grouping.
+
+### `shq clean [options]`
+
+Recover orphaned invocations and clean up stale data:
+
+```rust
+pub fn cmd_clean(
+    max_age_hours: u32,
+    prune: bool,
+    older_than_days: u32,
+    dry_run: bool,
+) -> Result<()> {
+    let store = open_store()?;
+
+    // Recover orphaned invocations from pending files
+    let stats = store.clean(&CleanOptions {
+        dry_run,
+        max_age_hours,
+        prune,
+        older_than_days,
+    })?;
+
+    println!("Clean: checked {} pending, {} orphaned, {} still running",
+        stats.pending_checked, stats.orphaned, stats.still_running);
+
+    if prune && stats.pruned_files > 0 {
+        println!("Prune: removed {} files ({} bytes freed)",
+            stats.pruned_files, stats.bytes_freed);
+    }
+
+    Ok(())
+}
+```
+
+Options:
+- `--max-age N` (default: 24) - Mark as orphaned if pending file is older than N hours
+- `--prune` - Also prune old archive data
+- `--older-than SPEC` (default: 365d) - Prune archive data older than this (when --prune)
+- `-n, --dry-run` - Show what would be cleaned without making changes
+
+**Clean Operation:**
+
+1. Scan pending files in `$BIRD_ROOT/db/pending/`
+2. Check runner liveness for each pending invocation:
+   - `pid:N` - Check if process exists with `kill -0`
+   - `gha:run:N` - Assume stale after max_age (GitHub Actions)
+   - `k8s:pod:N` - Assume stale after max_age (Kubernetes)
+3. For dead/stale runners:
+   - Write invocation to `status=orphaned/` partition
+   - Delete pending parquet from `status=pending/`
+   - Delete JSON pending file
+4. If `--prune`: delete archive data older than `--older-than`
 
 ## Testing
 

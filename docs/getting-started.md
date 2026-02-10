@@ -47,10 +47,12 @@ This creates the directory structure at `~/.local/share/bird/`:
 ```
 ~/.local/share/bird/
 ├── db/
-│   └── bird.duckdb           # Main DuckDB database
+│   ├── bird.duckdb           # Main DuckDB database
+│   └── pending/              # In-flight invocation markers (crash recovery)
 ├── data/
 │   ├── recent/               # Hot tier (0-14 days)
 │   │   ├── invocations/
+│   │   │   └── status=<status>/  # pending, completed, orphaned
 │   │   ├── outputs/
 │   │   └── sessions/
 │   └── archive/              # Cold tier (>14 days)
@@ -239,6 +241,30 @@ shq compact --dry-run
 
 !!! note "Automatic Compaction"
     Shell hooks automatically run background compaction after each command, so manual compaction is rarely needed.
+
+### Clean and Recover
+
+Recover orphaned invocations (from crashes, SIGKILL, etc.) and clean up stale data:
+
+```bash
+# Recover orphaned invocations
+shq clean
+
+# Mark as orphaned after 12 hours (default: 24)
+shq clean --max-age 12
+
+# Also prune old archive data
+shq clean --prune
+
+# Prune data older than 90 days
+shq clean --prune --older-than 90d
+
+# Preview what would be cleaned
+shq clean --dry-run
+```
+
+!!! info "What is an orphaned invocation?"
+    When a command crashes, is killed with SIGKILL, or the system reboots unexpectedly, BIRD may have pending invocation records that were never completed. The `shq clean` command detects these by checking if the process (PID) is still alive and marks them as "orphaned" so they appear in your history with the correct status.
 
 ## Remote Storage
 

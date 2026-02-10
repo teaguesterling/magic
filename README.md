@@ -180,17 +180,20 @@ shq sql "
 ```
 ~/.local/share/bird/              # Default BIRD_ROOT
 ├── db/
-│   └── bird.duckdb               # Main DuckDB database
+│   ├── bird.duckdb               # Main DuckDB database
+│   └── pending/                  # In-flight invocation markers (crash recovery)
+│       └── <session>--<uuid>.pending
 ├── data/
 │   ├── recent/                   # Hot tier (0-14 days)
 │   │   ├── invocations/
-│   │   │   └── date=YYYY-MM-DD/*.parquet
+│   │   │   └── status=<status>/  # pending, completed, orphaned
+│   │   │       └── date=YYYY-MM-DD/*.parquet
 │   │   ├── outputs/
 │   │   │   └── date=YYYY-MM-DD/*.parquet
 │   │   └── sessions/
 │   │       └── date=YYYY-MM-DD/*.parquet
 │   └── archive/                  # Cold tier (>14 days)
-│       └── ...                   # Same structure
+│       └── ...                   # Same structure (without status partitioning)
 ├── blobs/
 │   └── content/                  # Content-addressed pool
 │       ├── ab/
@@ -251,6 +254,7 @@ shq sql "QUERY"       # Execute SQL query
 shq stats             # Show statistics
 shq archive           # Move old data to archive tier
 shq compact           # Compact parquet files for better performance
+shq clean             # Recover orphaned commands and clean stale data
 shq hook init         # Generate shell integration code
 ```
 
@@ -378,6 +382,12 @@ shq compact                  # Compact all sessions
 shq compact -s $SESSION_ID   # Compact specific session only
 shq compact --today          # Only compact today's partition
 shq compact --dry-run        # Preview what would be compacted
+
+# Clean up orphaned commands and stale data
+shq clean                    # Recover orphaned invocations
+shq clean --max-age 12       # Mark as orphaned after 12 hours (default: 24)
+shq clean --prune            # Also prune old archive data
+shq clean --dry-run          # Preview what would be cleaned
 ```
 
 Note: Shell hooks automatically run `shq compact -s $session --today -q` in the background after each command to keep file counts manageable.
@@ -592,7 +602,7 @@ shq run make test || {
 
 ### Q: How do I clean up old data?
 
-**A:** Use the archive and compact commands:
+**A:** Use the archive, compact, and clean commands:
 ```bash
 # Archive data older than 14 days (default)
 shq archive
@@ -603,9 +613,15 @@ shq archive --days 30
 # Compact parquet files (reduces file count, improves query performance)
 shq compact
 
+# Clean up orphaned invocations (from crashes/SIGKILL) and prune old archive
+shq clean                    # Recover orphaned commands
+shq clean --prune            # Also prune old archive data
+shq clean --prune --older-than 90d  # Prune data older than 90 days
+
 # Dry-run to see what would happen
 shq archive --dry-run
 shq compact --dry-run
+shq clean --dry-run
 ```
 
 ### Q: Does this work with multiple machines?

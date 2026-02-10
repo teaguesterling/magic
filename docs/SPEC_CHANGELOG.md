@@ -1,6 +1,118 @@
-# BIRD Spec Changelog: Content-Addressed Storage
+# BIRD Spec Changelog
 
-## Summary
+## v4: In-Flight Tracking + Crash Recovery (2026-02-09)
+
+### Summary
+
+BIRD v4 adds comprehensive crash recovery support with in-flight invocation tracking, status partitioning, and the clean/prune command.
+
+### Key Changes
+
+#### 1. Runner ID for Liveness Checking
+
+New `runner_id` field in invocations for tracking execution context:
+
+```sql
+runner_id VARCHAR  -- Format: "pid:12345", "gha:run:123456789", "k8s:pod:abc123"
+```
+
+**Supported formats:**
+- `pid:<number>` - Local process ID (can check with `kill -0`)
+- `gha:run:<id>` - GitHub Actions run ID
+- `k8s:pod:<name>` - Kubernetes pod identifier
+
+#### 2. Status Partitioning
+
+Invocations are now partitioned by status as the first-level hive partition:
+
+```
+invocations/
+└── status=<status>/      # pending, completed, orphaned
+    └── date=YYYY-MM-DD/
+        └── <session>--<exec>--<uuid>.parquet
+```
+
+**Status values:**
+| Status | Description |
+|--------|-------------|
+| `pending` | Command is currently running (exit_code is NULL) |
+| `completed` | Command finished normally (exit code captured) |
+| `orphaned` | Process died without cleanup (crash, SIGKILL, system reboot) |
+
+#### 3. Pending File Operations
+
+Crash-safe JSON markers for in-flight invocations:
+
+```
+$BIRD_ROOT/db/pending/<session_id>--<uuid>.pending
+```
+
+**Pending file format:**
+```json
+{
+  "id": "01937a2b-3c4d-7e8f-9012-3456789abcde",
+  "session_id": "zsh-12345",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "cwd": "/home/user/project",
+  "cmd": "make test",
+  "runner_id": "pid:12345",
+  "client_id": "user@hostname"
+}
+```
+
+**Lifecycle:**
+1. Command starts → Create JSON pending file + write to `status=pending/`
+2. Command completes → Write to `status=completed/`, delete pending files
+3. Crash recovery → Scan pending files, mark dead runners as orphaned
+
+#### 4. Clean/Prune Command
+
+New `shq clean` command for recovery and maintenance:
+
+```bash
+shq clean              # Recover orphaned invocations
+shq clean --dry-run    # Preview what would be cleaned
+shq clean --max-age 12 # Mark as orphaned after 12 hours
+shq clean --prune      # Also prune old archive data
+shq clean --prune --older-than 90d  # Prune data older than 90 days
+```
+
+**Operations:**
+1. Scan pending files for dead/stale runners
+2. Mark orphaned invocations (write to `status=orphaned/`)
+3. Delete stale pending files
+4. Optionally prune old archive data
+
+### Schema Changes
+
+**Invocations table additions:**
+```sql
+runner_id         VARCHAR,                 -- Runner identifier for liveness checking
+status            VARCHAR DEFAULT 'completed',  -- pending, completed, orphaned
+```
+
+### Benefits
+
+- **Crash recovery**: Detect and record commands that crashed or were killed
+- **Better visibility**: See pending and orphaned commands in queries
+- **Cross-platform**: Runner ID supports local PIDs, GitHub Actions, Kubernetes
+- **No data loss**: Pending files persist across crashes for recovery
+
+### Migration
+
+Existing databases will default to `status='completed'` and `runner_id=NULL` for historical data. No migration script required - the new columns are nullable with defaults.
+
+---
+
+## v3: Dual Storage Backends + Remote Sync (2026-01-15)
+
+*Previous version - see below for content-addressed storage changes.*
+
+---
+
+## v2: Content-Addressed Storage (2026-01-02)
+
+### Summary
 
 The BIRD specification has been updated from **UUID-based blob storage** to **content-addressed storage** using BLAKE3 hashing. This enables automatic deduplication, reducing storage by 70-90% for typical CI/CD workloads.
 
