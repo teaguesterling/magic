@@ -1,8 +1,8 @@
-# BIRD v5 Specification Proposal
+# BIRD v5 Specification
 
-**Version:** 5.0 (Draft)
-**Date:** 2026-02-09
-**Status:** Proposal for review
+**Version:** 5.0
+**Date:** 2026-02-10
+**Status:** Implemented
 **Authors:** shq/BIRD team, blq team
 
 ---
@@ -693,4 +693,4 @@ The attempts/outcomes split eliminates pending files and status partitioning. Th
 
 ---
 
-*BIRD v5 Specification Proposal - Ready for review*
+*BIRD v5 Specification - Implemented 2026-02-10*

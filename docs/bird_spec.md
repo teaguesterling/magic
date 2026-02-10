@@ -1,4 +1,10 @@
-# BIRD Specification v4 (In-Flight Tracking + Crash Recovery)
+# BIRD Specification v4 (Legacy)
+
+> **Note:** This is the v4 specification, kept for historical reference.
+> **The current specification is [BIRD v5](spec/v5/bird-v5.md)**, which replaces:
+> - Status partitioning with attempts/outcomes tables
+> - Pending files with VIEW-based pending detection
+> - Fixed schema with extensible MAP metadata
 
 **BIRD**: Buffer and Invocation Record Database
 
@@ -956,4 +962,4 @@ Supported formats: `gcc`, `cargo`, `pytest`, `eslint`, `tsc`, `go`, `auto`
 
 ---
 
-*Version 3: Dual storage backends + remote sync* 🎯
+*Version 4: In-flight tracking + crash recovery (superseded by v5)* 📦

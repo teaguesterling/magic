@@ -54,6 +54,14 @@ Content-addressed blob storage with automatic deduplication:
 - CI/CD workflows with repeated outputs → 70-90% reduction
 - Fast BLAKE3 hashing at 3GB/s
 
+### Clean Crash Recovery (v5)
+The attempts/outcomes schema split provides reliable crash recovery:
+
+- **Attempts:** Record what commands were started
+- **Outcomes:** Record how they completed
+- **Pending detection:** SQL query instead of file markers
+- Status derived from JOIN (pending/completed/orphaned)
+
 ### SQL-Powered Queries
 Query your shell history with the full power of DuckDB:
 
@@ -101,3 +109,5 @@ shq history     # Browse recent commands
 - [Shell Integration](shq_shell_integration.md) - How the hooks work
 - [shq Commands](shq_implementation.md) - Full command reference
 - [SQL Queries](sql-queries.md) - Query examples and tips
+- [BIRD v5 Specification](spec/v5/bird-v5.md) - Database schema and architecture
+- [Spec Changelog](SPEC_CHANGELOG.md) - Version history

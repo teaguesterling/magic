@@ -1,5 +1,140 @@
 # BIRD Spec Changelog
 
+## v5: Attempts/Outcomes Split (2026-02-10)
+
+### Summary
+
+BIRD v5 introduces a clean architectural split between **attempts** (what commands were started) and **outcomes** (how they completed). This eliminates pending files and status partitioning, replacing them with a VIEW-based approach where status is derived from the join.
+
+### Key Changes
+
+#### 1. Schema Split: Attempts + Outcomes
+
+**Before (v4):**
+```sql
+CREATE TABLE invocations (
+    id UUID PRIMARY KEY,
+    -- ... all columns including exit_code, status ...
+    status VARCHAR DEFAULT 'completed'  -- pending, completed, orphaned
+);
+```
+
+**After (v5):**
+```sql
+-- What was tried
+CREATE TABLE attempts (
+    id UUID PRIMARY KEY,
+    timestamp TIMESTAMP NOT NULL,
+    cmd VARCHAR NOT NULL,
+    cwd VARCHAR,
+    session_id VARCHAR,
+    tag VARCHAR,
+    source_client VARCHAR NOT NULL,
+    machine_id VARCHAR,           -- Runner ID for liveness checking
+    hostname VARCHAR,
+    executable VARCHAR,
+    format_hint VARCHAR,
+    metadata MAP(VARCHAR, JSON),  -- Extensible metadata
+    date DATE NOT NULL
+);
+
+-- What happened
+CREATE TABLE outcomes (
+    attempt_id UUID PRIMARY KEY,  -- References attempts.id
+    completed_at TIMESTAMP NOT NULL,
+    exit_code INTEGER,            -- NULL = crashed/orphaned
+    duration_ms BIGINT NOT NULL,
+    signal INTEGER,
+    timeout BOOLEAN,
+    metadata MAP(VARCHAR, JSON),
+    date DATE NOT NULL
+);
+
+-- invocations is now a VIEW
+CREATE VIEW invocations AS
+SELECT
+    a.*, o.completed_at, o.exit_code, o.duration_ms, o.signal, o.timeout,
+    CASE
+        WHEN o.attempt_id IS NULL THEN 'pending'
+        WHEN o.exit_code IS NULL THEN 'orphaned'
+        ELSE 'completed'
+    END AS status
+FROM attempts a
+LEFT JOIN outcomes o ON a.id = o.attempt_id;
+```
+
+#### 2. Simplified Directory Structure
+
+**Before (v4):**
+```
+recent/invocations/status=pending/date=2024-01-15/
+recent/invocations/status=completed/date=2024-01-15/
+recent/invocations/status=orphaned/date=2024-01-15/
+```
+
+**After (v5):**
+```
+recent/attempts/date=2024-01-15/
+recent/outcomes/date=2024-01-15/
+```
+
+No status partitioning - status is derived from the join.
+
+#### 3. Pending Detection via VIEW
+
+**Before (v4):** Pending files in `db/pending/*.pending`
+
+**After (v5):** SQL query
+```sql
+SELECT * FROM attempts WHERE id NOT IN (SELECT attempt_id FROM outcomes)
+```
+
+#### 4. Schema Versioning
+
+New `bird_meta` table for schema versioning:
+
+```sql
+CREATE TABLE bird_meta (
+    key VARCHAR PRIMARY KEY,
+    value VARCHAR NOT NULL,
+    updated_at TIMESTAMP DEFAULT now()
+);
+
+-- Required entries:
+-- schema_version: '5'
+-- primary_client: 'shq' | 'blq' | etc.
+-- created_at: ISO timestamp
+```
+
+#### 5. Extensible Metadata
+
+`MAP(VARCHAR, JSON)` columns on both attempts and outcomes:
+
+```sql
+-- Query metadata
+SELECT * FROM invocations WHERE metadata['vcs']->>'branch' = 'main';
+
+-- Well-known keys: vcs, ci, env, resources, timing
+```
+
+### Benefits
+
+- **Cleaner crash recovery**: No pending files, just query the VIEW
+- **Simpler partitioning**: No status= directory level
+- **Extensibility**: MAP metadata without schema changes
+- **Better separation**: Attempt data vs outcome data clearly separated
+
+### Migration
+
+Existing v4 databases will need migration. The pending file mechanism is deprecated - v5 uses VIEW-based pending detection.
+
+**Breaking changes:**
+- `invocations` is now a VIEW (can't INSERT directly)
+- `db/pending/` directory no longer used
+- `status=` partitioning removed
+
+---
+
 ## v4: In-Flight Tracking + Crash Recovery (2026-02-09)
 
 ### Summary
