@@ -1,12 +1,12 @@
 //! Invocation storage operations.
-
-use std::fs;
+//!
+//! V5 schema: Invocations are now composed of attempts + outcomes.
+//! - write_invocation() writes both attempt and outcome (for completed commands)
+//! - For long-running commands, use start_invocation() and complete_invocation()
 
 use duckdb::params;
 
-use super::atomic;
-use super::{sanitize_filename, Store};
-use crate::config::StorageMode;
+use super::Store;
 use crate::query::{CompareOp, Query, QueryComponent};
 use crate::schema::InvocationRecord;
 use crate::Result;
@@ -22,134 +22,23 @@ pub struct InvocationSummary {
 }
 
 impl Store {
-    /// Write an invocation record to the store.
+    /// Write an invocation record to the store (v5 schema).
     ///
-    /// Behavior depends on storage mode:
-    /// - Parquet: Creates a new Parquet file in the appropriate date partition
-    /// - DuckDB: Inserts directly into the local.invocations
+    /// This writes both an attempt and an outcome record, since the invocation
+    /// is already complete. For long-running commands, use start_invocation()
+    /// followed by complete_invocation().
     pub fn write_invocation(&self, record: &InvocationRecord) -> Result<()> {
-        match self.config.storage_mode {
-            StorageMode::Parquet => self.write_invocation_parquet(record),
-            StorageMode::DuckDB => self.write_invocation_duckdb(record),
+        // Convert InvocationRecord to v5 attempt + outcome
+        let attempt = record.to_attempt();
+        let outcome = record.to_outcome();
+
+        // Write the attempt
+        self.write_attempt(&attempt)?;
+
+        // Write the outcome (if the invocation is completed)
+        if let Some(outcome) = outcome {
+            self.write_outcome(&outcome)?;
         }
-    }
-
-    /// Write invocation to a Parquet file (multi-writer safe).
-    fn write_invocation_parquet(&self, record: &InvocationRecord) -> Result<()> {
-        let conn = self.connection_with_options(false)?;
-        let date = record.date();
-
-        // Ensure the partition directory exists (status-partitioned)
-        let partition_dir = self.config.invocations_dir_with_status(&record.status, &date);
-        fs::create_dir_all(&partition_dir)?;
-
-        // Generate filename: {session}--{executable}--{id}.parquet
-        let executable = record.executable.as_deref().unwrap_or("unknown");
-        let filename = format!(
-            "{}--{}--{}.parquet",
-            sanitize_filename(&record.session_id),
-            sanitize_filename(executable),
-            record.id
-        );
-        let file_path = partition_dir.join(&filename);
-
-        // Write via DuckDB using COPY
-        conn.execute_batch(
-            r#"
-            CREATE OR REPLACE TEMP TABLE temp_invocation (
-                id UUID,
-                session_id VARCHAR,
-                timestamp TIMESTAMP,
-                duration_ms BIGINT,
-                cwd VARCHAR,
-                cmd VARCHAR,
-                executable VARCHAR,
-                runner_id VARCHAR,
-                exit_code INTEGER,
-                status VARCHAR,
-                format_hint VARCHAR,
-                client_id VARCHAR,
-                hostname VARCHAR,
-                username VARCHAR,
-                tag VARCHAR,
-                date DATE
-            );
-            "#,
-        )?;
-
-        conn.execute(
-            r#"
-            INSERT INTO temp_invocation VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )
-            "#,
-            params![
-                record.id.to_string(),
-                record.session_id,
-                record.timestamp.to_rfc3339(),
-                record.duration_ms,
-                record.cwd,
-                record.cmd,
-                record.executable,
-                record.runner_id,
-                record.exit_code,
-                record.status,
-                record.format_hint,
-                record.client_id,
-                record.hostname,
-                record.username,
-                record.tag,
-                date.to_string(),
-            ],
-        )?;
-
-        // Atomic write: COPY to temp file, then rename
-        let temp_path = atomic::temp_path(&file_path);
-        conn.execute(
-            &format!(
-                "COPY temp_invocation TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
-                temp_path.display()
-            ),
-            [],
-        )?;
-        conn.execute("DROP TABLE temp_invocation", [])?;
-
-        // Rename temp to final (atomic on POSIX)
-        atomic::rename_into_place(&temp_path, &file_path)?;
-
-        Ok(())
-    }
-
-    /// Write invocation directly to DuckDB table.
-    fn write_invocation_duckdb(&self, record: &InvocationRecord) -> Result<()> {
-        let conn = self.connection()?;
-        let date = record.date();
-
-        conn.execute(
-            r#"
-            INSERT INTO local.invocations VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )
-            "#,
-            params![
-                record.id.to_string(),
-                record.session_id,
-                record.timestamp.to_rfc3339(),
-                record.duration_ms,
-                record.cwd,
-                record.cmd,
-                record.executable,
-                record.runner_id,
-                record.exit_code,
-                record.status,
-                record.format_hint,
-                record.client_id,
-                record.hostname,
-                record.username,
-                record.tag,
-                date.to_string(),
-            ],
-        )?;
 
         Ok(())
     }
@@ -372,112 +261,95 @@ impl Store {
     }
 
     /// Set or update the tag on an invocation.
+    ///
+    /// V5 schema: Updates the tag on the attempts table.
     pub fn set_tag(&self, invocation_id: &str, tag: Option<&str>) -> Result<()> {
         let conn = self.connection()?;
 
         conn.execute(
-            "UPDATE local.invocations SET tag = ? WHERE id = ?",
+            "UPDATE local.attempts SET tag = ? WHERE id = ?",
             params![tag, invocation_id],
         )?;
 
         Ok(())
     }
 
-    /// Start a pending invocation.
+    /// Start a pending invocation (v5 schema).
     ///
-    /// This:
-    /// 1. Creates a JSON pending file for crash recovery
-    /// 2. Writes the invocation to the status=pending partition
+    /// V5: Writes an attempt record. No pending file needed - pending status
+    /// is derived from attempts without matching outcomes.
     ///
-    /// Returns the pending invocation for later completion.
+    /// Returns the pending invocation for backward compatibility.
+    #[deprecated(note = "V4 API. Use start_invocation() with AttemptRecord instead.")]
     pub fn start_pending_invocation(
         &self,
         record: &InvocationRecord,
     ) -> Result<super::pending::PendingInvocation> {
-        use super::pending::{write_pending_file, PendingInvocation};
+        use super::pending::PendingInvocation;
 
-        // Create pending invocation marker
+        // Create pending invocation marker for backward compatibility
         let pending = PendingInvocation::from_record(record)
             .ok_or_else(|| crate::error::Error::Storage("Missing runner_id".to_string()))?;
 
-        // Write pending file first (crash-safe marker)
-        let pending_dir = self.config.pending_dir();
-        write_pending_file(&pending_dir, &pending)?;
-
-        // Write to status=pending partition
-        self.write_invocation(record)?;
+        // V5: Write attempt record (no outcome yet = pending status)
+        let attempt = record.to_attempt();
+        self.write_attempt(&attempt)?;
 
         Ok(pending)
     }
 
-    /// Complete a pending invocation.
+    /// Complete a pending invocation (v5 schema).
     ///
-    /// This:
-    /// 1. Writes the completed record to status=completed partition
-    /// 2. Deletes the pending parquet file from status=pending partition
-    /// 3. Deletes the JSON pending file
+    /// V5: Writes an outcome record. The attempt was already written by
+    /// start_pending_invocation().
+    #[deprecated(note = "V4 API. Use complete_invocation() with OutcomeRecord instead.")]
     pub fn complete_pending_invocation(
         &self,
         record: &InvocationRecord,
-        pending: &super::pending::PendingInvocation,
+        _pending: &super::pending::PendingInvocation,
     ) -> Result<()> {
-        use super::pending::delete_pending_file;
-
-        // Write completed record
-        self.write_invocation(record)?;
-
-        // Delete pending parquet file
-        let pending_date = pending.timestamp.date_naive();
-        let pending_partition = self.config.invocations_dir_with_status("pending", &pending_date);
-        let executable = record.executable.as_deref().unwrap_or("unknown");
-        let pending_filename = format!(
-            "{}--{}--{}.parquet",
-            sanitize_filename(&pending.session_id),
-            sanitize_filename(executable),
-            pending.id
-        );
-        let pending_parquet = pending_partition.join(&pending_filename);
-        if pending_parquet.exists() {
-            let _ = fs::remove_file(&pending_parquet);
+        // V5: Write outcome record (the attempt already exists)
+        if let Some(outcome) = record.to_outcome() {
+            self.write_outcome(&outcome)?;
         }
-
-        // Delete JSON pending file
-        let pending_dir = self.config.pending_dir();
-        delete_pending_file(&pending_dir, pending.id, &pending.session_id)?;
 
         Ok(())
     }
 
-    /// Recover orphaned invocations from pending files.
+    /// Recover orphaned invocations (v5 schema).
     ///
-    /// This scans pending files and marks invocations as orphaned if:
-    /// - The runner is no longer alive
-    /// - The pending file is older than max_age_hours
+    /// V5: Scans attempts without outcomes and checks if the runner is still alive.
+    /// If not alive, writes an orphaned outcome record.
+    ///
+    /// Note: This now looks at machine_id field which stores the runner_id for local invocations.
     pub fn recover_orphaned_invocations(
         &self,
         max_age_hours: u32,
         dry_run: bool,
     ) -> Result<super::pending::RecoveryStats> {
-        use super::pending::{
-            delete_pending_file, is_runner_alive, list_pending_files, RecoveryStats,
-        };
+        use super::pending::{is_runner_alive, RecoveryStats};
 
-        let pending_dir = self.config.pending_dir();
-        let pending_files = list_pending_files(&pending_dir)?;
+        // V5: Get pending attempts (attempts without outcomes)
+        let pending_attempts = self.get_pending_attempts()?;
         let mut stats = RecoveryStats::default();
 
         let now = chrono::Utc::now();
         let max_age = chrono::Duration::hours(max_age_hours as i64);
 
-        for pending in pending_files {
+        for attempt in pending_attempts {
             stats.pending_checked += 1;
 
             // Check if too old (runner ID might have been recycled)
-            let age = now.signed_duration_since(pending.timestamp);
+            let age = now.signed_duration_since(attempt.timestamp);
             let is_stale = age > max_age;
 
-            // Check if runner is still alive
-            let runner_alive = !is_stale && is_runner_alive(&pending.runner_id);
+            // Check if runner is still alive (machine_id stores runner_id for local invocations)
+            let runner_alive = if let Some(ref runner_id) = attempt.machine_id {
+                !is_stale && is_runner_alive(runner_id)
+            } else {
+                // No runner_id means we can't check - mark as orphaned if stale
+                !is_stale
+            };
 
             if runner_alive {
                 stats.still_running += 1;
@@ -489,45 +361,9 @@ impl Store {
                 continue;
             }
 
-            // Create orphaned record
-            let orphaned_record = InvocationRecord {
-                id: pending.id,
-                session_id: pending.session_id.clone(),
-                timestamp: pending.timestamp,
-                duration_ms: None, // Unknown
-                cwd: pending.cwd.clone(),
-                cmd: pending.cmd.clone(),
-                executable: extract_executable(&pending.cmd),
-                runner_id: Some(pending.runner_id.clone()),
-                exit_code: None, // Unknown/crashed
-                status: "orphaned".to_string(),
-                format_hint: None,
-                client_id: pending.client_id.clone(),
-                hostname: None, // Not available from pending file
-                username: None, // Not available from pending file
-                tag: None,
-            };
-
-            // Write to status=orphaned partition
-            match self.write_invocation(&orphaned_record) {
+            // V5: Write orphaned outcome record
+            match self.orphan_invocation(attempt.id, attempt.date) {
                 Ok(()) => {
-                    // Delete pending parquet file
-                    let pending_date = pending.timestamp.date_naive();
-                    let pending_partition =
-                        self.config.invocations_dir_with_status("pending", &pending_date);
-                    let executable = orphaned_record.executable.as_deref().unwrap_or("unknown");
-                    let pending_filename = format!(
-                        "{}--{}--{}.parquet",
-                        sanitize_filename(&pending.session_id),
-                        sanitize_filename(executable),
-                        pending.id
-                    );
-                    let pending_parquet = pending_partition.join(&pending_filename);
-                    let _ = fs::remove_file(&pending_parquet);
-
-                    // Delete JSON pending file
-                    let _ = delete_pending_file(&pending_dir, pending.id, &pending.session_id);
-
                     stats.orphaned += 1;
                 }
                 Err(_) => {
@@ -538,13 +374,6 @@ impl Store {
 
         Ok(stats)
     }
-}
-
-/// Extract executable name from command string.
-fn extract_executable(cmd: &str) -> Option<String> {
-    cmd.split_whitespace()
-        .next()
-        .map(|s| s.rsplit('/').next().unwrap_or(s).to_string())
 }
 
 #[cfg(test)]
@@ -648,10 +477,10 @@ mod tests {
         );
         store.write_invocation(&record).unwrap();
 
-        // Check no .tmp files in invocations directory
+        // V5: Check no .tmp files in attempts directory
         let date = record.date();
-        let inv_dir = store.config().invocations_dir(&date);
-        let temps: Vec<_> = std::fs::read_dir(&inv_dir)
+        let attempts_dir = store.config().attempts_dir(&date);
+        let temps: Vec<_> = std::fs::read_dir(&attempts_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_str().unwrap_or("").starts_with(".tmp."))
@@ -659,7 +488,7 @@ mod tests {
         assert!(
             temps.is_empty(),
             "No temp files should remain in {:?}",
-            inv_dir
+            attempts_dir
         );
     }
 
@@ -768,132 +597,124 @@ mod tests {
 
     #[test]
     fn test_pending_invocation_lifecycle() {
-        let (tmp, store) = setup_store();
+        let (_tmp, store) = setup_store();
 
-        // Create a pending invocation (using current process PID)
-        let record = InvocationRecord::new_pending_local(
+        // V5: Use AttemptRecord and OutcomeRecord for pending lifecycle
+        use crate::schema::AttemptRecord;
+
+        // Create an attempt (invocation start)
+        let attempt = AttemptRecord::new(
             "test-session",
             "long-running-command",
             "/home/user",
-            std::process::id() as i32,
             "test@client",
         );
 
-        // Start the pending invocation
-        let pending = store.start_pending_invocation(&record).unwrap();
+        // Start the invocation (writes attempt, no outcome)
+        store.start_invocation(&attempt).unwrap();
 
-        // Verify pending file was created
-        let pending_dir = tmp.path().join("db/pending");
-        let pending_path = pending.path(&pending_dir);
-        assert!(pending_path.exists(), "Pending file should exist");
+        // Verify attempt was written
+        let count = store.attempt_count().unwrap();
+        assert_eq!(count, 1, "Attempt should be written");
 
-        // Verify invocation was written to status=pending partition
-        let date = record.date();
-        let pending_partition = tmp
-            .path()
-            .join("db/data/recent/invocations")
-            .join("status=pending")
-            .join(format!("date={}", date));
-        assert!(pending_partition.exists(), "Pending partition should exist");
+        // Verify invocation shows as pending (no outcome yet)
+        let pending = store.get_pending_attempts().unwrap();
+        assert_eq!(pending.len(), 1, "Should have one pending attempt");
+        assert_eq!(pending[0].id, attempt.id);
 
-        // Complete the invocation
-        let completed_record = record.complete(0, Some(100));
-        store
-            .complete_pending_invocation(&completed_record, &pending)
-            .unwrap();
+        // Complete the invocation (write outcome)
+        store.complete_invocation(attempt.id, 0, Some(100), attempt.date).unwrap();
 
-        // Verify pending file was deleted
-        assert!(!pending_path.exists(), "Pending file should be deleted");
+        // Verify outcome was written
+        let outcome_count = store.outcome_count().unwrap();
+        assert_eq!(outcome_count, 1, "Outcome should be written");
 
-        // Verify completed record was written
-        let completed_partition = tmp
-            .path()
-            .join("db/data/recent/invocations")
-            .join("status=completed")
-            .join(format!("date={}", date));
-        assert!(
-            completed_partition.exists(),
-            "Completed partition should exist"
-        );
+        // Verify no pending attempts remain
+        let pending_after = store.get_pending_attempts().unwrap();
+        assert!(pending_after.is_empty(), "No pending attempts after completion");
+
+        // Verify invocation shows as completed in the view
+        let invocations = store.recent_invocations(10).unwrap();
+        assert_eq!(invocations.len(), 1, "Should have one invocation");
+        assert_eq!(invocations[0].exit_code, 0);
     }
 
     #[test]
     fn test_recover_orphaned_invocations() {
-        let (tmp, store) = setup_store();
+        let (_tmp, store) = setup_store();
 
-        // Create a pending invocation with a dead PID
-        let record = InvocationRecord::new_pending_local(
+        // V5: Create an attempt without an outcome (simulating a crash)
+        // The machine_id field stores the runner_id (pid:NNNN format) for local invocations
+        use crate::schema::AttemptRecord;
+
+        let mut attempt = AttemptRecord::new(
             "test-session",
             "crashed-command",
             "/home/user",
-            999999999, // PID that doesn't exist
             "test@client",
         );
+        // Set machine_id to a dead PID (non-existent process) with pid: prefix
+        attempt.machine_id = Some("pid:999999999".to_string());
 
-        // Write pending file manually (simulating a crash scenario)
-        let pending =
-            crate::store::pending::PendingInvocation::from_record(&record).unwrap();
-        let pending_dir = tmp.path().join("db/pending");
-        crate::store::pending::write_pending_file(&pending_dir, &pending).unwrap();
+        // Write attempt only (no outcome = pending status)
+        store.write_attempt(&attempt).unwrap();
 
-        // Write to status=pending partition
-        store.write_invocation(&record).unwrap();
+        // Verify attempt exists as pending
+        let pending = store.get_pending_attempts().unwrap();
+        assert_eq!(pending.len(), 1, "Should have one pending attempt");
 
-        // Verify pending file exists
-        let pending_path = pending.path(&pending_dir);
-        assert!(pending_path.exists(), "Pending file should exist before recovery");
-
-        // Run recovery
+        // Run recovery (should mark as orphaned since PID doesn't exist)
         let stats = store.recover_orphaned_invocations(24, false).unwrap();
 
         assert_eq!(stats.pending_checked, 1);
         assert_eq!(stats.orphaned, 1);
         assert_eq!(stats.still_running, 0);
 
-        // Verify pending file was deleted
-        assert!(!pending_path.exists(), "Pending file should be deleted after recovery");
+        // Verify orphaned outcome was written
+        let outcome_count = store.outcome_count().unwrap();
+        assert_eq!(outcome_count, 1, "Orphaned outcome should be written");
 
-        // Verify orphaned record was written
-        let date = record.date();
-        let orphaned_partition = tmp
-            .path()
-            .join("db/data/recent/invocations")
-            .join("status=orphaned")
-            .join(format!("date={}", date));
-        assert!(
-            orphaned_partition.exists(),
-            "Orphaned partition should exist"
-        );
+        // Verify no pending attempts remain
+        let pending_after = store.get_pending_attempts().unwrap();
+        assert!(pending_after.is_empty(), "No pending attempts after recovery");
     }
 
     #[test]
     fn test_recover_skips_running_processes() {
-        let (tmp, store) = setup_store();
+        let (_tmp, store) = setup_store();
 
-        // Create a pending invocation with the current process PID (still alive)
-        let record = InvocationRecord::new_pending_local(
+        // V5: Create an attempt with the current process PID (still alive)
+        use crate::schema::AttemptRecord;
+
+        let mut attempt = AttemptRecord::new(
             "test-session",
             "running-command",
             "/home/user",
-            std::process::id() as i32,
             "test@client",
         );
+        // Set machine_id to current process PID (still alive) with pid: prefix
+        attempt.machine_id = Some(format!("pid:{}", std::process::id()));
 
-        // Write pending file
-        let pending =
-            crate::store::pending::PendingInvocation::from_record(&record).unwrap();
-        let pending_dir = tmp.path().join("db/pending");
-        crate::store::pending::write_pending_file(&pending_dir, &pending).unwrap();
+        // Write attempt only (no outcome = pending status)
+        store.write_attempt(&attempt).unwrap();
 
-        // Run recovery
+        // Verify attempt was written
+        let attempt_count = store.attempt_count().unwrap();
+        assert_eq!(attempt_count, 1, "Attempt should be written");
+
+        // Verify we can get pending attempts
+        let pending_before = store.get_pending_attempts().unwrap();
+        assert_eq!(pending_before.len(), 1, "Should have one pending attempt before recovery");
+
+        // Run recovery (should skip since process is still alive)
         let stats = store.recover_orphaned_invocations(24, false).unwrap();
 
-        assert_eq!(stats.pending_checked, 1);
-        assert_eq!(stats.still_running, 1);
-        assert_eq!(stats.orphaned, 0);
+        assert_eq!(stats.pending_checked, 1, "Should check one pending attempt");
+        assert_eq!(stats.still_running, 1, "Should detect process is still running");
+        assert_eq!(stats.orphaned, 0, "Should not orphan running process");
 
-        // Verify pending file was NOT deleted
-        let pending_path = pending.path(&pending_dir);
-        assert!(pending_path.exists(), "Pending file should still exist for running process");
+        // Verify attempt is still pending (no outcome written)
+        let pending_after = store.get_pending_attempts().unwrap();
+        assert_eq!(pending_after.len(), 1, "Attempt should still be pending");
     }
 }

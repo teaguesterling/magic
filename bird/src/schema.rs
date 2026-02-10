@@ -1,7 +1,21 @@
 //! Schema definitions for BIRD tables.
+//!
+//! # BIRD v5 Schema
+//!
+//! The v5 schema splits invocations into attempts + outcomes:
+//!
+//! - **attempts**: Record of invocation start (cmd, cwd, timestamp, etc.)
+//! - **outcomes**: Record of invocation completion (exit_code, duration, etc.)
+//! - **invocations**: VIEW joining attempts LEFT JOIN outcomes with derived status
+//!
+//! Status is derived from the join:
+//! - `pending`: attempt exists but no outcome
+//! - `completed`: outcome exists with exit_code
+//! - `orphaned`: outcome exists but exit_code is NULL (signal/crash)
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// An invocation record (a captured command/process execution).
@@ -56,6 +70,253 @@ pub struct InvocationRecord {
     /// User-defined tag (unique alias for this invocation, like git tags).
     pub tag: Option<String>,
 }
+
+// =============================================================================
+// BIRD v5 Schema Types: Attempts and Outcomes
+// =============================================================================
+
+/// An attempt record (the start of a command execution).
+///
+/// This represents the "attempt" to run a command - recorded at invocation start.
+/// The outcome (completion) is recorded separately in `OutcomeRecord`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptRecord {
+    /// Unique identifier (UUIDv7 for time-ordering).
+    pub id: Uuid,
+
+    /// When the attempt started.
+    pub timestamp: DateTime<Utc>,
+
+    /// The full command string.
+    pub cmd: String,
+
+    /// Working directory when invocation was executed.
+    pub cwd: String,
+
+    /// Session identifier (groups related invocations).
+    pub session_id: String,
+
+    /// User-defined tag (unique alias for this invocation, like git tags).
+    pub tag: Option<String>,
+
+    /// Client identifier (user@hostname or application name).
+    pub source_client: String,
+
+    /// Machine identifier (for multi-machine setups).
+    pub machine_id: Option<String>,
+
+    /// Hostname where invocation was executed.
+    pub hostname: Option<String>,
+
+    /// Extracted executable name (e.g., "make" from "make test").
+    pub executable: Option<String>,
+
+    /// Detected output format (e.g., "gcc", "pytest").
+    pub format_hint: Option<String>,
+
+    /// Extensible metadata (user-defined key-value pairs).
+    /// Stored as MAP(VARCHAR, JSON) in DuckDB.
+    pub metadata: HashMap<String, serde_json::Value>,
+
+    /// Date for partitioning.
+    pub date: NaiveDate,
+}
+
+impl AttemptRecord {
+    /// Create a new attempt record.
+    ///
+    /// If `BIRD_INVOCATION_UUID` is set in the environment, uses that UUID
+    /// to enable deduplication across nested BIRD clients.
+    pub fn new(
+        session_id: impl Into<String>,
+        cmd: impl Into<String>,
+        cwd: impl Into<String>,
+        source_client: impl Into<String>,
+    ) -> Self {
+        let cmd = cmd.into();
+        let now = Utc::now();
+
+        // Check for inherited invocation UUID from parent BIRD client
+        let id = if let Ok(uuid_str) = std::env::var(BIRD_INVOCATION_UUID_VAR) {
+            Uuid::parse_str(&uuid_str).unwrap_or_else(|_| Uuid::now_v7())
+        } else {
+            Uuid::now_v7()
+        };
+
+        Self {
+            id,
+            timestamp: now,
+            executable: extract_executable(&cmd),
+            cmd,
+            cwd: cwd.into(),
+            session_id: session_id.into(),
+            tag: None,
+            source_client: source_client.into(),
+            machine_id: None,
+            hostname: gethostname::gethostname().to_str().map(|s| s.to_string()),
+            format_hint: None,
+            metadata: HashMap::new(),
+            date: now.date_naive(),
+        }
+    }
+
+    /// Create an attempt record with an explicit UUID.
+    pub fn with_id(
+        id: Uuid,
+        session_id: impl Into<String>,
+        cmd: impl Into<String>,
+        cwd: impl Into<String>,
+        source_client: impl Into<String>,
+    ) -> Self {
+        let cmd = cmd.into();
+        let now = Utc::now();
+
+        Self {
+            id,
+            timestamp: now,
+            executable: extract_executable(&cmd),
+            cmd,
+            cwd: cwd.into(),
+            session_id: session_id.into(),
+            tag: None,
+            source_client: source_client.into(),
+            machine_id: None,
+            hostname: gethostname::gethostname().to_str().map(|s| s.to_string()),
+            format_hint: None,
+            metadata: HashMap::new(),
+            date: now.date_naive(),
+        }
+    }
+
+    /// Set the tag (unique alias for this invocation).
+    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tag = Some(tag.into());
+        self
+    }
+
+    /// Set the machine ID.
+    pub fn with_machine_id(mut self, machine_id: impl Into<String>) -> Self {
+        self.machine_id = Some(machine_id.into());
+        self
+    }
+
+    /// Set the format hint.
+    pub fn with_format_hint(mut self, hint: impl Into<String>) -> Self {
+        self.format_hint = Some(hint.into());
+        self
+    }
+
+    /// Add metadata entry.
+    pub fn with_metadata(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.metadata.insert(key.into(), value);
+        self
+    }
+
+    /// Get the date portion of the timestamp (for partitioning).
+    pub fn date(&self) -> NaiveDate {
+        self.date
+    }
+}
+
+/// An outcome record (the completion of a command execution).
+///
+/// This represents the "outcome" of a command - recorded at invocation end.
+/// Links back to an `AttemptRecord` via `attempt_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeRecord {
+    /// The attempt this outcome is for.
+    pub attempt_id: Uuid,
+
+    /// When the invocation completed.
+    pub completed_at: DateTime<Utc>,
+
+    /// Exit code (None if killed by signal or crashed).
+    pub exit_code: Option<i32>,
+
+    /// How long the invocation took in milliseconds.
+    pub duration_ms: Option<i64>,
+
+    /// Signal that terminated the process (if killed by signal).
+    pub signal: Option<i32>,
+
+    /// Whether the process was terminated due to timeout.
+    pub timeout: bool,
+
+    /// Extensible metadata (user-defined key-value pairs).
+    /// Stored as MAP(VARCHAR, JSON) in DuckDB.
+    pub metadata: HashMap<String, serde_json::Value>,
+
+    /// Date for partitioning (matches the attempt date).
+    pub date: NaiveDate,
+}
+
+impl OutcomeRecord {
+    /// Create a new completed outcome record.
+    pub fn completed(attempt_id: Uuid, exit_code: i32, duration_ms: Option<i64>, date: NaiveDate) -> Self {
+        Self {
+            attempt_id,
+            completed_at: Utc::now(),
+            exit_code: Some(exit_code),
+            duration_ms,
+            signal: None,
+            timeout: false,
+            metadata: HashMap::new(),
+            date,
+        }
+    }
+
+    /// Create an outcome for a process killed by signal.
+    pub fn killed(attempt_id: Uuid, signal: i32, duration_ms: Option<i64>, date: NaiveDate) -> Self {
+        Self {
+            attempt_id,
+            completed_at: Utc::now(),
+            exit_code: None,
+            duration_ms,
+            signal: Some(signal),
+            timeout: false,
+            metadata: HashMap::new(),
+            date,
+        }
+    }
+
+    /// Create an outcome for a timed-out process.
+    pub fn timed_out(attempt_id: Uuid, duration_ms: i64, date: NaiveDate) -> Self {
+        Self {
+            attempt_id,
+            completed_at: Utc::now(),
+            exit_code: None,
+            duration_ms: Some(duration_ms),
+            signal: None,
+            timeout: true,
+            metadata: HashMap::new(),
+            date,
+        }
+    }
+
+    /// Create an orphaned outcome (process crashed or was killed without cleanup).
+    pub fn orphaned(attempt_id: Uuid, date: NaiveDate) -> Self {
+        Self {
+            attempt_id,
+            completed_at: Utc::now(),
+            exit_code: None,
+            duration_ms: None,
+            signal: None,
+            timeout: false,
+            metadata: HashMap::new(),
+            date,
+        }
+    }
+
+    /// Add metadata entry.
+    pub fn with_metadata(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.metadata.insert(key.into(), value);
+        self
+    }
+}
+
+// =============================================================================
+// Legacy v4 Schema Types (for backwards compatibility)
+// =============================================================================
 
 /// Environment variable for sharing invocation UUID between nested BIRD clients.
 ///
@@ -250,6 +511,84 @@ impl InvocationRecord {
     /// Get the date portion of the timestamp (for partitioning).
     pub fn date(&self) -> NaiveDate {
         self.timestamp.date_naive()
+    }
+
+    // =========================================================================
+    // V5 Schema Conversion Methods
+    // =========================================================================
+
+    /// Convert this invocation record to an AttemptRecord (v5 schema).
+    pub fn to_attempt(&self) -> AttemptRecord {
+        AttemptRecord {
+            id: self.id,
+            timestamp: self.timestamp,
+            cmd: self.cmd.clone(),
+            cwd: self.cwd.clone(),
+            session_id: self.session_id.clone(),
+            tag: self.tag.clone(),
+            source_client: self.client_id.clone(),
+            // machine_id stores runner_id for liveness checking
+            machine_id: self.runner_id.clone(),
+            hostname: self.hostname.clone(),
+            executable: self.executable.clone(),
+            format_hint: self.format_hint.clone(),
+            metadata: HashMap::new(),
+            date: self.date(),
+        }
+    }
+
+    /// Convert this invocation record to an OutcomeRecord (v5 schema).
+    ///
+    /// Returns None if this is a pending invocation (no outcome yet).
+    pub fn to_outcome(&self) -> Option<OutcomeRecord> {
+        // Pending invocations don't have an outcome
+        if self.status == "pending" {
+            return None;
+        }
+
+        Some(OutcomeRecord {
+            attempt_id: self.id,
+            completed_at: self.timestamp + chrono::Duration::milliseconds(self.duration_ms.unwrap_or(0)),
+            exit_code: self.exit_code,
+            duration_ms: self.duration_ms,
+            signal: None,
+            timeout: false,
+            metadata: HashMap::new(),
+            date: self.date(),
+        })
+    }
+
+    /// Create an InvocationRecord from AttemptRecord and optional OutcomeRecord (v5 schema).
+    pub fn from_attempt_outcome(attempt: &AttemptRecord, outcome: Option<&OutcomeRecord>) -> Self {
+        let (exit_code, duration_ms, status) = match outcome {
+            Some(o) => {
+                let status = if o.exit_code.is_some() {
+                    "completed"
+                } else {
+                    "orphaned"
+                };
+                (o.exit_code, o.duration_ms, status.to_string())
+            }
+            None => (None, None, "pending".to_string()),
+        };
+
+        Self {
+            id: attempt.id,
+            session_id: attempt.session_id.clone(),
+            timestamp: attempt.timestamp,
+            duration_ms,
+            cwd: attempt.cwd.clone(),
+            cmd: attempt.cmd.clone(),
+            executable: attempt.executable.clone(),
+            runner_id: None,
+            exit_code,
+            status,
+            format_hint: attempt.format_hint.clone(),
+            client_id: attempt.source_client.clone(),
+            hostname: attempt.hostname.clone(),
+            username: None,
+            tag: attempt.tag.clone(),
+        }
     }
 }
 
@@ -539,6 +878,91 @@ CREATE TABLE sessions (
 );
 "#;
 
+// =============================================================================
+// BIRD v5 Schema SQL Constants
+// =============================================================================
+
+/// SQL to create the attempts table (v5 schema).
+pub const ATTEMPTS_SCHEMA: &str = r#"
+CREATE TABLE attempts (
+    id                UUID PRIMARY KEY,
+    timestamp         TIMESTAMP NOT NULL,
+    cmd               VARCHAR NOT NULL,
+    cwd               VARCHAR NOT NULL,
+    session_id        VARCHAR NOT NULL,
+    tag               VARCHAR,
+    source_client     VARCHAR NOT NULL,
+    machine_id        VARCHAR,
+    hostname          VARCHAR,
+    executable        VARCHAR,
+    format_hint       VARCHAR,
+    metadata          MAP(VARCHAR, JSON),
+    date              DATE NOT NULL
+);
+"#;
+
+/// SQL to create the outcomes table (v5 schema).
+pub const OUTCOMES_SCHEMA: &str = r#"
+CREATE TABLE outcomes (
+    attempt_id        UUID PRIMARY KEY,
+    completed_at      TIMESTAMP NOT NULL,
+    exit_code         INTEGER,
+    duration_ms       BIGINT,
+    signal            INTEGER,
+    timeout           BOOLEAN DEFAULT FALSE,
+    metadata          MAP(VARCHAR, JSON),
+    date              DATE NOT NULL
+);
+"#;
+
+/// SQL to create the bird_meta table for schema versioning.
+pub const BIRD_META_SCHEMA: &str = r#"
+CREATE TABLE bird_meta (
+    key               VARCHAR PRIMARY KEY,
+    value             VARCHAR NOT NULL,
+    updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"#;
+
+/// SQL to create the invocations VIEW (v5 schema).
+///
+/// This joins attempts LEFT JOIN outcomes and derives the status:
+/// - `pending`: attempt exists but no outcome
+/// - `completed`: outcome exists with exit_code
+/// - `orphaned`: outcome exists but exit_code is NULL
+pub const INVOCATIONS_VIEW_SCHEMA: &str = r#"
+CREATE VIEW invocations AS
+SELECT
+    a.id,
+    a.session_id,
+    a.timestamp,
+    o.duration_ms,
+    a.cwd,
+    a.cmd,
+    a.executable,
+    o.exit_code,
+    CASE
+        WHEN o.attempt_id IS NULL THEN 'pending'
+        WHEN o.exit_code IS NULL THEN 'orphaned'
+        ELSE 'completed'
+    END AS status,
+    a.format_hint,
+    a.source_client AS client_id,
+    a.hostname,
+    a.tag,
+    o.signal,
+    o.timeout,
+    o.completed_at,
+    -- Merge metadata from both attempt and outcome (outcome wins on conflict)
+    map_concat(COALESCE(a.metadata, MAP{}), COALESCE(o.metadata, MAP{})) AS metadata,
+    a.date
+FROM attempts a
+LEFT JOIN outcomes o ON a.id = o.attempt_id;
+"#;
+
+/// Current BIRD schema version.
+pub const BIRD_SCHEMA_VERSION: &str = "5";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,5 +1100,167 @@ mod tests {
         assert_eq!(record.invoker, "zsh");
         assert_eq!(record.invoker_pid, 12345);
         assert_eq!(record.invoker_type, "shell");
+    }
+
+    // =========================================================================
+    // V5 Schema Tests
+    // =========================================================================
+
+    #[test]
+    fn test_attempt_record_new() {
+        let attempt = AttemptRecord::new(
+            "session-123",
+            "make test",
+            "/home/user/project",
+            "user@laptop",
+        );
+
+        assert_eq!(attempt.session_id, "session-123");
+        assert_eq!(attempt.cmd, "make test");
+        assert_eq!(attempt.cwd, "/home/user/project");
+        assert_eq!(attempt.source_client, "user@laptop");
+        assert_eq!(attempt.executable, Some("make".to_string()));
+        assert!(attempt.metadata.is_empty());
+    }
+
+    #[test]
+    fn test_attempt_record_with_metadata() {
+        let attempt = AttemptRecord::new(
+            "session-123",
+            "make test",
+            "/home/user/project",
+            "user@laptop",
+        )
+        .with_metadata("git_branch", serde_json::json!("main"))
+        .with_metadata("ci", serde_json::json!(true));
+
+        assert_eq!(attempt.metadata.len(), 2);
+        assert_eq!(attempt.metadata.get("git_branch"), Some(&serde_json::json!("main")));
+        assert_eq!(attempt.metadata.get("ci"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn test_outcome_record_completed() {
+        let attempt_id = Uuid::now_v7();
+        let date = Utc::now().date_naive();
+        let outcome = OutcomeRecord::completed(attempt_id, 0, Some(1500), date);
+
+        assert_eq!(outcome.attempt_id, attempt_id);
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(outcome.duration_ms, Some(1500));
+        assert_eq!(outcome.signal, None);
+        assert!(!outcome.timeout);
+    }
+
+    #[test]
+    fn test_outcome_record_killed() {
+        let attempt_id = Uuid::now_v7();
+        let date = Utc::now().date_naive();
+        let outcome = OutcomeRecord::killed(attempt_id, 9, Some(500), date);
+
+        assert_eq!(outcome.exit_code, None);
+        assert_eq!(outcome.signal, Some(9));
+        assert!(!outcome.timeout);
+    }
+
+    #[test]
+    fn test_outcome_record_timed_out() {
+        let attempt_id = Uuid::now_v7();
+        let date = Utc::now().date_naive();
+        let outcome = OutcomeRecord::timed_out(attempt_id, 30000, date);
+
+        assert_eq!(outcome.exit_code, None);
+        assert_eq!(outcome.duration_ms, Some(30000));
+        assert!(outcome.timeout);
+    }
+
+    #[test]
+    fn test_outcome_record_orphaned() {
+        let attempt_id = Uuid::now_v7();
+        let date = Utc::now().date_naive();
+        let outcome = OutcomeRecord::orphaned(attempt_id, date);
+
+        assert_eq!(outcome.exit_code, None);
+        assert_eq!(outcome.duration_ms, None);
+        assert_eq!(outcome.signal, None);
+        assert!(!outcome.timeout);
+    }
+
+    #[test]
+    fn test_invocation_to_attempt_conversion() {
+        let invocation = InvocationRecord::new(
+            "session-123",
+            "make test",
+            "/home/user/project",
+            0,
+            "user@laptop",
+        );
+
+        let attempt = invocation.to_attempt();
+
+        assert_eq!(attempt.id, invocation.id);
+        assert_eq!(attempt.session_id, invocation.session_id);
+        assert_eq!(attempt.cmd, invocation.cmd);
+        assert_eq!(attempt.cwd, invocation.cwd);
+        assert_eq!(attempt.source_client, invocation.client_id);
+    }
+
+    #[test]
+    fn test_invocation_to_outcome_conversion() {
+        let invocation = InvocationRecord::new(
+            "session-123",
+            "make test",
+            "/home/user/project",
+            0,
+            "user@laptop",
+        )
+        .with_duration(1500);
+
+        let outcome = invocation.to_outcome().expect("Should have outcome for completed invocation");
+
+        assert_eq!(outcome.attempt_id, invocation.id);
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(outcome.duration_ms, Some(1500));
+    }
+
+    #[test]
+    fn test_pending_invocation_has_no_outcome() {
+        let invocation = InvocationRecord::new_pending(
+            "session-123",
+            "make test",
+            "/home/user/project",
+            "pid:12345",
+            "user@laptop",
+        );
+
+        assert!(invocation.to_outcome().is_none());
+    }
+
+    #[test]
+    fn test_invocation_from_attempt_outcome() {
+        let attempt = AttemptRecord::new(
+            "session-123",
+            "make test",
+            "/home/user/project",
+            "user@laptop",
+        );
+
+        // Pending: no outcome
+        let pending = InvocationRecord::from_attempt_outcome(&attempt, None);
+        assert_eq!(pending.status, "pending");
+        assert_eq!(pending.exit_code, None);
+
+        // Completed: outcome with exit code
+        let outcome = OutcomeRecord::completed(attempt.id, 0, Some(1500), attempt.date);
+        let completed = InvocationRecord::from_attempt_outcome(&attempt, Some(&outcome));
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.exit_code, Some(0));
+        assert_eq!(completed.duration_ms, Some(1500));
+
+        // Orphaned: outcome without exit code
+        let orphaned_outcome = OutcomeRecord::orphaned(attempt.id, attempt.date);
+        let orphaned = InvocationRecord::from_attempt_outcome(&attempt, Some(&orphaned_outcome));
+        assert_eq!(orphaned.status, "orphaned");
+        assert_eq!(orphaned.exit_code, None);
     }
 }

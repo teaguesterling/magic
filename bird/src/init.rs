@@ -72,7 +72,10 @@ fn create_directories(config: &Config) -> Result<()> {
     // Parquet mode needs partition directories
     if config.storage_mode == StorageMode::Parquet {
         dirs.extend([
-            config.recent_dir().join("invocations"),
+            // V5 schema directories
+            config.recent_dir().join("attempts"),
+            config.recent_dir().join("outcomes"),
+            // Shared data directories
             config.recent_dir().join("outputs"),
             config.recent_dir().join("sessions"),
             config.recent_dir().join("events"),
@@ -107,19 +110,22 @@ fn init_database(config: &Config) -> Result<()> {
     // Create core schemas
     create_core_schemas(&conn)?;
 
+    // Create bird_meta table for schema versioning (v5)
+    create_bird_meta(&conn)?;
+
     // Create blob_registry table in main schema (used by both modes)
     create_blob_registry(&conn)?;
 
     // Mode-specific initialization for local schema
     match config.storage_mode {
         StorageMode::Parquet => {
-            // Create seed parquet files with correct schema but no rows
+            // Create seed parquet files with correct schema but no rows (v5: attempts, outcomes)
             create_seed_files(&conn, config)?;
-            // Create local schema with views over parquet files
+            // Create local schema with views over parquet files (v5: attempts, outcomes tables)
             create_local_parquet_views(&conn)?;
         }
         StorageMode::DuckDB => {
-            // Create local schema with tables for direct storage
+            // Create local schema with tables for direct storage (v5: attempts, outcomes tables)
             create_local_tables(&conn)?;
         }
     }
@@ -161,6 +167,8 @@ fn create_core_schemas(conn: &duckdb::Connection) -> Result<()> {
 
 /// Create placeholder schemas with empty tables.
 /// These ensure union views work even when no cached/remote schemas exist.
+///
+/// V5 schema: Includes attempts and outcomes tables, plus invocations VIEW.
 fn create_placeholder_schemas(conn: &duckdb::Connection) -> Result<()> {
     // Cached placeholder - empty tables with correct schema
     conn.execute_batch(
@@ -170,12 +178,47 @@ fn create_placeholder_schemas(conn: &duckdb::Connection) -> Result<()> {
             invoker_type VARCHAR, registered_at TIMESTAMP, cwd VARCHAR, date DATE,
             _source VARCHAR
         );
-        CREATE TABLE cached_placeholder.invocations (
-            id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
-            cwd VARCHAR, cmd VARCHAR, executable VARCHAR, runner_id VARCHAR, exit_code INTEGER,
-            status VARCHAR, format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR,
-            username VARCHAR, tag VARCHAR, date DATE, _source VARCHAR
+        -- V5: Attempts table (invocation start)
+        CREATE TABLE cached_placeholder.attempts (
+            id UUID, timestamp TIMESTAMP, cmd VARCHAR, cwd VARCHAR, session_id VARCHAR,
+            tag VARCHAR, source_client VARCHAR, machine_id VARCHAR, hostname VARCHAR,
+            executable VARCHAR, format_hint VARCHAR, metadata JSON, date DATE,
+            _source VARCHAR
         );
+        -- V5: Outcomes table (invocation end)
+        CREATE TABLE cached_placeholder.outcomes (
+            attempt_id UUID, completed_at TIMESTAMP, exit_code INTEGER, duration_ms BIGINT,
+            signal INTEGER, timeout BOOLEAN, metadata JSON, date DATE,
+            _source VARCHAR
+        );
+        -- V5: Invocations VIEW (attempts LEFT JOIN outcomes with derived status)
+        CREATE VIEW cached_placeholder.invocations AS
+        SELECT
+            a.id,
+            a.session_id,
+            a.timestamp,
+            o.duration_ms,
+            a.cwd,
+            a.cmd,
+            a.executable,
+            o.exit_code,
+            CASE
+                WHEN o.attempt_id IS NULL THEN 'pending'
+                WHEN o.exit_code IS NULL THEN 'orphaned'
+                ELSE 'completed'
+            END AS status,
+            a.format_hint,
+            a.source_client AS client_id,
+            a.hostname,
+            a.tag,
+            o.signal,
+            o.timeout,
+            o.completed_at,
+            a.date,
+            a._source
+        FROM cached_placeholder.attempts a
+        LEFT JOIN cached_placeholder.outcomes o ON a.id = o.attempt_id;
+
         CREATE TABLE cached_placeholder.outputs (
             id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
             byte_length BIGINT, storage_type VARCHAR, storage_ref VARCHAR,
@@ -198,12 +241,47 @@ fn create_placeholder_schemas(conn: &duckdb::Connection) -> Result<()> {
             invoker_type VARCHAR, registered_at TIMESTAMP, cwd VARCHAR, date DATE,
             _source VARCHAR
         );
-        CREATE TABLE remote_placeholder.invocations (
-            id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
-            cwd VARCHAR, cmd VARCHAR, executable VARCHAR, runner_id VARCHAR, exit_code INTEGER,
-            status VARCHAR, format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR,
-            username VARCHAR, tag VARCHAR, date DATE, _source VARCHAR
+        -- V5: Attempts table (invocation start)
+        CREATE TABLE remote_placeholder.attempts (
+            id UUID, timestamp TIMESTAMP, cmd VARCHAR, cwd VARCHAR, session_id VARCHAR,
+            tag VARCHAR, source_client VARCHAR, machine_id VARCHAR, hostname VARCHAR,
+            executable VARCHAR, format_hint VARCHAR, metadata JSON, date DATE,
+            _source VARCHAR
         );
+        -- V5: Outcomes table (invocation end)
+        CREATE TABLE remote_placeholder.outcomes (
+            attempt_id UUID, completed_at TIMESTAMP, exit_code INTEGER, duration_ms BIGINT,
+            signal INTEGER, timeout BOOLEAN, metadata JSON, date DATE,
+            _source VARCHAR
+        );
+        -- V5: Invocations VIEW (attempts LEFT JOIN outcomes with derived status)
+        CREATE VIEW remote_placeholder.invocations AS
+        SELECT
+            a.id,
+            a.session_id,
+            a.timestamp,
+            o.duration_ms,
+            a.cwd,
+            a.cmd,
+            a.executable,
+            o.exit_code,
+            CASE
+                WHEN o.attempt_id IS NULL THEN 'pending'
+                WHEN o.exit_code IS NULL THEN 'orphaned'
+                ELSE 'completed'
+            END AS status,
+            a.format_hint,
+            a.source_client AS client_id,
+            a.hostname,
+            a.tag,
+            o.signal,
+            o.timeout,
+            o.completed_at,
+            a.date,
+            a._source
+        FROM remote_placeholder.attempts a
+        LEFT JOIN remote_placeholder.outcomes o ON a.id = o.attempt_id;
+
         CREATE TABLE remote_placeholder.outputs (
             id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
             byte_length BIGINT, storage_type VARCHAR, storage_ref VARCHAR,
@@ -223,11 +301,15 @@ fn create_placeholder_schemas(conn: &duckdb::Connection) -> Result<()> {
 
 /// Create union schemas that combine data from multiple sources.
 /// Initially these just reference placeholders; they get rebuilt when remotes are added.
+///
+/// V5 schema: Includes attempts and outcomes union views.
 fn create_union_schemas(conn: &duckdb::Connection) -> Result<()> {
     // caches = union of all cached_* schemas (initially just placeholder)
     conn.execute_batch(
         r#"
         CREATE OR REPLACE VIEW caches.sessions AS SELECT * FROM cached_placeholder.sessions;
+        CREATE OR REPLACE VIEW caches.attempts AS SELECT * FROM cached_placeholder.attempts;
+        CREATE OR REPLACE VIEW caches.outcomes AS SELECT * FROM cached_placeholder.outcomes;
         CREATE OR REPLACE VIEW caches.invocations AS SELECT * FROM cached_placeholder.invocations;
         CREATE OR REPLACE VIEW caches.outputs AS SELECT * FROM cached_placeholder.outputs;
         CREATE OR REPLACE VIEW caches.events AS SELECT * FROM cached_placeholder.events;
@@ -238,6 +320,8 @@ fn create_union_schemas(conn: &duckdb::Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         CREATE OR REPLACE VIEW remotes.sessions AS SELECT * FROM remote_placeholder.sessions;
+        CREATE OR REPLACE VIEW remotes.attempts AS SELECT * FROM remote_placeholder.attempts;
+        CREATE OR REPLACE VIEW remotes.outcomes AS SELECT * FROM remote_placeholder.outcomes;
         CREATE OR REPLACE VIEW remotes.invocations AS SELECT * FROM remote_placeholder.invocations;
         CREATE OR REPLACE VIEW remotes.outputs AS SELECT * FROM remote_placeholder.outputs;
         CREATE OR REPLACE VIEW remotes.events AS SELECT * FROM remote_placeholder.events;
@@ -245,14 +329,46 @@ fn create_union_schemas(conn: &duckdb::Connection) -> Result<()> {
     )?;
 
     // main = local + caches (all data we own)
+    // V5: attempts and outcomes are base tables, invocations is derived VIEW
     conn.execute_batch(
         r#"
         CREATE OR REPLACE VIEW main.sessions AS
             SELECT *, 'local' as _source FROM local.sessions
             UNION ALL BY NAME SELECT * FROM caches.sessions;
+        CREATE OR REPLACE VIEW main.attempts AS
+            SELECT *, 'local' as _source FROM local.attempts
+            UNION ALL BY NAME SELECT * FROM caches.attempts;
+        CREATE OR REPLACE VIEW main.outcomes AS
+            SELECT *, 'local' as _source FROM local.outcomes
+            UNION ALL BY NAME SELECT * FROM caches.outcomes;
+        -- V5: Invocations VIEW (attempts LEFT JOIN outcomes with derived status)
         CREATE OR REPLACE VIEW main.invocations AS
-            SELECT *, 'local' as _source FROM local.invocations
-            UNION ALL BY NAME SELECT * FROM caches.invocations;
+        SELECT
+            a.id,
+            a.session_id,
+            a.timestamp,
+            o.duration_ms,
+            a.cwd,
+            a.cmd,
+            a.executable,
+            o.exit_code,
+            CASE
+                WHEN o.attempt_id IS NULL THEN 'pending'
+                WHEN o.exit_code IS NULL THEN 'orphaned'
+                ELSE 'completed'
+            END AS status,
+            a.format_hint,
+            a.source_client AS client_id,
+            a.hostname,
+            a.tag,
+            o.signal,
+            o.timeout,
+            o.completed_at,
+            a.date,
+            a._source
+        FROM main.attempts a
+        LEFT JOIN main.outcomes o ON a.id = o.attempt_id;
+
         CREATE OR REPLACE VIEW main.outputs AS
             SELECT *, 'local' as _source FROM local.outputs
             UNION ALL BY NAME SELECT * FROM caches.outputs;
@@ -263,14 +379,46 @@ fn create_union_schemas(conn: &duckdb::Connection) -> Result<()> {
     )?;
 
     // unified = main + remotes (everything)
+    // V5: attempts and outcomes are base tables, invocations is derived VIEW
     conn.execute_batch(
         r#"
         CREATE OR REPLACE VIEW unified.sessions AS
             SELECT * FROM main.sessions
             UNION ALL BY NAME SELECT * FROM remotes.sessions;
+        CREATE OR REPLACE VIEW unified.attempts AS
+            SELECT * FROM main.attempts
+            UNION ALL BY NAME SELECT * FROM remotes.attempts;
+        CREATE OR REPLACE VIEW unified.outcomes AS
+            SELECT * FROM main.outcomes
+            UNION ALL BY NAME SELECT * FROM remotes.outcomes;
+        -- V5: Invocations VIEW (attempts LEFT JOIN outcomes with derived status)
         CREATE OR REPLACE VIEW unified.invocations AS
-            SELECT * FROM main.invocations
-            UNION ALL BY NAME SELECT * FROM remotes.invocations;
+        SELECT
+            a.id,
+            a.session_id,
+            a.timestamp,
+            o.duration_ms,
+            a.cwd,
+            a.cmd,
+            a.executable,
+            o.exit_code,
+            CASE
+                WHEN o.attempt_id IS NULL THEN 'pending'
+                WHEN o.exit_code IS NULL THEN 'orphaned'
+                ELSE 'completed'
+            END AS status,
+            a.format_hint,
+            a.source_client AS client_id,
+            a.hostname,
+            a.tag,
+            o.signal,
+            o.timeout,
+            o.completed_at,
+            a.date,
+            a._source
+        FROM unified.attempts a
+        LEFT JOIN unified.outcomes o ON a.id = o.attempt_id;
+
         CREATE OR REPLACE VIEW unified.outputs AS
             SELECT * FROM main.outputs
             UNION ALL BY NAME SELECT * FROM remotes.outputs;
@@ -286,6 +434,14 @@ fn create_union_schemas(conn: &duckdb::Connection) -> Result<()> {
         CREATE OR REPLACE VIEW unified.qualified_sessions AS
             SELECT * EXCLUDE (_source), list(DISTINCT _source) as _sources
             FROM unified.sessions
+            GROUP BY ALL;
+        CREATE OR REPLACE VIEW unified.qualified_attempts AS
+            SELECT * EXCLUDE (_source), list(DISTINCT _source) as _sources
+            FROM unified.attempts
+            GROUP BY ALL;
+        CREATE OR REPLACE VIEW unified.qualified_outcomes AS
+            SELECT * EXCLUDE (_source), list(DISTINCT _source) as _sources
+            FROM unified.outcomes
             GROUP BY ALL;
         CREATE OR REPLACE VIEW unified.qualified_invocations AS
             SELECT * EXCLUDE (_source), list(DISTINCT _source) as _sources
@@ -310,6 +466,8 @@ fn create_union_schemas(conn: &duckdb::Connection) -> Result<()> {
 /// In parquet mode, local data is stored in parquet files.
 /// Views in the local schema read from these files.
 /// Uses `file_row_number = true` to handle empty directories gracefully.
+///
+/// V5 schema: Creates attempts/outcomes views and invocations as a derived VIEW.
 fn create_local_parquet_views(conn: &duckdb::Connection) -> Result<()> {
     // Note: We use UNION ALL with seed files to ensure views work even when
     // main directories are empty. The seed files are in date=1970-01-01 and
@@ -327,16 +485,60 @@ fn create_local_parquet_views(conn: &duckdb::Connection) -> Result<()> {
             file_row_number = true
         );
 
-        -- Invocations view: read from parquet files
-        CREATE OR REPLACE VIEW local.invocations AS
+        -- V5: Attempts view: read from parquet files
+        CREATE OR REPLACE VIEW local.attempts AS
         SELECT * EXCLUDE (filename, file_row_number)
         FROM read_parquet(
-            'recent/invocations/**/*.parquet',
+            'recent/attempts/**/*.parquet',
             union_by_name = true,
             hive_partitioning = true,
             filename = true,
             file_row_number = true
         );
+
+        -- V5: Outcomes view: read from parquet files
+        CREATE OR REPLACE VIEW local.outcomes AS
+        SELECT * EXCLUDE (filename, file_row_number)
+        FROM read_parquet(
+            'recent/outcomes/**/*.parquet',
+            union_by_name = true,
+            hive_partitioning = true,
+            filename = true,
+            file_row_number = true
+        );
+
+        -- V5: Invocations VIEW (attempts LEFT JOIN outcomes with derived status)
+        CREATE OR REPLACE VIEW local.invocations AS
+        SELECT
+            a.id,
+            a.session_id,
+            a.timestamp,
+            o.duration_ms,
+            a.cwd,
+            a.cmd,
+            a.executable,
+            o.exit_code,
+            CASE
+                WHEN o.attempt_id IS NULL THEN 'pending'
+                WHEN o.exit_code IS NULL THEN 'orphaned'
+                ELSE 'completed'
+            END AS status,
+            a.format_hint,
+            a.source_client AS client_id,
+            a.hostname,
+            a.tag,
+            o.signal,
+            o.timeout,
+            o.completed_at,
+            CASE
+                WHEN a.metadata IS NULL AND o.metadata IS NULL THEN NULL
+                WHEN a.metadata IS NULL THEN o.metadata
+                WHEN o.metadata IS NULL THEN a.metadata
+                ELSE map_concat(a.metadata, o.metadata)
+            END AS metadata,
+            a.date
+        FROM local.attempts a
+        LEFT JOIN local.outcomes o ON a.id = o.attempt_id;
 
         -- Outputs view: read from parquet files
         CREATE OR REPLACE VIEW local.outputs AS
@@ -365,6 +567,8 @@ fn create_local_parquet_views(conn: &duckdb::Connection) -> Result<()> {
 }
 
 /// Create local schema with tables for direct storage (for DuckDB mode).
+///
+/// Creates v5 schema with attempts/outcomes tables and invocations VIEW.
 fn create_local_tables(conn: &duckdb::Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -380,25 +584,67 @@ fn create_local_tables(conn: &duckdb::Connection) -> Result<()> {
             date DATE
         );
 
-        -- Invocations table
-        CREATE TABLE IF NOT EXISTS local.invocations (
-            id UUID,
-            session_id VARCHAR,
-            timestamp TIMESTAMP,
-            duration_ms BIGINT,
-            cwd VARCHAR,
-            cmd VARCHAR,
-            executable VARCHAR,
-            runner_id VARCHAR,
-            exit_code INTEGER,
-            status VARCHAR DEFAULT 'completed',
-            format_hint VARCHAR,
-            client_id VARCHAR,
-            hostname VARCHAR,
-            username VARCHAR,
+        -- V5: Attempts table (invocation start)
+        CREATE TABLE IF NOT EXISTS local.attempts (
+            id UUID PRIMARY KEY,
+            timestamp TIMESTAMP NOT NULL,
+            cmd VARCHAR NOT NULL,
+            cwd VARCHAR NOT NULL,
+            session_id VARCHAR NOT NULL,
             tag VARCHAR,
-            date DATE
+            source_client VARCHAR NOT NULL,
+            machine_id VARCHAR,
+            hostname VARCHAR,
+            executable VARCHAR,
+            format_hint VARCHAR,
+            metadata MAP(VARCHAR, JSON),
+            date DATE NOT NULL
         );
+
+        -- V5: Outcomes table (invocation end)
+        CREATE TABLE IF NOT EXISTS local.outcomes (
+            attempt_id UUID PRIMARY KEY,
+            completed_at TIMESTAMP NOT NULL,
+            exit_code INTEGER,
+            duration_ms BIGINT,
+            signal INTEGER,
+            timeout BOOLEAN DEFAULT FALSE,
+            metadata MAP(VARCHAR, JSON),
+            date DATE NOT NULL
+        );
+
+        -- V5: Invocations VIEW (attempts LEFT JOIN outcomes with derived status)
+        CREATE OR REPLACE VIEW local.invocations AS
+        SELECT
+            a.id,
+            a.session_id,
+            a.timestamp,
+            o.duration_ms,
+            a.cwd,
+            a.cmd,
+            a.executable,
+            o.exit_code,
+            CASE
+                WHEN o.attempt_id IS NULL THEN 'pending'
+                WHEN o.exit_code IS NULL THEN 'orphaned'
+                ELSE 'completed'
+            END AS status,
+            a.format_hint,
+            a.source_client AS client_id,
+            a.hostname,
+            a.tag,
+            o.signal,
+            o.timeout,
+            o.completed_at,
+            CASE
+                WHEN a.metadata IS NULL AND o.metadata IS NULL THEN NULL
+                WHEN a.metadata IS NULL THEN o.metadata
+                WHEN o.metadata IS NULL THEN a.metadata
+                ELSE map_concat(a.metadata, o.metadata)
+            END AS metadata,
+            a.date
+        FROM local.attempts a
+        LEFT JOIN local.outcomes o ON a.id = o.attempt_id;
 
         -- Outputs table
         CREATE TABLE IF NOT EXISTS local.outputs (
@@ -501,6 +747,24 @@ fn create_helper_views(conn: &duckdb::Connection) -> Result<()> {
 /// Create cwd schema views filtered to current working directory.
 /// These views are dynamically regenerated when the connection opens.
 /// Note: Initial creation uses a placeholder; actual filtering happens at connection time.
+/// Create the bird_meta table for schema versioning (v5).
+fn create_bird_meta(conn: &duckdb::Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS bird_meta (
+            key               VARCHAR PRIMARY KEY,
+            value             VARCHAR NOT NULL,
+            updated_at        TIMESTAMP DEFAULT (now())
+        );
+
+        -- Insert schema version
+        INSERT INTO bird_meta (key, value, updated_at) VALUES ('schema_version', '5', now())
+        ON CONFLICT (key) DO UPDATE SET value = '5', updated_at = now();
+        "#,
+    )?;
+    Ok(())
+}
+
 fn create_cwd_views(conn: &duckdb::Connection) -> Result<()> {
     // cwd views filter main data to entries where cwd starts with current directory
     // The actual current directory is set via a variable at connection time
@@ -605,40 +869,59 @@ fn create_blob_registry(conn: &duckdb::Connection) -> Result<()> {
 }
 
 /// Create seed parquet files with correct schema but no rows.
+///
+/// V5 schema: Creates seed files for attempts and outcomes (no invocations seed needed
+/// since invocations is now a VIEW).
 fn create_seed_files(conn: &duckdb::Connection, config: &Config) -> Result<()> {
-    // Create invocations seed (in status=completed partition)
-    let invocations_seed_dir = config
-        .recent_dir()
-        .join("invocations")
-        .join("status=completed")
-        .join("date=1970-01-01");
-    fs::create_dir_all(&invocations_seed_dir)?;
+    // V5: Create attempts seed
+    let attempts_seed_dir = config.recent_dir().join("attempts").join("date=1970-01-01");
+    fs::create_dir_all(&attempts_seed_dir)?;
 
-    let invocations_seed_path = invocations_seed_dir.join("_seed.parquet");
+    let attempts_seed_path = attempts_seed_dir.join("_seed.parquet");
     conn.execute_batch(&format!(
         r#"
         COPY (
             SELECT
                 NULL::UUID as id,
-                NULL::VARCHAR as session_id,
                 NULL::TIMESTAMP as timestamp,
-                NULL::BIGINT as duration_ms,
-                NULL::VARCHAR as cwd,
                 NULL::VARCHAR as cmd,
-                NULL::VARCHAR as executable,
-                NULL::VARCHAR as runner_id,
-                NULL::INTEGER as exit_code,
-                NULL::VARCHAR as status,
-                NULL::VARCHAR as format_hint,
-                NULL::VARCHAR as client_id,
-                NULL::VARCHAR as hostname,
-                NULL::VARCHAR as username,
+                NULL::VARCHAR as cwd,
+                NULL::VARCHAR as session_id,
                 NULL::VARCHAR as tag,
+                NULL::VARCHAR as source_client,
+                NULL::VARCHAR as machine_id,
+                NULL::VARCHAR as hostname,
+                NULL::VARCHAR as executable,
+                NULL::VARCHAR as format_hint,
+                NULL::MAP(VARCHAR, JSON) as metadata,
                 NULL::DATE as date
             WHERE false
         ) TO '{}' (FORMAT PARQUET);
         "#,
-        invocations_seed_path.display()
+        attempts_seed_path.display()
+    ))?;
+
+    // V5: Create outcomes seed
+    let outcomes_seed_dir = config.recent_dir().join("outcomes").join("date=1970-01-01");
+    fs::create_dir_all(&outcomes_seed_dir)?;
+
+    let outcomes_seed_path = outcomes_seed_dir.join("_seed.parquet");
+    conn.execute_batch(&format!(
+        r#"
+        COPY (
+            SELECT
+                NULL::UUID as attempt_id,
+                NULL::TIMESTAMP as completed_at,
+                NULL::INTEGER as exit_code,
+                NULL::BIGINT as duration_ms,
+                NULL::INTEGER as signal,
+                NULL::BOOLEAN as timeout,
+                NULL::MAP(VARCHAR, JSON) as metadata,
+                NULL::DATE as date
+            WHERE false
+        ) TO '{}' (FORMAT PARQUET);
+        "#,
+        outcomes_seed_path.display()
     ))?;
 
     // Create outputs seed
@@ -849,7 +1132,9 @@ mod tests {
 
         // Check directories exist
         assert!(config.db_path().exists());
-        assert!(config.recent_dir().join("invocations").exists());
+        // V5 schema: attempts and outcomes directories instead of invocations
+        assert!(config.recent_dir().join("attempts").exists());
+        assert!(config.recent_dir().join("outcomes").exists());
         assert!(config.recent_dir().join("outputs").exists());
         assert!(config.recent_dir().join("sessions").exists());
         assert!(config.blobs_dir().exists());

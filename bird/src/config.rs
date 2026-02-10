@@ -453,9 +453,37 @@ impl Config {
         self.data_dir().join("archive")
     }
 
+    // =========================================================================
+    // V5 Schema Paths (attempts/outcomes)
+    // =========================================================================
+
+    /// Path to attempts parquet files for a given date (v5 schema).
+    ///
+    /// Partitioning: `recent/attempts/date=YYYY-MM-DD/`
+    pub fn attempts_dir(&self, date: &chrono::NaiveDate) -> PathBuf {
+        self.recent_dir()
+            .join("attempts")
+            .join(format!("date={}", date))
+    }
+
+    /// Path to outcomes parquet files for a given date (v5 schema).
+    ///
+    /// Partitioning: `recent/outcomes/date=YYYY-MM-DD/`
+    pub fn outcomes_dir(&self, date: &chrono::NaiveDate) -> PathBuf {
+        self.recent_dir()
+            .join("outcomes")
+            .join(format!("date={}", date))
+    }
+
+    // =========================================================================
+    // V4 Schema Paths (legacy, for backwards compatibility)
+    // =========================================================================
+
     /// Path to invocations parquet files for a given date and status.
     ///
-    /// Status partitioning: `recent/invocations/status=<status>/date=YYYY-MM-DD/`
+    /// **V4 Schema**: Status partitioning: `recent/invocations/status=<status>/date=YYYY-MM-DD/`
+    ///
+    /// In v5 schema, use `attempts_dir()` and `outcomes_dir()` instead.
     pub fn invocations_dir_with_status(&self, status: &str, date: &chrono::NaiveDate) -> PathBuf {
         self.recent_dir()
             .join("invocations")
@@ -465,12 +493,21 @@ impl Config {
 
     /// Path to invocations parquet files for a given date (defaults to "completed" status).
     ///
-    /// For backwards compatibility - use `invocations_dir_with_status` for explicit status.
+    /// **V4 Schema**: For backwards compatibility - use `invocations_dir_with_status` for explicit status.
+    ///
+    /// In v5 schema, use `attempts_dir()` and `outcomes_dir()` instead.
     pub fn invocations_dir(&self, date: &chrono::NaiveDate) -> PathBuf {
         self.invocations_dir_with_status("completed", date)
     }
 
     /// Path to the pending invocations directory (JSON files for crash recovery).
+    ///
+    /// **V4 Schema**: In v5, pending detection is via:
+    /// `SELECT * FROM attempts WHERE id NOT IN (SELECT attempt_id FROM outcomes)`
+    #[deprecated(
+        since = "0.2.0",
+        note = "V4 schema. In v5, pending detection is via the invocations view."
+    )]
     pub fn pending_dir(&self) -> PathBuf {
         self.bird_root.join("db/pending")
     }
@@ -646,5 +683,27 @@ mod tests {
         let loaded = Config::load_from(&bird_root).unwrap();
         assert_eq!(loaded.hot_days, config.hot_days);
         assert_eq!(loaded.inline_threshold, config.inline_threshold);
+    }
+
+    // V5 schema path tests
+
+    #[test]
+    fn test_attempts_dir() {
+        let config = Config::with_root("/tmp/test-bird");
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        assert_eq!(
+            config.attempts_dir(&date),
+            PathBuf::from("/tmp/test-bird/db/data/recent/attempts/date=2024-01-15")
+        );
+    }
+
+    #[test]
+    fn test_outcomes_dir() {
+        let config = Config::with_root("/tmp/test-bird");
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        assert_eq!(
+            config.outcomes_dir(&date),
+            PathBuf::from("/tmp/test-bird/db/data/recent/outcomes/date=2024-01-15")
+        );
     }
 }
