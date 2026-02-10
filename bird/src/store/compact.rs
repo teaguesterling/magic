@@ -516,7 +516,7 @@ impl Store {
         self.compact_partition_with_opts(partition_dir, &opts)
     }
 
-    /// Compact all partitions in a data type directory (invocations, outputs, sessions).
+    /// Compact all partitions in a data type directory (attempts, outcomes, outputs, sessions).
     pub fn compact_data_type(
         &self,
         data_dir: &Path,
@@ -530,7 +530,7 @@ impl Store {
             return Ok(total_stats);
         }
 
-        // Iterate over partitions (may have status= level for invocations)
+        // v5 schema: iterate over date= partitions directly (no status= partitions)
         for entry in fs::read_dir(data_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -541,18 +541,13 @@ impl Store {
 
             let dir_name = entry.file_name().to_string_lossy().to_string();
 
-            // Check if this is a status= partition (for invocations)
-            if dir_name.starts_with("status=") {
-                // Recurse into status partition to find date partitions
-                let stats =
-                    self.compact_data_type(&path, file_threshold, session_filter, dry_run)?;
-                total_stats.add(&stats);
-            } else {
-                // This is a date= partition or other partition
+            // v5 schema: only date= partitions
+            if dir_name.starts_with("date=") {
                 let stats =
                     self.compact_partition(&path, file_threshold, session_filter, dry_run)?;
                 total_stats.add(&stats);
             }
+            // Skip non-date directories
         }
 
         Ok(total_stats)
@@ -570,7 +565,8 @@ impl Store {
         let mut total_stats = CompactStats::default();
         let recent_dir = self.config().recent_dir();
 
-        for data_type in &["invocations", "outputs", "sessions", "events"] {
+        // v5 schema: attempts/outcomes instead of invocations with status partitions
+        for data_type in &["attempts", "outcomes", "outputs", "sessions", "events"] {
             let data_dir = recent_dir.join(data_type);
             let stats =
                 self.compact_data_type(&data_dir, file_threshold, Some(session_id), dry_run)?;
@@ -594,7 +590,8 @@ impl Store {
         let today = Utc::now().date_naive();
         let date_partition = format!("date={}", today.format("%Y-%m-%d"));
 
-        for data_type in &["invocations", "outputs", "sessions", "events"] {
+        // v5 schema: attempts/outcomes instead of invocations with status partitions
+        for data_type in &["attempts", "outcomes", "outputs", "sessions", "events"] {
             let partition_dir = recent_dir.join(data_type).join(&date_partition);
             if partition_dir.exists() {
                 let stats = self.compact_partition(
@@ -615,7 +612,8 @@ impl Store {
         let mut total_stats = CompactStats::default();
         let recent_dir = self.config().recent_dir();
 
-        for data_type in &["invocations", "outputs", "sessions", "events"] {
+        // v5 schema: attempts/outcomes instead of invocations with status partitions
+        for data_type in &["attempts", "outcomes", "outputs", "sessions", "events"] {
             let data_dir = recent_dir.join(data_type);
             let stats = self.compact_data_type(&data_dir, file_threshold, None, dry_run)?;
             total_stats.add(&stats);
@@ -629,7 +627,8 @@ impl Store {
         let mut total_stats = CompactStats::default();
         let archive_dir = self.config().archive_dir();
 
-        for data_type in &["invocations", "outputs", "sessions", "events"] {
+        // v5 schema: attempts/outcomes instead of invocations with status partitions
+        for data_type in &["attempts", "outcomes", "outputs", "sessions", "events"] {
             let data_dir = archive_dir.join(data_type);
             let stats = self.compact_data_type(&data_dir, file_threshold, None, dry_run)?;
             total_stats.add(&stats);
@@ -649,7 +648,8 @@ impl Store {
         let recent_dir = self.config().recent_dir();
         let archive_dir = self.config().archive_dir();
 
-        for data_type in &["invocations", "outputs", "sessions", "events"] {
+        // v5 schema: attempts/outcomes instead of invocations with status partitions
+        for data_type in &["attempts", "outcomes", "outputs", "sessions", "events"] {
             let recent_data_dir = recent_dir.join(data_type);
             let archive_data_dir = archive_dir.join(data_type);
 
@@ -662,13 +662,8 @@ impl Store {
             // Skip seed partitions (date=1970-01-01) which contain schema-only files
             let seed_date = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
 
-            // For invocations, we need to look inside status=completed/ for date partitions
-            // Other data types have date partitions directly
-            let date_partition_parent = if *data_type == "invocations" {
-                recent_data_dir.join("status=completed")
-            } else {
-                recent_data_dir.clone()
-            };
+            // v5 schema: all data types have date partitions directly (no status= partitions)
+            let date_partition_parent = recent_data_dir.clone();
 
             if !date_partition_parent.exists() {
                 continue;
@@ -805,7 +800,8 @@ impl Store {
         let mut total_stats = CompactStats::default();
         let recent_dir = self.config().recent_dir();
 
-        for data_type in &["invocations", "outputs", "sessions", "events"] {
+        // v5 schema: attempts/outcomes instead of invocations with status partitions
+        for data_type in &["attempts", "outcomes", "outputs", "sessions", "events"] {
             let data_dir = recent_dir.join(data_type);
             let stats = self.compact_data_type_with_opts(&data_dir, opts)?;
             total_stats.add(&stats);
@@ -819,7 +815,8 @@ impl Store {
         let mut total_stats = CompactStats::default();
         let archive_dir = self.config().archive_dir();
 
-        for data_type in &["invocations", "outputs", "sessions", "events"] {
+        // v5 schema: attempts/outcomes instead of invocations with status partitions
+        for data_type in &["attempts", "outcomes", "outputs", "sessions", "events"] {
             let data_dir = archive_dir.join(data_type);
             let stats = self.compact_data_type_with_opts(&data_dir, opts)?;
             total_stats.add(&stats);
@@ -850,16 +847,13 @@ impl Store {
 
             let dir_name = entry.file_name().to_string_lossy().to_string();
 
-            // Check if this is a status= partition (for invocations)
-            if dir_name.starts_with("status=") {
-                // Recurse into status partition to find date partitions
-                let stats = self.compact_data_type_with_opts(&path, opts)?;
-                total_stats.add(&stats);
-            } else {
-                // This is a date= partition or other partition
+            // v5 schema: no status= partitions, only date= partitions
+            if dir_name.starts_with("date=") {
+                // This is a date= partition
                 let stats = self.compact_partition_with_opts(&path, opts)?;
                 total_stats.add(&stats);
             }
+            // Skip non-date directories
         }
 
         Ok(total_stats)
@@ -879,7 +873,8 @@ impl Store {
             ..opts.clone()
         };
 
-        for data_type in &["invocations", "outputs", "sessions", "events"] {
+        // v5 schema: attempts/outcomes instead of invocations with status partitions
+        for data_type in &["attempts", "outcomes", "outputs", "sessions", "events"] {
             let data_dir = recent_dir.join(data_type);
             let stats = self.compact_data_type_with_opts(&data_dir, &session_opts)?;
             total_stats.add(&stats);
@@ -891,8 +886,8 @@ impl Store {
     /// Clean operation: recover orphaned invocations and optionally prune archive.
     ///
     /// This:
-    /// 1. Scans pending files for crashed/dead invocations
-    /// 2. Marks them as orphaned in status=orphaned partition
+    /// 1. Scans for pending invocations (attempts without matching outcomes)
+    /// 2. Creates outcome records for orphaned invocations
     /// 3. Optionally prunes old archive data
     pub fn clean(&self, opts: &CleanOptions) -> Result<CleanStats> {
         let mut stats = CleanStats::default();
@@ -923,13 +918,14 @@ impl Store {
         let cutoff_date = Utc::now().date_naive() - chrono::Duration::days(older_than_days as i64);
         let archive_dir = self.config().archive_dir();
 
-        for data_type in &["invocations", "outputs", "sessions", "events"] {
+        // v5 schema: attempts/outcomes instead of invocations with status partitions
+        for data_type in &["attempts", "outcomes", "outputs", "sessions", "events"] {
             let data_dir = archive_dir.join(data_type);
             if !data_dir.exists() {
                 continue;
             }
 
-            // Archive doesn't have status partitioning - just date= partitions directly
+            // Archive has date= partitions directly
             let partition_stats =
                 self.prune_date_partitions(&data_dir, cutoff_date, dry_run)?;
             stats.add(&partition_stats);
@@ -1144,7 +1140,7 @@ mod tests {
 
         // session-b should be untouched (only 3 files, below threshold)
         let date = chrono::Utc::now().date_naive();
-        let inv_dir = store.config().invocations_dir(&date);
+        let inv_dir = store.config().attempts_dir(&date);
         let session_b_count = std::fs::read_dir(&inv_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1176,7 +1172,7 @@ mod tests {
 
         // Files should still be there
         let date = chrono::Utc::now().date_naive();
-        let inv_dir = store.config().invocations_dir(&date);
+        let inv_dir = store.config().attempts_dir(&date);
         let file_count = std::fs::read_dir(&inv_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1207,7 +1203,7 @@ mod tests {
 
         // Check that compacted file has correct naming
         let date = chrono::Utc::now().date_naive();
-        let inv_dir = store.config().invocations_dir(&date);
+        let inv_dir = store.config().attempts_dir(&date);
         let compacted_files: Vec<_> = std::fs::read_dir(&inv_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1367,7 +1363,7 @@ mod tests {
 
         // Verify files exist in recent
         let date = chrono::Utc::now().date_naive();
-        let recent_dir = store.config().invocations_dir(&date);
+        let recent_dir = store.config().attempts_dir(&date);
         let recent_count = std::fs::read_dir(&recent_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1384,8 +1380,8 @@ mod tests {
         // Archive with 0 days (archive everything)
         let stats = store.archive_old_data(0, false).unwrap();
 
-        // Archives 4 data types: invocations, outputs, sessions, events
-        // Only invocations has data, but all 4 partitions exist
+        // Archives 5 data types: attempts, outcomes, outputs, sessions, events
+        // Only attempts has data (outcomes too but may be empty in test), but partitions exist
         assert!(stats.partitions_archived >= 1, "Should archive at least 1 partition");
         assert!(stats.files_moved > 0, "Should move files");
 
@@ -1393,7 +1389,7 @@ mod tests {
         let archive_dir = store
             .config()
             .archive_dir()
-            .join("invocations")
+            .join("attempts")
             .join(format!("date={}", date));
         assert!(archive_dir.exists(), "Archive partition should exist");
 
@@ -1446,7 +1442,7 @@ mod tests {
 
         // Files should still be in recent
         let date = chrono::Utc::now().date_naive();
-        let recent_dir = store.config().invocations_dir(&date);
+        let recent_dir = store.config().attempts_dir(&date);
         let recent_count = std::fs::read_dir(&recent_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1481,7 +1477,7 @@ mod tests {
 
         // Verify data is still queryable (via filesystem check, not view)
         let date = chrono::Utc::now().date_naive();
-        let recent_dir = store.config().invocations_dir(&date);
+        let recent_dir = store.config().attempts_dir(&date);
         let file_count = std::fs::read_dir(&recent_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1523,7 +1519,7 @@ mod tests {
 
         // Verify single file remains
         let date = chrono::Utc::now().date_naive();
-        let inv_dir = store.config().invocations_dir(&date);
+        let inv_dir = store.config().attempts_dir(&date);
         let file_count = std::fs::read_dir(&inv_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1561,7 +1557,7 @@ mod tests {
 
         // Count compacted files
         let date = chrono::Utc::now().date_naive();
-        let inv_dir = store.config().invocations_dir(&date);
+        let inv_dir = store.config().attempts_dir(&date);
         let compacted_count = std::fs::read_dir(&inv_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1603,7 +1599,7 @@ mod tests {
 
         // Verify files before compact
         let date = chrono::Utc::now().date_naive();
-        let inv_dir = store.config().invocations_dir(&date);
+        let inv_dir = store.config().attempts_dir(&date);
         let files_before = std::fs::read_dir(&inv_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1685,9 +1681,10 @@ mod tests {
 
     #[test]
     fn test_clean_recovers_orphaned() {
-        let (tmp, store) = setup_store();
+        let (_tmp, store) = setup_store();
 
         // Create a pending invocation with a dead PID
+        // v5: Just write the attempt - no pending file needed
         let record = InvocationRecord::new_pending_local(
             "test-session",
             "crashed-command",
@@ -1696,16 +1693,10 @@ mod tests {
             "test@client",
         );
 
-        // Write pending file manually (simulating a crash scenario)
-        let pending =
-            super::super::pending::PendingInvocation::from_record(&record).unwrap();
-        let pending_dir = tmp.path().join("db/pending");
-        super::super::pending::write_pending_file(&pending_dir, &pending).unwrap();
-
-        // Write to status=pending partition
+        // v5: write_invocation writes only an attempt (no outcome) for pending records
         store.write_invocation(&record).unwrap();
 
-        // Run clean
+        // Run clean - should find the pending attempt via the invocations view
         let opts = CleanOptions::default();
         let stats = store.clean(&opts).unwrap();
 
@@ -1716,7 +1707,7 @@ mod tests {
 
     #[test]
     fn test_clean_dry_run() {
-        let (tmp, store) = setup_store();
+        let (_tmp, store) = setup_store();
 
         // Create a pending invocation with a dead PID
         let record = InvocationRecord::new_pending_local(
@@ -1727,13 +1718,7 @@ mod tests {
             "test@client",
         );
 
-        // Write pending file
-        let pending =
-            super::super::pending::PendingInvocation::from_record(&record).unwrap();
-        let pending_dir = tmp.path().join("db/pending");
-        super::super::pending::write_pending_file(&pending_dir, &pending).unwrap();
-
-        // Write to status=pending partition
+        // v5: write_invocation writes only an attempt (no outcome) for pending records
         store.write_invocation(&record).unwrap();
 
         // Run clean in dry-run mode
@@ -1747,9 +1732,9 @@ mod tests {
         assert_eq!(stats.pending_checked, 1);
         assert_eq!(stats.orphaned, 1);
 
-        // But pending file should still exist
-        let pending_path = pending.path(&pending_dir);
-        assert!(pending_path.exists(), "Pending file should still exist after dry run");
+        // v5: Verify the attempt still has no outcome (dry-run didn't create one)
+        let pending = store.get_pending_attempts().unwrap();
+        assert_eq!(pending.len(), 1, "Attempt should still be pending after dry run");
     }
 
     #[test]
@@ -1773,8 +1758,8 @@ mod tests {
         assert!(archive_stats.partitions_archived > 0, "Should archive data");
 
         // Verify archive exists
-        let archive_invocations = tmp.path().join("db/data/archive/invocations");
-        assert!(archive_invocations.exists(), "Archive should exist");
+        let archive_attempts = tmp.path().join("db/data/archive/attempts");
+        assert!(archive_attempts.exists(), "Archive should exist");
 
         // Prune with 0 days (prune everything)
         let prune_stats = store.prune_archive(0, false).unwrap();
@@ -1784,23 +1769,9 @@ mod tests {
 
     #[test]
     fn test_clean_with_prune() {
-        let (tmp, store) = setup_store();
+        let (_tmp, store) = setup_store();
 
-        // Create orphaned pending file
-        let record = InvocationRecord::new_pending_local(
-            "test-session",
-            "crashed-command",
-            "/home/user",
-            999999999,
-            "test@client",
-        );
-        let pending =
-            super::super::pending::PendingInvocation::from_record(&record).unwrap();
-        let pending_dir = tmp.path().join("db/pending");
-        super::super::pending::write_pending_file(&pending_dir, &pending).unwrap();
-        store.write_invocation(&record).unwrap();
-
-        // Write and archive some data
+        // Write and archive some completed invocations first
         for i in 0..3 {
             let record = InvocationRecord::new(
                 "another-session",
@@ -1812,6 +1783,17 @@ mod tests {
             store.write_invocation(&record).unwrap();
         }
         store.archive_old_data(0, false).unwrap();
+
+        // Now create orphaned pending invocation (after archiving, so it stays in recent)
+        // v5: just write the attempt, no pending file needed
+        let record = InvocationRecord::new_pending_local(
+            "test-session",
+            "crashed-command",
+            "/home/user",
+            999999999,
+            "test@client",
+        );
+        store.write_invocation(&record).unwrap();
 
         // Run clean with prune
         let opts = CleanOptions {

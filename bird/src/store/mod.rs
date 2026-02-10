@@ -1,11 +1,23 @@
 //! Store - handles writing and reading records.
 //!
 //! Uses DuckDB to write Parquet files and query across them.
+//!
+//! # V5 Schema
+//!
+//! The v5 schema splits invocations into attempts + outcomes:
+//! - `attempts`: Written at invocation start (cmd, cwd, timestamp, etc.)
+//! - `outcomes`: Written at invocation end (exit_code, duration, etc.)
+//! - `invocations`: VIEW joining attempts LEFT JOIN outcomes
+//!
+//! Use `start_invocation()` / `complete_invocation()` for the v5 API.
+//! The legacy `write_invocation()` still works for v4 compatibility.
 
 mod atomic;
+mod attempts;
 mod compact;
 mod events;
 mod invocations;
+mod outcomes;
 mod outputs;
 mod pending;
 mod remote;
@@ -1272,28 +1284,77 @@ impl Store {
             }
         }
 
-        // Write invocation
+        // V5: Write attempt and outcome instead of invocation
+        let attempt = invocation.to_attempt();
+        let outcome = invocation.to_outcome();
+
+        // Convert metadata HashMap to DuckDB MAP format
+        let attempt_metadata_map = if attempt.metadata.is_empty() {
+            "map([],[]::JSON[])".to_string()
+        } else {
+            let entries: Vec<String> = attempt.metadata.iter()
+                .map(|(k, v)| {
+                    let key = k.replace('\'', "''");
+                    let value = v.to_string().replace('\'', "''");
+                    format!("struct_pack(k := '{}', v := '{}'::JSON)", key, value)
+                })
+                .collect();
+            format!("map_from_entries([{}])", entries.join(", "))
+        };
+
+        // Write attempt
         conn.execute(
-            r#"INSERT INTO local.invocations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            &format!(
+                r#"INSERT INTO local.attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {}, ?)"#,
+                attempt_metadata_map
+            ),
             params![
-                invocation.id.to_string(),
-                invocation.session_id,
-                invocation.timestamp.to_rfc3339(),
-                invocation.duration_ms,
-                invocation.cwd,
-                invocation.cmd,
-                invocation.executable,
-                invocation.runner_id,
-                invocation.exit_code,
-                invocation.status,
-                invocation.format_hint,
-                invocation.client_id,
-                invocation.hostname,
-                invocation.username,
-                invocation.tag,
+                attempt.id.to_string(),
+                attempt.timestamp.to_rfc3339(),
+                attempt.cmd,
+                attempt.cwd,
+                attempt.session_id,
+                attempt.tag,
+                attempt.source_client,
+                attempt.machine_id,
+                attempt.hostname,
+                attempt.executable,
+                attempt.format_hint,
                 date.to_string(),
             ],
         )?;
+
+        // Write outcome if completed
+        if let Some(outcome) = outcome {
+            let outcome_metadata_map = if outcome.metadata.is_empty() {
+                "map([],[]::JSON[])".to_string()
+            } else {
+                let entries: Vec<String> = outcome.metadata.iter()
+                    .map(|(k, v)| {
+                        let key = k.replace('\'', "''");
+                        let value = v.to_string().replace('\'', "''");
+                        format!("struct_pack(k := '{}', v := '{}'::JSON)", key, value)
+                    })
+                    .collect();
+                format!("map_from_entries([{}])", entries.join(", "))
+            };
+
+            conn.execute(
+                &format!(
+                    r#"INSERT INTO local.outcomes VALUES (?, ?, ?, ?, ?, ?, {}, ?)"#,
+                    outcome_metadata_map
+                ),
+                params![
+                    outcome.attempt_id.to_string(),
+                    outcome.completed_at.to_rfc3339(),
+                    outcome.exit_code,
+                    outcome.duration_ms,
+                    outcome.signal,
+                    outcome.timeout,
+                    outcome.date.to_string(),
+                ],
+            )?;
+        }
 
         // Write outputs
         for (stream, content) in &batch.outputs {

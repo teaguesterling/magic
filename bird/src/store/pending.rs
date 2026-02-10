@@ -1,8 +1,18 @@
 //! Pending invocation file operations for crash recovery.
 //!
-//! This module handles the lightweight JSON files that track in-flight invocations.
-//! These files serve as crash-safe markers that can be checked even if DuckDB is
-//! unavailable.
+//! **V5 Schema Note**: In v5, pending detection is done via the invocations VIEW
+//! (attempts without matching outcomes). The pending file mechanism is deprecated
+//! but kept for backward compatibility with v4 recovery code.
+//!
+//! The following are still used in v5:
+//! - `is_runner_alive()` - For checking if a process is still running
+//! - `RecoveryStats` - For reporting recovery operation results
+//!
+//! The following are deprecated in v5:
+//! - `PendingInvocation` - No longer written; kept for backward compatibility
+//! - `write_pending_file()` - No longer called in v5
+//! - `delete_pending_file()` - No longer called in v5
+//! - `list_pending_files()` - No longer called in v5
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,6 +28,10 @@ use crate::schema::InvocationRecord;
 ///
 /// This is a lightweight representation of an in-flight invocation,
 /// stored as a JSON file for crash recovery.
+///
+/// **Deprecated in v5**: In v5 schema, pending detection is done via the
+/// invocations VIEW (attempts without matching outcomes). This struct is
+/// kept for backward compatibility with v4 code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingInvocation {
     /// Unique identifier (matches the parquet record).
@@ -69,6 +83,10 @@ impl PendingInvocation {
 }
 
 /// Write a pending invocation file.
+///
+/// **Deprecated in v5**: Pending files are no longer written. Use
+/// `Store::start_invocation()` with `AttemptRecord` instead.
+#[deprecated(note = "V4 API. In v5, pending detection is via the invocations view.")]
 pub fn write_pending_file(pending_dir: &Path, pending: &PendingInvocation) -> Result<PathBuf> {
     fs::create_dir_all(pending_dir)?;
     let path = pending.path(pending_dir);
@@ -78,6 +96,9 @@ pub fn write_pending_file(pending_dir: &Path, pending: &PendingInvocation) -> Re
 }
 
 /// Delete a pending invocation file.
+///
+/// **Deprecated in v5**: Pending files are no longer used.
+#[deprecated(note = "V4 API. In v5, pending detection is via the invocations view.")]
 pub fn delete_pending_file(pending_dir: &Path, id: Uuid, session_id: &str) -> Result<bool> {
     let filename = format!("{}--{}.pending", session_id, id);
     let path = pending_dir.join(filename);
@@ -90,6 +111,9 @@ pub fn delete_pending_file(pending_dir: &Path, id: Uuid, session_id: &str) -> Re
 }
 
 /// List all pending invocation files.
+///
+/// **Deprecated in v5**: Use `Store::get_pending_attempts()` instead.
+#[deprecated(note = "V4 API. Use Store::get_pending_attempts() in v5.")]
 pub fn list_pending_files(pending_dir: &Path) -> Result<Vec<PendingInvocation>> {
     if !pending_dir.exists() {
         return Ok(Vec::new());

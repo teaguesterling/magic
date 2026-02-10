@@ -273,7 +273,8 @@ impl super::Store {
         if opts.dry_run {
             // Count what would be pushed
             stats.sessions = count_sessions_to_push(&conn, &remote_schema, opts.since)?;
-            stats.invocations = count_table_to_push(&conn, "invocations", &remote_schema, opts.since)?;
+            // V5: count only attempts (represents invocation count)
+            stats.invocations = count_table_to_push(&conn, "attempts", &remote_schema, opts.since)?;
             stats.outputs = count_table_to_push(&conn, "outputs", &remote_schema, opts.since)?;
             stats.events = count_table_to_push(&conn, "events", &remote_schema, opts.since)?;
             if opts.sync_blobs {
@@ -287,7 +288,9 @@ impl super::Store {
 
             // Actually push in dependency order
             stats.sessions = push_sessions(&conn, &remote_schema, opts.since)?;
-            stats.invocations = push_table(&conn, "invocations", &remote_schema, opts.since)?;
+            // V5: push attempts first, then outcomes (report attempts count as "invocations")
+            stats.invocations = push_table(&conn, "attempts", &remote_schema, opts.since)?;
+            let _ = push_table(&conn, "outcomes", &remote_schema, opts.since)?;
             stats.outputs = push_outputs(&conn, &remote_schema, opts.since, opts.sync_blobs)?;
             stats.events = push_table(&conn, "events", &remote_schema, opts.since)?;
         }
@@ -379,10 +382,13 @@ impl super::Store {
         // Ensure cached schema exists with required tables
         ensure_cached_schema(&conn, &cached_schema, &remote.name)?;
 
-        // Pull in dependency order (sessions first, then invocations, outputs, events)
+        // Pull in dependency order (sessions first, then attempts, outcomes, outputs, events)
+        // V5: pull attempts first, then outcomes (report attempts count as "invocations")
+        let attempts_pulled = pull_table(&conn, "attempts", &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?;
+        let _ = pull_table(&conn, "outcomes", &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?;
         let mut stats = PullStats {
             sessions: pull_sessions(&conn, &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?,
-            invocations: pull_table(&conn, "invocations", &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?,
+            invocations: attempts_pulled,
             outputs: pull_outputs(&conn, &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref(), opts.sync_blobs)?,
             events: pull_table(&conn, "events", &remote_schema, &cached_schema, opts.since, opts.client_id.as_deref())?,
             blobs: BlobStats::default(),
@@ -470,6 +476,7 @@ impl super::Store {
     /// Uses explicit transaction for DDL safety. The caches.* views reference
     /// local cached_* schemas (not attached databases), so they should be safe
     /// to persist.
+    /// V5 schema: unions attempts/outcomes tables and creates invocations view.
     pub fn rebuild_caches_schema(&self, conn: &Connection) -> Result<()> {
         // Find all cached_* schemas
         let schemas: Vec<String> = conn
@@ -482,7 +489,8 @@ impl super::Store {
         conn.execute("BEGIN TRANSACTION", [])?;
 
         let result = (|| -> std::result::Result<(), duckdb::Error> {
-            for table in &["sessions", "invocations", "outputs", "events"] {
+            // V5: union attempts and outcomes tables
+            for table in &["sessions", "attempts", "outcomes", "outputs", "events"] {
                 let mut union_parts: Vec<String> = schemas
                     .iter()
                     .map(|s| format!("SELECT * FROM \"{}\".{}", s, table))
@@ -500,6 +508,31 @@ impl super::Store {
                 );
                 conn.execute(&sql, [])?;
             }
+
+            // V5: Create invocations view that joins attempts and outcomes
+            // Note: We don't include metadata in this view because merging MAPs from
+            // different sources is problematic. Use attempts.metadata or outcomes.metadata directly.
+            conn.execute(
+                r#"
+                CREATE OR REPLACE VIEW caches.invocations AS
+                SELECT
+                    a.id, a.timestamp, a.cmd, a.cwd, a.session_id,
+                    a.tag, a.source_client, a.machine_id, a.hostname,
+                    a.executable, a.format_hint,
+                    o.completed_at, o.exit_code, o.duration_ms, o.signal, o.timeout,
+                    a.date,
+                    CASE
+                        WHEN o.attempt_id IS NULL THEN 'pending'
+                        WHEN o.exit_code IS NULL THEN 'orphaned'
+                        ELSE 'completed'
+                    END AS status,
+                    a._source
+                FROM caches.attempts a
+                LEFT JOIN caches.outcomes o ON a.id = o.attempt_id
+                "#,
+                [],
+            )?;
+
             Ok(())
         })();
 
@@ -518,6 +551,7 @@ impl super::Store {
 
 /// Ensure the remote schema has the required tables.
 /// Tables use consistent naming (no `_table` suffix).
+/// V5 schema: uses attempts/outcomes tables instead of invocations.
 fn ensure_remote_schema(conn: &Connection, schema: &str) -> Result<()> {
     let sql = format!(
         r#"
@@ -525,12 +559,33 @@ fn ensure_remote_schema(conn: &Connection, schema: &str) -> Result<()> {
             session_id VARCHAR, client_id VARCHAR, invoker VARCHAR, invoker_pid INTEGER,
             invoker_type VARCHAR, registered_at TIMESTAMP, cwd VARCHAR, date DATE
         );
-        CREATE TABLE IF NOT EXISTS {schema}.invocations (
-            id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
-            cwd VARCHAR, cmd VARCHAR, executable VARCHAR, runner_id VARCHAR,
-            exit_code INTEGER, status VARCHAR, format_hint VARCHAR, client_id VARCHAR,
-            hostname VARCHAR, username VARCHAR, tag VARCHAR, date DATE
+        -- V5: attempts table (invocation start)
+        CREATE TABLE IF NOT EXISTS {schema}.attempts (
+            id UUID, timestamp TIMESTAMP, cmd VARCHAR, cwd VARCHAR, session_id VARCHAR,
+            tag VARCHAR, source_client VARCHAR, machine_id VARCHAR, hostname VARCHAR,
+            executable VARCHAR, format_hint VARCHAR, metadata MAP(VARCHAR, JSON), date DATE
         );
+        -- V5: outcomes table (invocation completion)
+        CREATE TABLE IF NOT EXISTS {schema}.outcomes (
+            attempt_id UUID, completed_at TIMESTAMP, exit_code INTEGER, duration_ms BIGINT,
+            signal INTEGER, timeout BOOLEAN, metadata MAP(VARCHAR, JSON), date DATE
+        );
+        -- V5: invocations VIEW for compatibility
+        -- Note: metadata not included due to MAP_CONCAT complexity; use attempts/outcomes directly
+        CREATE OR REPLACE VIEW {schema}.invocations AS
+        SELECT
+            a.id, a.timestamp, a.cmd, a.cwd, a.session_id,
+            a.tag, a.source_client, a.machine_id, a.hostname,
+            a.executable, a.format_hint,
+            o.completed_at, o.exit_code, o.duration_ms, o.signal, o.timeout,
+            a.date,
+            CASE
+                WHEN o.attempt_id IS NULL THEN 'pending'
+                WHEN o.exit_code IS NULL THEN 'orphaned'
+                ELSE 'completed'
+            END AS status
+        FROM {schema}.attempts a
+        LEFT JOIN {schema}.outcomes o ON a.id = o.attempt_id;
         CREATE TABLE IF NOT EXISTS {schema}.outputs (
             id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
             byte_length BIGINT, storage_type VARCHAR, storage_ref VARCHAR,
@@ -559,6 +614,7 @@ fn ensure_remote_schema(conn: &Connection, schema: &str) -> Result<()> {
 
 /// Ensure the cached schema exists with required tables.
 /// Tables include a `_source` column to track which remote the data came from.
+/// V5 schema: uses attempts/outcomes tables instead of invocations.
 fn ensure_cached_schema(conn: &Connection, schema: &str, remote_name: &str) -> Result<()> {
     // Create the schema if it doesn't exist
     conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {}", schema), [])?;
@@ -571,13 +627,36 @@ fn ensure_cached_schema(conn: &Connection, schema: &str, remote_name: &str) -> R
             invoker_type VARCHAR, registered_at TIMESTAMP, cwd VARCHAR, date DATE,
             _source VARCHAR DEFAULT '{remote_name}'
         );
-        CREATE TABLE IF NOT EXISTS {schema}.invocations (
-            id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
-            cwd VARCHAR, cmd VARCHAR, executable VARCHAR, runner_id VARCHAR,
-            exit_code INTEGER, status VARCHAR, format_hint VARCHAR, client_id VARCHAR,
-            hostname VARCHAR, username VARCHAR, tag VARCHAR, date DATE,
+        -- V5: attempts table (invocation start)
+        CREATE TABLE IF NOT EXISTS {schema}.attempts (
+            id UUID, timestamp TIMESTAMP, cmd VARCHAR, cwd VARCHAR, session_id VARCHAR,
+            tag VARCHAR, source_client VARCHAR, machine_id VARCHAR, hostname VARCHAR,
+            executable VARCHAR, format_hint VARCHAR, metadata MAP(VARCHAR, JSON), date DATE,
             _source VARCHAR DEFAULT '{remote_name}'
         );
+        -- V5: outcomes table (invocation completion)
+        CREATE TABLE IF NOT EXISTS {schema}.outcomes (
+            attempt_id UUID, completed_at TIMESTAMP, exit_code INTEGER, duration_ms BIGINT,
+            signal INTEGER, timeout BOOLEAN, metadata MAP(VARCHAR, JSON), date DATE,
+            _source VARCHAR DEFAULT '{remote_name}'
+        );
+        -- V5: invocations VIEW for compatibility
+        -- Note: metadata not included due to MAP_CONCAT complexity; use attempts/outcomes directly
+        CREATE OR REPLACE VIEW {schema}.invocations AS
+        SELECT
+            a.id, a.timestamp, a.cmd, a.cwd, a.session_id,
+            a.tag, a.source_client, a.machine_id, a.hostname,
+            a.executable, a.format_hint,
+            o.completed_at, o.exit_code, o.duration_ms, o.signal, o.timeout,
+            a.date,
+            CASE
+                WHEN o.attempt_id IS NULL THEN 'pending'
+                WHEN o.exit_code IS NULL THEN 'orphaned'
+                ELSE 'completed'
+            END AS status,
+            a._source
+        FROM {schema}.attempts a
+        LEFT JOIN {schema}.outcomes o ON a.id = o.attempt_id;
         CREATE TABLE IF NOT EXISTS {schema}.outputs (
             id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
             byte_length BIGINT, storage_type VARCHAR, storage_ref VARCHAR,
@@ -615,18 +694,19 @@ fn client_clause(client_id: Option<&str>) -> String {
 
 /// Count sessions that would be pushed.
 /// Reads from `local` schema.
+/// V5 schema: joins on attempts instead of invocations.
 fn count_sessions_to_push(
     conn: &Connection,
     remote_schema: &str,
     since: Option<NaiveDate>,
 ) -> Result<usize> {
-    let since_filter = since_clause(since, "i.timestamp");
+    let since_filter = since_clause(since, "a.timestamp");
 
     let sql = format!(
         r#"
         SELECT COUNT(DISTINCT s.session_id)
         FROM local.sessions s
-        JOIN local.invocations i ON i.session_id = s.session_id
+        JOIN local.attempts a ON a.session_id = s.session_id
         WHERE NOT EXISTS (
             SELECT 1 FROM {remote}.sessions r WHERE r.session_id = s.session_id
         )
@@ -642,6 +722,7 @@ fn count_sessions_to_push(
 
 /// Count records that would be pushed for a table.
 /// Reads from `local` schema.
+/// V5 schema: uses attempts/outcomes tables instead of invocations.
 fn count_table_to_push(
     conn: &Connection,
     table: &str,
@@ -649,29 +730,47 @@ fn count_table_to_push(
     since: Option<NaiveDate>,
 ) -> Result<usize> {
     let sql = match table {
-        "invocations" => {
+        // V5: count attempts
+        "attempts" => {
             let since_filter = since_clause(since, "l.timestamp");
             format!(
                 r#"
                 SELECT COUNT(*)
-                FROM local.{table} l
+                FROM local.attempts l
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM {remote}.{table} r WHERE r.id = l.id
+                    SELECT 1 FROM {remote}.attempts r WHERE r.id = l.id
                 )
                 {since}
                 "#,
-                table = table,
+                remote = remote_schema,
+                since = since_filter,
+            )
+        }
+        // V5: count outcomes
+        "outcomes" => {
+            let since_filter = since_clause(since, "a.timestamp");
+            format!(
+                r#"
+                SELECT COUNT(*)
+                FROM local.outcomes l
+                JOIN local.attempts a ON a.id = l.attempt_id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {remote}.outcomes r WHERE r.attempt_id = l.attempt_id
+                )
+                {since}
+                "#,
                 remote = remote_schema,
                 since = since_filter,
             )
         }
         "outputs" | "events" => {
-            let since_filter = since_clause(since, "i.timestamp");
+            // V5: join on attempts instead of invocations
+            let since_filter = since_clause(since, "a.timestamp");
             format!(
                 r#"
                 SELECT COUNT(*)
                 FROM local.{table} l
-                JOIN local.invocations i ON i.id = l.invocation_id
+                JOIN local.attempts a ON a.id = l.invocation_id
                 WHERE NOT EXISTS (
                     SELECT 1 FROM {remote}.{table} r WHERE r.id = l.id
                 )
@@ -702,19 +801,20 @@ fn count_table_to_push(
 }
 
 /// Push sessions from `local` to remote.
+/// V5 schema: joins on attempts instead of invocations.
 fn push_sessions(
     conn: &Connection,
     remote_schema: &str,
     since: Option<NaiveDate>,
 ) -> Result<usize> {
-    let since_filter = since_clause(since, "i.timestamp");
+    let since_filter = since_clause(since, "a.timestamp");
 
     let sql = format!(
         r#"
         INSERT INTO {remote}.sessions
         SELECT DISTINCT s.*
         FROM local.sessions s
-        JOIN local.invocations i ON i.session_id = s.session_id
+        JOIN local.attempts a ON a.session_id = s.session_id
         WHERE NOT EXISTS (
             SELECT 1 FROM {remote}.sessions r WHERE r.session_id = s.session_id
         )
@@ -729,6 +829,7 @@ fn push_sessions(
 }
 
 /// Push records from `local` to remote.
+/// V5 schema: uses attempts/outcomes tables instead of invocations.
 fn push_table(
     conn: &Connection,
     table: &str,
@@ -736,31 +837,50 @@ fn push_table(
     since: Option<NaiveDate>,
 ) -> Result<usize> {
     let sql = match table {
-        "invocations" => {
+        // V5: Push attempts table
+        "attempts" => {
             let since_filter = since_clause(since, "l.timestamp");
             format!(
                 r#"
-                INSERT INTO {remote}.{table}
+                INSERT INTO {remote}.attempts
                 SELECT *
-                FROM local.{table} l
+                FROM local.attempts l
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM {remote}.{table} r WHERE r.id = l.id
+                    SELECT 1 FROM {remote}.attempts r WHERE r.id = l.id
                 )
                 {since}
                 "#,
-                table = table,
+                remote = remote_schema,
+                since = since_filter,
+            )
+        }
+        // V5: Push outcomes table
+        "outcomes" => {
+            let since_filter = since_clause(since, "a.timestamp");
+            format!(
+                r#"
+                INSERT INTO {remote}.outcomes
+                SELECT l.*
+                FROM local.outcomes l
+                JOIN local.attempts a ON a.id = l.attempt_id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {remote}.outcomes r WHERE r.attempt_id = l.attempt_id
+                )
+                {since}
+                "#,
                 remote = remote_schema,
                 since = since_filter,
             )
         }
         "outputs" | "events" => {
-            let since_filter = since_clause(since, "i.timestamp");
+            // V5: Join on attempts instead of invocations
+            let since_filter = since_clause(since, "a.timestamp");
             format!(
                 r#"
                 INSERT INTO {remote}.{table}
                 SELECT l.*
                 FROM local.{table} l
-                JOIN local.invocations i ON i.id = l.invocation_id
+                JOIN local.attempts a ON a.id = l.invocation_id
                 WHERE NOT EXISTS (
                     SELECT 1 FROM {remote}.{table} r WHERE r.id = l.id
                 )
@@ -824,6 +944,7 @@ fn pull_sessions(
 }
 
 /// Pull records from remote into cached schema.
+/// V5 schema: uses attempts/outcomes tables instead of invocations.
 fn pull_table(
     conn: &Connection,
     table: &str,
@@ -835,71 +956,99 @@ fn pull_table(
     let client_filter = client_clause(client_id);
 
     let sql = match table {
-        "invocations" => {
+        // V5: pull attempts
+        "attempts" => {
             let since_filter = since_clause(since, "r.timestamp");
             format!(
                 r#"
-                INSERT INTO {cached}.{table} (id, session_id, timestamp, duration_ms, cwd, cmd, executable, runner_id, exit_code, status, format_hint, client_id, hostname, username, tag, date)
+                INSERT INTO {cached}.attempts (id, timestamp, cmd, cwd, session_id, tag, source_client, machine_id, hostname, executable, format_hint, metadata, date)
                 SELECT r.*
-                FROM {remote}.{table} r
+                FROM {remote}.attempts r
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM {cached}.{table} l WHERE l.id = r.id
+                    SELECT 1 FROM {cached}.attempts l WHERE l.id = r.id
                 )
                 {since}
                 {client}
                 "#,
-                table = table,
-                cached = cached_schema,
-                remote = remote_schema,
-                since = since_filter,
-                client = client_filter,
-            )
-        }
-        "outputs" => {
-            let since_filter = since_clause(since, "i.timestamp");
-            format!(
-                r#"
-                INSERT INTO {cached}.{table} (id, invocation_id, stream, content_hash, byte_length, storage_type, storage_ref, content_type, date)
-                SELECT r.*
-                FROM {remote}.{table} r
-                JOIN {remote}.invocations i ON i.id = r.invocation_id
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM {cached}.{table} l WHERE l.id = r.id
-                )
-                {since}
-                {client}
-                "#,
-                table = table,
                 cached = cached_schema,
                 remote = remote_schema,
                 since = since_filter,
                 client = if client_id.is_some() {
-                    format!("AND i.client_id = '{}'", client_id.unwrap().replace('\'', "''"))
+                    format!("AND r.source_client = '{}'", client_id.unwrap().replace('\'', "''"))
+                } else {
+                    String::new()
+                },
+            )
+        }
+        // V5: pull outcomes
+        "outcomes" => {
+            let since_filter = since_clause(since, "a.timestamp");
+            format!(
+                r#"
+                INSERT INTO {cached}.outcomes (attempt_id, completed_at, exit_code, duration_ms, signal, timeout, metadata, date)
+                SELECT r.*
+                FROM {remote}.outcomes r
+                JOIN {remote}.attempts a ON a.id = r.attempt_id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {cached}.outcomes l WHERE l.attempt_id = r.attempt_id
+                )
+                {since}
+                {client}
+                "#,
+                cached = cached_schema,
+                remote = remote_schema,
+                since = since_filter,
+                client = if client_id.is_some() {
+                    format!("AND a.source_client = '{}'", client_id.unwrap().replace('\'', "''"))
+                } else {
+                    String::new()
+                },
+            )
+        }
+        // V5: join on attempts instead of invocations
+        "outputs" => {
+            let since_filter = since_clause(since, "a.timestamp");
+            format!(
+                r#"
+                INSERT INTO {cached}.outputs (id, invocation_id, stream, content_hash, byte_length, storage_type, storage_ref, content_type, date)
+                SELECT r.*
+                FROM {remote}.outputs r
+                JOIN {remote}.attempts a ON a.id = r.invocation_id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {cached}.outputs l WHERE l.id = r.id
+                )
+                {since}
+                {client}
+                "#,
+                cached = cached_schema,
+                remote = remote_schema,
+                since = since_filter,
+                client = if client_id.is_some() {
+                    format!("AND a.source_client = '{}'", client_id.unwrap().replace('\'', "''"))
                 } else {
                     String::new()
                 },
             )
         }
         "events" => {
-            let since_filter = since_clause(since, "i.timestamp");
+            let since_filter = since_clause(since, "a.timestamp");
             format!(
                 r#"
-                INSERT INTO {cached}.{table} (id, invocation_id, client_id, hostname, event_type, severity, ref_file, ref_line, ref_column, message, error_code, test_name, status, format_used, date)
+                INSERT INTO {cached}.events (id, invocation_id, client_id, hostname, event_type, severity, ref_file, ref_line, ref_column, message, error_code, test_name, status, format_used, date)
                 SELECT r.*
-                FROM {remote}.{table} r
-                JOIN {remote}.invocations i ON i.id = r.invocation_id
+                FROM {remote}.events r
+                JOIN {remote}.attempts a ON a.id = r.invocation_id
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM {cached}.{table} l WHERE l.id = r.id
+                    SELECT 1 FROM {cached}.events l WHERE l.id = r.id
                 )
                 {since}
                 {client}
                 "#,
-                table = table,
                 cached = cached_schema,
                 remote = remote_schema,
                 since = since_filter,
                 client = if client_id.is_some() {
-                    format!("AND i.client_id = '{}'", client_id.unwrap().replace('\'', "''"))
+                    format!("AND a.source_client = '{}'", client_id.unwrap().replace('\'', "''"))
                 } else {
                     String::new()
                 },
@@ -929,18 +1078,19 @@ fn pull_table(
 }
 
 /// Count blobs that would be pushed (for dry run).
+/// V5 schema: joins on attempts instead of invocations.
 fn count_blobs_to_push(
     conn: &Connection,
     remote_schema: &str,
     since: Option<NaiveDate>,
 ) -> Result<BlobStats> {
-    let since_filter = since_clause(since, "i.timestamp");
+    let since_filter = since_clause(since, "a.timestamp");
 
     let sql = format!(
         r#"
         SELECT COUNT(DISTINCT o.content_hash), COALESCE(SUM(o.byte_length), 0)
         FROM local.outputs o
-        JOIN local.invocations i ON i.id = o.invocation_id
+        JOIN local.attempts a ON a.id = o.invocation_id
         WHERE o.storage_type = 'blob'
           AND NOT EXISTS (
               SELECT 1 FROM {remote}.blob_registry r WHERE r.content_hash = o.content_hash
@@ -960,18 +1110,19 @@ fn count_blobs_to_push(
 }
 
 /// Get blobs that need to be pushed to remote.
+/// V5 schema: joins on attempts instead of invocations.
 fn get_blobs_to_push(
     conn: &Connection,
     remote_schema: &str,
     since: Option<NaiveDate>,
 ) -> Result<Vec<BlobInfo>> {
-    let since_filter = since_clause(since, "i.timestamp");
+    let since_filter = since_clause(since, "a.timestamp");
 
     let sql = format!(
         r#"
         SELECT DISTINCT o.content_hash, b.storage_path, o.byte_length
         FROM local.outputs o
-        JOIN local.invocations i ON i.id = o.invocation_id
+        JOIN local.attempts a ON a.id = o.invocation_id
         JOIN blob_registry b ON b.content_hash = o.content_hash
         WHERE o.storage_type = 'blob'
           AND NOT EXISTS (
@@ -1034,13 +1185,14 @@ fn get_blobs_to_pull(
 }
 
 /// Push outputs to remote, optionally converting storage_ref paths.
+/// V5 schema: joins on attempts instead of invocations.
 fn push_outputs(
     conn: &Connection,
     remote_schema: &str,
     since: Option<NaiveDate>,
     _sync_blobs: bool,
 ) -> Result<usize> {
-    let since_filter = since_clause(since, "i.timestamp");
+    let since_filter = since_clause(since, "a.timestamp");
 
     // For now, we keep storage_ref as-is. The blob files are synced separately.
     // The storage_ref format (file://recent/blobs/...) is relative and works on both sides.
@@ -1049,7 +1201,7 @@ fn push_outputs(
         INSERT INTO {remote}.outputs
         SELECT l.*
         FROM local.outputs l
-        JOIN local.invocations i ON i.id = l.invocation_id
+        JOIN local.attempts a ON a.id = l.invocation_id
         WHERE NOT EXISTS (
             SELECT 1 FROM {remote}.outputs r WHERE r.id = l.id
         )
@@ -1064,6 +1216,7 @@ fn push_outputs(
 }
 
 /// Pull outputs from remote, optionally handling storage_ref paths.
+/// V5 schema: joins on attempts instead of invocations.
 fn pull_outputs(
     conn: &Connection,
     remote_schema: &str,
@@ -1072,9 +1225,9 @@ fn pull_outputs(
     client_id: Option<&str>,
     _sync_blobs: bool,
 ) -> Result<usize> {
-    let since_filter = since_clause(since, "i.timestamp");
+    let since_filter = since_clause(since, "a.timestamp");
     let client_filter = if client_id.is_some() {
-        format!("AND i.client_id = '{}'", client_id.unwrap().replace('\'', "''"))
+        format!("AND a.source_client = '{}'", client_id.unwrap().replace('\'', "''"))
     } else {
         String::new()
     };
@@ -1086,7 +1239,7 @@ fn pull_outputs(
         INSERT INTO {cached}.outputs (id, invocation_id, stream, content_hash, byte_length, storage_type, storage_ref, content_type, date)
         SELECT r.*
         FROM {remote}.outputs r
-        JOIN {remote}.invocations i ON i.id = r.invocation_id
+        JOIN {remote}.attempts a ON a.id = r.invocation_id
         WHERE NOT EXISTS (
             SELECT 1 FROM {cached}.outputs l WHERE l.id = r.id
         )
@@ -1276,7 +1429,7 @@ mod tests {
 
         // Clear local data (simulate different client)
         let conn = store.connection().unwrap();
-        conn.execute("DELETE FROM local.invocations", []).unwrap();
+        conn.execute("DELETE FROM local.outcomes; DELETE FROM local.attempts", []).unwrap();
         drop(conn);
 
         // Pull from remote
@@ -1492,7 +1645,7 @@ mod tests {
 
         // Delete local, pull from remote to create cached data
         let conn = store.connection().unwrap();
-        conn.execute("DELETE FROM local.invocations", []).unwrap();
+        conn.execute("DELETE FROM local.outcomes; DELETE FROM local.attempts", []).unwrap();
         drop(conn);
 
         store.pull(&remote, PullOptions::default()).unwrap();
