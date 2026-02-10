@@ -1765,3 +1765,249 @@ fn test_v5_stats_works() {
     // Should show invocation count (includes seed + our command)
     assert!(stdout.contains("Total invocations:"), "Should show invocation stats: {}", stdout);
 }
+
+// ============================================================================
+// Parquet Mode Tests - Verify v5 schema works with file-based storage
+// ============================================================================
+
+fn init_bird_parquet(bird_root: &std::path::Path) {
+    let output = shq_cmd(bird_root)
+        .args(["init", "--mode", "parquet"])
+        .output()
+        .expect("failed to run shq init --mode parquet");
+    assert!(output.status.success(), "shq init --mode parquet failed: {:?}", output);
+}
+
+#[test]
+fn test_parquet_mode_init() {
+    let tmp = TempDir::new().unwrap();
+    init_bird_parquet(tmp.path());
+
+    // Verify database was created
+    assert!(tmp.path().join("db/bird.duckdb").exists());
+
+    // Check stats shows parquet mode
+    let output = shq_cmd(tmp.path())
+        .args(["stats"])
+        .output()
+        .expect("failed to get stats");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("parquet"), "Should show parquet storage mode: {}", stdout);
+}
+
+#[test]
+fn test_parquet_mode_creates_attempts_directory() {
+    let tmp = TempDir::new().unwrap();
+    init_bird_parquet(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "parquet test"])
+        .output()
+        .expect("failed to run");
+
+    // Parquet mode should create db/data/recent/attempts directory
+    let attempts_dir = tmp.path().join("db/data/recent/attempts");
+    assert!(attempts_dir.exists(), "Should have attempts directory in parquet mode");
+
+    // Should have date partition
+    let has_date_partition = std::fs::read_dir(&attempts_dir)
+        .map(|entries| {
+            entries.filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().starts_with("date="))
+        })
+        .unwrap_or(false);
+    assert!(has_date_partition, "attempts/ should have date= partitions");
+}
+
+#[test]
+fn test_parquet_mode_creates_outcomes_directory() {
+    let tmp = TempDir::new().unwrap();
+    init_bird_parquet(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "parquet outcomes"])
+        .output()
+        .expect("failed to run");
+
+    // Parquet mode should create db/data/recent/outcomes directory
+    let outcomes_dir = tmp.path().join("db/data/recent/outcomes");
+    assert!(outcomes_dir.exists(), "Should have outcomes directory in parquet mode");
+
+    // Should have date partition
+    let has_date_partition = std::fs::read_dir(&outcomes_dir)
+        .map(|entries| {
+            entries.filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().starts_with("date="))
+        })
+        .unwrap_or(false);
+    assert!(has_date_partition, "outcomes/ should have date= partitions");
+}
+
+#[test]
+fn test_parquet_mode_creates_parquet_files() {
+    let tmp = TempDir::new().unwrap();
+    init_bird_parquet(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "parquet files"])
+        .output()
+        .expect("failed to run");
+
+    // Find parquet files in attempts directory
+    let attempts_dir = tmp.path().join("db/data/recent/attempts");
+    let mut found_parquet = false;
+
+    if let Ok(entries) = std::fs::read_dir(&attempts_dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("date=") {
+                if let Ok(files) = std::fs::read_dir(entry.path()) {
+                    for file in files.flatten() {
+                        if file.path().extension().map(|e| e == "parquet").unwrap_or(false) {
+                            found_parquet = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(found_parquet, "Should create .parquet files in attempts directory");
+}
+
+#[test]
+fn test_parquet_mode_queries_work() {
+    let tmp = TempDir::new().unwrap();
+    init_bird_parquet(tmp.path());
+
+    // Run commands
+    for i in 1..=3 {
+        shq_cmd(tmp.path())
+            .args(["run", "echo", &format!("parquet query {}", i)])
+            .output()
+            .expect("failed to run");
+    }
+
+    // Query should work via invocations VIEW
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT cmd, status FROM invocations WHERE cmd LIKE '%parquet query%' ORDER BY timestamp"])
+        .output()
+        .expect("failed to query");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("parquet query 1"), "Should find query 1: {}", stdout);
+    assert!(stdout.contains("parquet query 2"), "Should find query 2: {}", stdout);
+    assert!(stdout.contains("parquet query 3"), "Should find query 3: {}", stdout);
+}
+
+#[test]
+fn test_parquet_mode_history_works() {
+    let tmp = TempDir::new().unwrap();
+    init_bird_parquet(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "parquet history"])
+        .output()
+        .expect("failed to run");
+
+    // History command should work
+    let output = shq_cmd(tmp.path())
+        .args(["history"])
+        .output()
+        .expect("failed to get history");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("parquet history"), "History should show command: {}", stdout);
+}
+
+#[test]
+fn test_parquet_mode_stats_works() {
+    let tmp = TempDir::new().unwrap();
+    init_bird_parquet(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "parquet stats"])
+        .output()
+        .expect("failed to run");
+
+    // Stats should work
+    let output = shq_cmd(tmp.path())
+        .args(["stats"])
+        .output()
+        .expect("failed to get stats");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Total invocations: 1"), "Should show 1 invocation: {}", stdout);
+}
+
+#[test]
+fn test_parquet_mode_attempts_outcomes_count() {
+    let tmp = TempDir::new().unwrap();
+    init_bird_parquet(tmp.path());
+
+    // Run commands
+    for i in 1..=5 {
+        shq_cmd(tmp.path())
+            .args(["run", "echo", &format!("count test {}", i)])
+            .output()
+            .expect("failed to run");
+    }
+
+    // Check attempts count
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT COUNT(*) as count FROM attempts"])
+        .output()
+        .expect("failed to query");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("5"), "Should have 5 attempts: {}", stdout);
+
+    // Check outcomes count
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT COUNT(*) as count FROM outcomes"])
+        .output()
+        .expect("failed to query");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("5"), "Should have 5 outcomes: {}", stdout);
+}
+
+#[test]
+fn test_parquet_mode_compact_works() {
+    let tmp = TempDir::new().unwrap();
+    init_bird_parquet(tmp.path());
+
+    // Run multiple commands
+    for i in 1..=5 {
+        shq_cmd(tmp.path())
+            .args(["run", "echo", &format!("compact test {}", i)])
+            .output()
+            .expect("failed to run");
+    }
+
+    // Compact with low threshold
+    let output = shq_cmd(tmp.path())
+        .args(["compact", "--threshold", "2"])
+        .output()
+        .expect("failed to compact");
+
+    assert!(output.status.success());
+
+    // Verify data still queryable after compaction
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT COUNT(*) FROM invocations"])
+        .output()
+        .expect("failed to query after compact");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("5"), "Should still have 5 invocations after compact: {}", stdout);
+}
