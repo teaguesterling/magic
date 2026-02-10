@@ -28,6 +28,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Cache DuckDB extensions
+        uses: actions/cache@v4
+        with:
+          path: ~/.duckdb/extensions
+          key: ${{ runner.os }}-duckdb-extensions-v1
+
+      - name: Create DuckDB extension directory
+        run: mkdir -p ~/.duckdb/extensions
+
       - name: Run tests
         run: cargo test --workspace
 
