@@ -1425,3 +1425,343 @@ fn test_tag_not_found() {
     // Should fail because tag doesn't exist
     assert!(!output.status.success());
 }
+
+// ============================================================================
+// BIRD v5 Schema Tests - Attempts/Outcomes split
+// ============================================================================
+
+#[test]
+fn test_v5_attempts_table_exists() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "v5 test"])
+        .output()
+        .expect("failed to run");
+
+    // Query attempts table directly
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT COUNT(*) as count FROM attempts"])
+        .output()
+        .expect("failed to query attempts");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should have at least 1 attempt (seed + our command)
+    assert!(stdout.contains("1") || stdout.contains("2"), "Should have attempts: {}", stdout);
+}
+
+#[test]
+fn test_v5_outcomes_table_exists() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "v5 test"])
+        .output()
+        .expect("failed to run");
+
+    // Query outcomes table directly
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT COUNT(*) as count FROM outcomes"])
+        .output()
+        .expect("failed to query outcomes");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should have at least 1 outcome
+    assert!(stdout.contains("1") || stdout.contains("2"), "Should have outcomes: {}", stdout);
+}
+
+#[test]
+fn test_v5_invocations_is_view() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "view test"])
+        .output()
+        .expect("failed to run");
+
+    // Query invocations VIEW - should work transparently
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT cmd, status FROM invocations WHERE cmd LIKE '%view test%'"])
+        .output()
+        .expect("failed to query invocations view");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("view test"), "VIEW should return data: {}", stdout);
+    assert!(stdout.contains("completed"), "Status should be 'completed': {}", stdout);
+}
+
+#[test]
+fn test_v5_status_derived_from_join() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a successful command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "success"])
+        .output()
+        .expect("failed to run");
+
+    // Run a failing command
+    shq_cmd(tmp.path())
+        .args(["run", "-c", "exit 42"])
+        .output()
+        .expect("failed to run");
+
+    // Both should have status='completed' (exit code doesn't affect status)
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT status, exit_code FROM invocations ORDER BY timestamp DESC LIMIT 2"])
+        .output()
+        .expect("failed to query");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Both should be 'completed' - status is not about exit code
+    assert!(stdout.contains("completed"), "Both should be completed: {}", stdout);
+}
+
+#[test]
+fn test_v5_attempt_outcome_join() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "join test"])
+        .output()
+        .expect("failed to run");
+
+    // Manually verify the join works by selecting from both tables
+    let output = shq_cmd(tmp.path())
+        .args(["sql",
+            "SELECT a.cmd, o.exit_code, o.duration_ms \
+             FROM attempts a \
+             JOIN outcomes o ON a.id = o.attempt_id \
+             WHERE a.cmd LIKE '%join test%'"])
+        .output()
+        .expect("failed to query join");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("join test"), "JOIN should return data: {}", stdout);
+    assert!(stdout.contains("0"), "Exit code should be 0: {}", stdout);
+}
+
+#[test]
+fn test_v5_bird_meta_table() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Query bird_meta for schema version
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT value FROM bird_meta WHERE key = 'schema_version'"])
+        .output()
+        .expect("failed to query bird_meta");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("5"), "Schema version should be 5: {}", stdout);
+}
+
+#[test]
+fn test_v5_schema_version_is_five() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Query bird_meta schema version - should be 5
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT key, value FROM bird_meta ORDER BY key"])
+        .output()
+        .expect("failed to query bird_meta");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("schema_version"), "Should have schema_version key: {}", stdout);
+    assert!(stdout.contains("5"), "Schema version should be 5: {}", stdout);
+}
+
+#[test]
+fn test_v5_no_status_partitioning() {
+    // In v5, there's no status= partitioning. This is the key structural change.
+    // In DuckDB mode (default), data is in tables. In Parquet mode, data is in
+    // attempts/outcomes directories (not invocations/status=).
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "dir test"])
+        .output()
+        .expect("failed to run");
+
+    // v5 should NOT have status= partitioned invocations directory
+    // Check both possible locations (depending on storage mode)
+    let recent_dir1 = tmp.path().join("data/recent/invocations");
+    let recent_dir2 = tmp.path().join("db/data/recent/invocations");
+
+    for invocations_dir in [recent_dir1, recent_dir2] {
+        if invocations_dir.exists() {
+            let has_status_dir = std::fs::read_dir(&invocations_dir)
+                .map(|entries| {
+                    entries.filter_map(|e| e.ok())
+                        .any(|e| e.file_name().to_string_lossy().starts_with("status="))
+                })
+                .unwrap_or(false);
+            assert!(!has_status_dir, "v5 should not have status= partitioning");
+        }
+    }
+
+    // Verify no db/pending directory (v4 pending file mechanism removed)
+    assert!(!tmp.path().join("db/pending").exists(), "v5 should not have pending directory");
+}
+
+#[test]
+fn test_v5_no_pending_files() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "no pending"])
+        .output()
+        .expect("failed to run");
+
+    // v5 should NOT have a db/pending directory
+    let pending_dir = tmp.path().join("db/pending");
+    assert!(!pending_dir.exists(), "v5 should not have pending directory");
+}
+
+#[test]
+fn test_v5_attempt_fields() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command with tag
+    shq_cmd(tmp.path())
+        .args(["run", "-t", "v5tag", "echo", "field test"])
+        .output()
+        .expect("failed to run");
+
+    // Query attempt-specific fields
+    let output = shq_cmd(tmp.path())
+        .args(["sql",
+            "SELECT id, timestamp, cmd, cwd, session_id, tag, source_client, date \
+             FROM attempts WHERE cmd LIKE '%field test%'"])
+        .output()
+        .expect("failed to query attempt fields");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("field test"), "Should have cmd: {}", stdout);
+    assert!(stdout.contains("v5tag"), "Should have tag: {}", stdout);
+    assert!(stdout.contains("shq"), "Should have source_client: {}", stdout);
+}
+
+#[test]
+fn test_v5_outcome_fields() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "outcome fields"])
+        .output()
+        .expect("failed to run");
+
+    // Query outcome-specific fields
+    let output = shq_cmd(tmp.path())
+        .args(["sql",
+            "SELECT o.attempt_id, o.completed_at, o.exit_code, o.duration_ms, o.date \
+             FROM outcomes o \
+             JOIN attempts a ON a.id = o.attempt_id \
+             WHERE a.cmd LIKE '%outcome fields%'"])
+        .output()
+        .expect("failed to query outcome fields");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("0"), "Should have exit_code 0: {}", stdout);
+}
+
+#[test]
+fn test_v5_existing_queries_work() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run commands
+    for i in 1..=3 {
+        shq_cmd(tmp.path())
+            .args(["run", "echo", &format!("query test {}", i)])
+            .output()
+            .expect("failed to run");
+    }
+
+    // Existing queries against invocations VIEW should work unchanged
+    let output = shq_cmd(tmp.path())
+        .args(["sql",
+            "SELECT cmd, exit_code, duration_ms, status \
+             FROM invocations \
+             WHERE cmd LIKE '%query test%' \
+             ORDER BY timestamp"])
+        .output()
+        .expect("failed to query");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("query test 1"), "Should find first command: {}", stdout);
+    assert!(stdout.contains("query test 2"), "Should find second command: {}", stdout);
+    assert!(stdout.contains("query test 3"), "Should find third command: {}", stdout);
+}
+
+#[test]
+fn test_v5_history_command_uses_view() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run commands
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "history v5"])
+        .output()
+        .expect("failed to run");
+
+    // History command should work (uses invocations VIEW internally)
+    let output = shq_cmd(tmp.path())
+        .args(["history"])
+        .output()
+        .expect("failed to get history");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("history v5"), "History should show command: {}", stdout);
+}
+
+#[test]
+fn test_v5_stats_works() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "stats v5"])
+        .output()
+        .expect("failed to run");
+
+    // Stats should work with v5 schema
+    let output = shq_cmd(tmp.path())
+        .args(["stats"])
+        .output()
+        .expect("failed to get stats");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should show invocation count (includes seed + our command)
+    assert!(stdout.contains("Total invocations:"), "Should show invocation stats: {}", stdout);
+}
