@@ -2063,3 +2063,143 @@ fn test_metadata_accessible_via_invocations_view() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("vcs"), "Should have VCS metadata in VIEW: {}", stdout);
 }
+
+// ============================================================================
+// No-PTY Mode Tests
+// ============================================================================
+
+#[test]
+fn test_no_pty_captures_stdout_separately() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run with --no-pty to capture streams separately
+    let output = shq_cmd(tmp.path())
+        .args(["run", "--no-pty", "sh", "-c", "echo stdout_content"])
+        .output()
+        .expect("failed to run");
+
+    assert!(output.status.success());
+
+    // Check that stdout stream exists
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT stream FROM outputs WHERE stream = 'stdout'"])
+        .output()
+        .expect("failed to query");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stdout"), "Should have stdout stream: {}", stdout);
+}
+
+#[test]
+fn test_no_pty_captures_stderr_separately() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run with --no-pty, writing to stderr
+    let output = shq_cmd(tmp.path())
+        .args(["run", "--no-pty", "sh", "-c", "echo stderr_content >&2"])
+        .output()
+        .expect("failed to run");
+
+    assert!(output.status.success());
+
+    // Check that stderr stream exists
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT stream FROM outputs WHERE stream = 'stderr'"])
+        .output()
+        .expect("failed to query");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stderr"), "Should have stderr stream: {}", stdout);
+}
+
+#[test]
+fn test_no_pty_both_streams() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run with --no-pty, writing to both streams
+    shq_cmd(tmp.path())
+        .args(["run", "--no-pty", "sh", "-c", "echo out; echo err >&2"])
+        .output()
+        .expect("failed to run");
+
+    // Check both streams exist
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT COUNT(*) FROM outputs"])
+        .output()
+        .expect("failed to query");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("2"), "Should have 2 output streams: {}", stdout);
+}
+
+#[test]
+fn test_no_pty_show_stdout_filter() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run with --no-pty
+    shq_cmd(tmp.path())
+        .args(["run", "--no-pty", "sh", "-c", "echo stdout_only; echo stderr_only >&2"])
+        .output()
+        .expect("failed to run");
+
+    // Show only stdout
+    let output = shq_cmd(tmp.path())
+        .args(["show", "--stdout"])
+        .output()
+        .expect("failed to show");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stdout_only"), "Should show stdout: {}", stdout);
+    assert!(!stdout.contains("stderr_only"), "Should not show stderr: {}", stdout);
+}
+
+#[test]
+fn test_no_pty_show_stderr_filter() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run with --no-pty
+    let run_output = shq_cmd(tmp.path())
+        .args(["run", "--no-pty", "sh", "-c", "echo stdout_only; echo stderr_only >&2"])
+        .output()
+        .expect("failed to run");
+
+    assert!(run_output.status.success(), "Run failed: {:?}", run_output);
+
+    // Show only stderr (routes to stderr by design)
+    let output = shq_cmd(tmp.path())
+        .args(["show", "--stderr"])
+        .output()
+        .expect("failed to show");
+
+    // Note: shq show routes filtered content to its original stream
+    // So --stderr content goes to stderr
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stderr_only"), "Should show stderr content: {}", stderr);
+    assert!(!stderr.contains("stdout_only"), "Should not show stdout content: {}", stderr);
+}
+
+#[test]
+fn test_pty_mode_stores_combined() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run without --no-pty (default PTY mode)
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "pty_output"])
+        .output()
+        .expect("failed to run");
+
+    // Check that combined stream exists
+    let output = shq_cmd(tmp.path())
+        .args(["sql", "SELECT stream FROM outputs"])
+        .output()
+        .expect("failed to query");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("combined"), "PTY mode should store as combined: {}", stdout);
+}

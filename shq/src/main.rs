@@ -54,6 +54,10 @@ enum Commands {
         #[arg(short = 'C', long = "compact")]
         compact: bool,
 
+        /// Disable PTY (pseudo-terminal) - captures stdout/stderr separately but loses colors/interactivity
+        #[arg(long = "no-pty")]
+        no_pty: bool,
+
         /// The command to run (alternative to -c)
         #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -584,7 +588,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::Init { mode, force } => commands::init(&mode, force),
-        Commands::Run { shell_cmd, tag, extract, no_extract, format, compact, cmd } => {
+        Commands::Run { shell_cmd, tag, extract, no_extract, format, compact, no_pty, cmd } => {
             // Resolve extract behavior: --extract forces on, --no-extract forces off, otherwise use config
             let extract_override = if extract {
                 Some(true)
@@ -593,7 +597,7 @@ fn main() {
             } else {
                 None
             };
-            commands::run(shell_cmd.as_deref(), &cmd, tag.as_deref(), extract_override, format.as_deref(), compact)
+            commands::run(shell_cmd.as_deref(), &cmd, tag.as_deref(), extract_override, format.as_deref(), compact, no_pty)
         }
         Commands::Save { file, command, exit_code, duration_ms, stream, stdout_file, stderr_file, session_id, invoker_pid, invoker, invoker_type, extract, compact, tag, quiet } => {
             commands::save(

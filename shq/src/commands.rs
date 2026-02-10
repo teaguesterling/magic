@@ -48,18 +48,25 @@ fn contains_nosave_marker(data: &[u8]) -> bool {
         || data.windows(NOSAVE_OSC_ST.len()).any(|w| w == NOSAVE_OSC_ST)
 }
 
-/// Run a command and capture it to BIRD using PTY for proper job control.
+/// Run a command and capture it to BIRD.
 ///
-/// The command runs in a pseudo-terminal, which means:
+/// By default, uses PTY (pseudo-terminal) which means:
 /// - Ctrl-Z suspends the command (not shq)
 /// - Interactive programs (vim, less) work correctly
 /// - Output is displayed in real-time
+/// - stdout/stderr are combined into a single stream
+///
+/// With `no_pty: true`, uses pipes instead:
+/// - stdout/stderr are captured separately
+/// - Colors and interactivity are lost
+/// - Better for non-interactive batch commands
 ///
 /// `tag`: Optional tag (unique alias) for this invocation.
 /// `extract_override`: Some(true) forces extraction, Some(false) disables it, None uses config.
 /// `format_override`: Override format detection for event extraction.
 /// `auto_compact`: If true, spawn background compaction after saving.
-pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extract_override: Option<bool>, format_override: Option<&str>, auto_compact: bool) -> bird::Result<()> {
+/// `no_pty`: If true, use pipes instead of PTY for separate stdout/stderr capture.
+pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extract_override: Option<bool>, format_override: Option<&str>, auto_compact: bool, no_pty: bool) -> bird::Result<()> {
     // Determine command string and build PTY command
     let (cmd_str, shell, args): (String, String, Vec<String>) = match shell_cmd {
         Some(cmd) => {
@@ -90,6 +97,15 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
         .unwrap_or_else(|_| ".".to_string());
 
     let invocation_id = uuid::Uuid::now_v7();
+
+    // Branch based on PTY mode
+    if no_pty {
+        return run_no_pty(
+            &cmd_str, &shell, &args, &cwd, invocation_id,
+            tag, extract_override, format_override, auto_compact,
+            config, store,
+        );
+    }
 
     // Allocate PTY
     let (mut pty, pts) = pty_open().map_err(|e| bird::Error::Io(io::Error::other(e)))?;
@@ -266,6 +282,173 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
     // PTY merges stdout/stderr into a single stream - store as "combined"
     if !output_buffer.is_empty() {
         batch = batch.with_output("combined", output_buffer);
+    }
+
+    store.write_batch(&batch)?;
+
+    // Extract events if enabled
+    let should_extract = extract_override.unwrap_or(config.auto_extract);
+    if should_extract {
+        let count = store.extract_events(&inv_id.to_string(), format_override)?;
+        if count > 0 {
+            eprintln!("shq: extracted {} events", count);
+        }
+    }
+
+    // Spawn background compaction if requested
+    if auto_compact {
+        let session_id = sid.clone();
+        let _ = Command::new(std::env::current_exe().unwrap_or_else(|_| "shq".into()))
+            .args(["compact", "-s", &session_id, "--today", "-q"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
+    if !status.success() {
+        std::process::exit(exit_code);
+    }
+
+    Ok(())
+}
+
+/// Run a command without PTY, capturing stdout/stderr separately via pipes.
+///
+/// This mode loses colors and interactivity but gains separate stream capture.
+fn run_no_pty(
+    cmd_str: &str,
+    shell: &str,
+    args: &[String],
+    cwd: &str,
+    invocation_id: uuid::Uuid,
+    tag: Option<&str>,
+    extract_override: Option<bool>,
+    format_override: Option<&str>,
+    auto_compact: bool,
+    config: Config,
+    store: Store,
+) -> bird::Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+    use std::thread;
+
+    // Build command with piped stdout/stderr
+    let mut child = Command::new(shell)
+        .args(args)
+        .env(BIRD_INVOCATION_UUID_VAR, invocation_id.to_string())
+        .env(BIRD_PARENT_CLIENT_VAR, "shq")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| bird::Error::Io(e))?;
+
+    let start = Instant::now();
+
+    // Take ownership of stdout/stderr handles
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+
+    // Buffers to collect output
+    let (tx_stdout, rx) = mpsc::channel::<(bool, Vec<u8>)>(); // (is_stderr, data)
+    let tx_stderr = tx_stdout.clone();
+
+    // Spawn thread to read stdout
+    let stdout_handle = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                // Echo to real stdout
+                println!("{}", line);
+                // Send to collector (with newline)
+                let mut data = line.into_bytes();
+                data.push(b'\n');
+                let _ = tx_stdout.send((false, data));
+            }
+        }
+    });
+
+    // Spawn thread to read stderr
+    let stderr_handle = thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                // Echo to real stderr
+                eprintln!("{}", line);
+                // Send to collector (with newline)
+                let mut data = line.into_bytes();
+                data.push(b'\n');
+                let _ = tx_stderr.send((true, data));
+            }
+        }
+    });
+
+    // Wait for child to exit
+    let status = child.wait().map_err(|e| bird::Error::Io(e))?;
+    let duration_ms = start.elapsed().as_millis() as i64;
+    let exit_code = status.code().unwrap_or(-1);
+
+    // Wait for reader threads to finish
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+
+    // Collect all output
+    let mut stdout_buffer = Vec::new();
+    let mut stderr_buffer = Vec::new();
+    while let Ok((is_stderr, data)) = rx.try_recv() {
+        if is_stderr {
+            stderr_buffer.extend(data);
+        } else {
+            stdout_buffer.extend(data);
+        }
+    }
+
+    // Check for nosave marker in combined output
+    let combined = [&stdout_buffer[..], &stderr_buffer[..]].concat();
+    if contains_nosave_marker(&combined) {
+        if !status.success() {
+            std::process::exit(exit_code);
+        }
+        return Ok(());
+    }
+
+    // Create and save records
+    let sid = session_id();
+    let session = SessionRecord::new(
+        &sid,
+        &config.client_id,
+        invoker_name(),
+        invoker_pid(),
+        "shell",
+    );
+
+    // Collect context metadata (VCS, CI)
+    let context = ContextMetadata::collect(Some(std::path::Path::new(cwd)));
+
+    let mut record = InvocationRecord::with_id(
+        invocation_id,
+        &sid,
+        cmd_str,
+        cwd,
+        exit_code,
+        &config.client_id,
+    )
+    .with_duration(duration_ms)
+    .with_metadata(context.into_map());
+
+    if let Some(t) = tag {
+        record = record.with_tag(t);
+    }
+
+    let inv_id = record.id;
+    let mut batch = InvocationBatch::new(record).with_session(session);
+
+    // Store stdout and stderr as separate streams
+    if !stdout_buffer.is_empty() {
+        batch = batch.with_output("stdout", stdout_buffer);
+    }
+    if !stderr_buffer.is_empty() {
+        batch = batch.with_output("stderr", stderr_buffer);
     }
 
     store.write_batch(&batch)?;
