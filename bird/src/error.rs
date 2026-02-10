@@ -10,6 +10,9 @@ pub enum Error {
     #[error("DuckDB error: {0}")]
     DuckDb(#[from] duckdb::Error),
 
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
     #[error("Configuration error: {0}")]
     Config(String),
 

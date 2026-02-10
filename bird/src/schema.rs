@@ -28,8 +28,18 @@ pub struct InvocationRecord {
     /// Extracted executable name (e.g., "make" from "make test").
     pub executable: Option<String>,
 
-    /// Exit code.
-    pub exit_code: i32,
+    /// Runner identifier for liveness checking of pending invocations.
+    /// Format depends on execution context:
+    /// - Local process: "pid:12345"
+    /// - GitHub Actions: "gha:run:12345678"
+    /// - Kubernetes: "k8s:pod:abc123"
+    pub runner_id: Option<String>,
+
+    /// Exit code (None while pending).
+    pub exit_code: Option<i32>,
+
+    /// Invocation status: "pending", "completed", "orphaned".
+    pub status: String,
 
     /// Detected output format (e.g., "gcc", "pytest").
     pub format_hint: Option<String>,
@@ -89,7 +99,9 @@ impl InvocationRecord {
             cwd: cwd.into(),
             executable: extract_executable(&cmd),
             cmd,
-            exit_code,
+            runner_id: None,
+            exit_code: Some(exit_code),
+            status: "completed".to_string(),
             format_hint: None,
             client_id: client_id.into(),
             hostname: gethostname::gethostname().to_str().map(|s| s.to_string()),
@@ -119,13 +131,92 @@ impl InvocationRecord {
             cwd: cwd.into(),
             executable: extract_executable(&cmd),
             cmd,
-            exit_code,
+            runner_id: None,
+            exit_code: Some(exit_code),
+            status: "completed".to_string(),
             format_hint: None,
             client_id: client_id.into(),
             hostname: gethostname::gethostname().to_str().map(|s| s.to_string()),
             username: std::env::var("USER").ok(),
             tag: None,
         }
+    }
+
+    /// Create a new pending invocation record.
+    ///
+    /// Use this when a command starts but hasn't completed yet.
+    /// The exit_code is None and status is "pending".
+    ///
+    /// `runner_id` identifies the execution context for liveness checking:
+    /// - Local process: "pid:12345"
+    /// - GitHub Actions: "gha:run:12345678"
+    /// - Kubernetes: "k8s:pod:abc123"
+    pub fn new_pending(
+        session_id: impl Into<String>,
+        cmd: impl Into<String>,
+        cwd: impl Into<String>,
+        runner_id: impl Into<String>,
+        client_id: impl Into<String>,
+    ) -> Self {
+        let cmd = cmd.into();
+
+        // Check for inherited invocation UUID from parent BIRD client
+        let id = if let Ok(uuid_str) = std::env::var(BIRD_INVOCATION_UUID_VAR) {
+            Uuid::parse_str(&uuid_str).unwrap_or_else(|_| Uuid::now_v7())
+        } else {
+            Uuid::now_v7()
+        };
+
+        Self {
+            id,
+            session_id: session_id.into(),
+            timestamp: Utc::now(),
+            duration_ms: None,
+            cwd: cwd.into(),
+            executable: extract_executable(&cmd),
+            cmd,
+            runner_id: Some(runner_id.into()),
+            exit_code: None,
+            status: "pending".to_string(),
+            format_hint: None,
+            client_id: client_id.into(),
+            hostname: gethostname::gethostname().to_str().map(|s| s.to_string()),
+            username: std::env::var("USER").ok(),
+            tag: None,
+        }
+    }
+
+    /// Create a pending invocation for a local process.
+    ///
+    /// Convenience method that formats the PID as "pid:{pid}".
+    pub fn new_pending_local(
+        session_id: impl Into<String>,
+        cmd: impl Into<String>,
+        cwd: impl Into<String>,
+        pid: i32,
+        client_id: impl Into<String>,
+    ) -> Self {
+        Self::new_pending(session_id, cmd, cwd, format!("pid:{}", pid), client_id)
+    }
+
+    /// Mark this invocation as completed with the given exit code.
+    pub fn complete(mut self, exit_code: i32, duration_ms: Option<i64>) -> Self {
+        self.exit_code = Some(exit_code);
+        self.duration_ms = duration_ms;
+        self.status = "completed".to_string();
+        self
+    }
+
+    /// Mark this invocation as orphaned (process died without cleanup).
+    pub fn mark_orphaned(mut self) -> Self {
+        self.status = "orphaned".to_string();
+        self
+    }
+
+    /// Set the runner ID.
+    pub fn with_runner_id(mut self, runner_id: impl Into<String>) -> Self {
+        self.runner_id = Some(runner_id.into());
+        self
     }
 
     /// Check if this invocation was inherited from a parent BIRD client.
@@ -422,7 +513,9 @@ CREATE TABLE invocations (
     cwd               VARCHAR NOT NULL,
     cmd               VARCHAR NOT NULL,
     executable        VARCHAR,
-    exit_code         INTEGER NOT NULL,
+    runner_id         VARCHAR,
+    exit_code         INTEGER,
+    status            VARCHAR DEFAULT 'completed',
     format_hint       VARCHAR,
     client_id         VARCHAR NOT NULL,
     hostname          VARCHAR,
@@ -472,8 +565,86 @@ mod tests {
         assert_eq!(record.session_id, "session-123");
         assert_eq!(record.cmd, "make test");
         assert_eq!(record.executable, Some("make".to_string()));
-        assert_eq!(record.exit_code, 0);
+        assert_eq!(record.exit_code, Some(0));
+        assert_eq!(record.status, "completed");
         assert!(record.duration_ms.is_none());
+        assert!(record.runner_id.is_none());
+    }
+
+    #[test]
+    fn test_invocation_record_pending() {
+        let record = InvocationRecord::new_pending(
+            "session-123",
+            "make test",
+            "/home/user/project",
+            "pid:12345",
+            "user@laptop",
+        );
+
+        assert_eq!(record.session_id, "session-123");
+        assert_eq!(record.cmd, "make test");
+        assert_eq!(record.runner_id, Some("pid:12345".to_string()));
+        assert_eq!(record.exit_code, None);
+        assert_eq!(record.status, "pending");
+    }
+
+    #[test]
+    fn test_invocation_record_pending_local() {
+        let record = InvocationRecord::new_pending_local(
+            "session-123",
+            "make test",
+            "/home/user/project",
+            12345,
+            "user@laptop",
+        );
+
+        assert_eq!(record.runner_id, Some("pid:12345".to_string()));
+        assert_eq!(record.status, "pending");
+    }
+
+    #[test]
+    fn test_invocation_record_pending_gha() {
+        let record = InvocationRecord::new_pending(
+            "gha-session",
+            "make test",
+            "/github/workspace",
+            "gha:run:123456789",
+            "runner@github",
+        );
+
+        assert_eq!(record.runner_id, Some("gha:run:123456789".to_string()));
+        assert_eq!(record.status, "pending");
+    }
+
+    #[test]
+    fn test_invocation_record_complete() {
+        let record = InvocationRecord::new_pending(
+            "session-123",
+            "make test",
+            "/home/user/project",
+            "pid:12345",
+            "user@laptop",
+        )
+        .complete(0, Some(1500));
+
+        assert_eq!(record.exit_code, Some(0));
+        assert_eq!(record.duration_ms, Some(1500));
+        assert_eq!(record.status, "completed");
+    }
+
+    #[test]
+    fn test_invocation_record_orphaned() {
+        let record = InvocationRecord::new_pending(
+            "session-123",
+            "make test",
+            "/home/user/project",
+            "pid:12345",
+            "user@laptop",
+        )
+        .mark_orphaned();
+
+        assert_eq!(record.exit_code, None);
+        assert_eq!(record.status, "orphaned");
     }
 
     #[test]

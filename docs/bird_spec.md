@@ -31,8 +31,9 @@ $BIRD_ROOT/                          # Default: ~/.local/share/bird
 │   ├── data/
 │   │   ├── recent/                  # Last 14 days (hot data)
 │   │   │   ├── invocations/         # Command execution records
-│   │   │   │   └── date=YYYY-MM-DD/
-│   │   │   │       └── <session>--<exec>--<uuid>.parquet
+│   │   │   │   └── status=<status>/ # pending, completed, orphaned
+│   │   │   │       └── date=YYYY-MM-DD/
+│   │   │   │           └── <session>--<exec>--<uuid>.parquet
 │   │   │   ├── outputs/             # stdout/stderr content
 │   │   │   │   └── date=YYYY-MM-DD/
 │   │   │   │       └── <session>--<exec>--<uuid>.parquet
@@ -144,9 +145,11 @@ CREATE TABLE invocations (
     -- Command
     cmd               VARCHAR NOT NULL,        -- Full command string
     executable        VARCHAR,                 -- Extracted executable name
+    runner_id         VARCHAR,                 -- Runner identifier (for liveness checking)
 
     -- Result
-    exit_code         INTEGER NOT NULL,
+    exit_code         INTEGER,                 -- NULL while pending
+    status            VARCHAR DEFAULT 'completed',  -- pending, completed, orphaned
 
     -- Format detection
     format_hint       VARCHAR,                 -- Detected format (gcc, cargo, pytest)
@@ -155,11 +158,20 @@ CREATE TABLE invocations (
     client_id         VARCHAR NOT NULL,        -- user@hostname
     hostname          VARCHAR,
     username          VARCHAR,
+    tag               VARCHAR,                 -- User-assigned tag
 
-    -- Partitioning
+    -- Partitioning (status is first-level hive partition)
     date              DATE NOT NULL
 );
 ```
+
+**Status Values:**
+
+| Status | Description |
+|--------|-------------|
+| `pending` | Command is currently running (exit_code is NULL) |
+| `completed` | Command finished normally (exit code captured) |
+| `orphaned` | Process died without cleanup (crash, SIGKILL, system reboot) |
 
 ### Sessions Table
 
@@ -541,68 +553,210 @@ $BIRD_ROOT/db/pending/<session_id>--<uuid>.pending
 
 **Lifecycle:**
 
-1. **Command starts**: Create pending file with initial metadata
+1. **Command starts**:
+   - Create JSON pending file (fast, crash-safe marker)
+   - Write parquet to `status=pending/date=.../` partition
 2. **Command runs**: Output captured to temp files/buffers
-3. **Command ends**: Write final invocation record, delete pending file
+3. **Command ends**:
+   - Write final invocation record to `status=completed/date=.../`
+   - Delete pending parquet file from `status=pending/`
+   - Delete JSON pending file
 
-**Pending File Format (JSON Lines):**
+**Pending File Format (JSON):**
 
 ```json
-{"id":"01937a2b-3c4d-7e8f-9012-3456789abcde","session_id":"zsh-12345","timestamp":"2024-01-15T10:30:00Z","cmd":"make test","cwd":"/home/user/project","client_id":"user@hostname"}
-```
-
-**On Startup/Recovery:**
-
-```rust
-fn recover_pending_invocations(bird_root: &Path) -> Vec<IncompleteInvocation> {
-    let pending_dir = bird_root.join("db/pending");
-    fs::read_dir(&pending_dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            if path.extension()? == "pending" {
-                let content = fs::read_to_string(&path).ok()?;
-                let inv: IncompleteInvocation = serde_json::from_str(&content).ok()?;
-                Some(inv)
-            } else {
-                None
-            }
-        })
-        .collect()
+{
+  "id": "01937a2b-3c4d-7e8f-9012-3456789abcde",
+  "session_id": "zsh-12345",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "cmd": "make test",
+  "cwd": "/home/user/project",
+  "client_id": "user@hostname",
+  "runner_id": "pid:12345"
 }
 ```
 
-**Recovery Options:**
+**Runner ID Formats:**
 
-| Scenario | Action |
-|----------|--------|
-| Pending file exists, no output | Record as incomplete (exit_code=-1, duration=unknown) |
-| Pending file exists, partial output | Record with partial output, mark as interrupted |
-| Pending file stale (>24h) | Archive to `incomplete/` or delete |
+| Context | Format | Example |
+|---------|--------|---------|
+| Local process | `pid:<pid>` | `pid:12345` |
+| GitHub Actions | `gha:run:<run_id>` | `gha:run:123456789` |
+| Kubernetes | `k8s:pod:<pod_name>` | `k8s:pod:build-abc123` |
+| Docker | `docker:<container_id>` | `docker:a1b2c3d4e5f6` |
 
-**Schema Addition:**
+**Runner-Based Liveness Checking:**
 
-```sql
--- Optional: Track invocation status
-ALTER TABLE invocations ADD COLUMN status VARCHAR DEFAULT 'completed';
--- Values: 'running', 'completed', 'interrupted', 'timeout'
+The runner_id enables checking if an execution context is still active:
+
+```rust
+/// Check if a runner is still alive based on its ID format
+fn is_runner_alive(runner_id: &str) -> bool {
+    if let Some(pid_str) = runner_id.strip_prefix("pid:") {
+        // Local process: use kill(pid, 0)
+        if let Ok(pid) = pid_str.parse::<i32>() {
+            return is_process_alive(pid);
+        }
+    } else if runner_id.starts_with("gha:") {
+        // GitHub Actions: check via API or assume alive if recent
+        return true; // Can't easily check, assume alive
+    } else if runner_id.starts_with("k8s:") {
+        // Kubernetes: could check pod status via kubectl/API
+        return true; // Requires k8s access
+    }
+    // Unknown format - assume alive to be safe
+    true
+}
+
+/// Check if a local process is still alive
+fn is_process_alive(pid: i32) -> bool {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        kill(Pid::from_raw(pid), None).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        true // Conservative: assume alive on non-Unix
+    }
+}
 ```
+
+**Recovery Logic:**
+
+```rust
+fn recover_pending_invocations(store: &Store) -> Result<RecoveryStats> {
+    let pending_dir = store.config().pending_dir();
+    let mut stats = RecoveryStats::default();
+
+    for entry in fs::read_dir(&pending_dir)?.flatten() {
+        let path = entry.path();
+        if path.extension() != Some("pending".as_ref()) {
+            continue;
+        }
+
+        let content = fs::read_to_string(&path)?;
+        let pending: PendingInvocation = serde_json::from_str(&content)?;
+
+        if is_runner_alive(&pending.runner_id) {
+            // Runner still active - leave pending file alone
+            stats.still_running += 1;
+            continue;
+        }
+
+        // Runner is dead - record as orphaned
+        let record = InvocationRecord {
+            id: pending.id,
+            session_id: pending.session_id,
+            timestamp: pending.timestamp,
+            duration_ms: None,  // Unknown
+            cwd: pending.cwd,
+            cmd: pending.cmd,
+            executable: extract_executable(&pending.cmd),
+            runner_id: Some(pending.runner_id),
+            exit_code: None,    // Unknown/crashed
+            status: "orphaned".to_string(),
+            // ... other fields
+        };
+
+        store.write_invocation_with_status(&record, "orphaned")?;
+        fs::remove_file(&path)?;
+        stats.orphaned += 1;
+    }
+
+    Ok(stats)
+}
+```
+
+**Recovery Scenarios:**
+
+| Scenario | Runner Check | Action |
+|----------|--------------|--------|
+| Pending file, runner alive | Liveness check succeeds | Leave alone (still running) |
+| Pending file, runner dead | Liveness check fails | Record as orphaned, delete pending |
+| Pending file, stale (>24h) | Any | Record as orphaned (runner_id may have been recycled) |
+| Pending file, unknown runner type | N/A | Treat as stale after max_age |
 
 **Benefits:**
 
 - **Fast**: Single file write at command start (~1ms)
 - **Crash-safe**: Plain file survives DuckDB crashes
 - **Concurrent-safe**: Unique filename per invocation
-- **Debuggable**: Human-readable JSON
+- **Debuggable**: Human-readable JSON with PID
 - **Recoverable**: Can reconstruct incomplete records on restart
+- **Liveness check**: PID enables detection of still-running vs dead processes
 
 **Cleanup:**
 
 Pending files are automatically cleaned up:
-- On normal command completion: deleted immediately
-- On startup: any files older than `hot_days` are archived or deleted
+- On normal command completion: deleted immediately after writing to `status=completed/`
+- Via `shq clean`: checks all pending files, records orphaned ones
 - Background task: periodic cleanup of orphaned pending files
+
+### Clean/Prune Command
+
+The `shq clean` command processes orphaned invocations and cleans up stale data:
+
+```bash
+# Check for orphaned processes and record them
+shq clean
+
+# Preview what would be cleaned (no changes)
+shq clean --dry-run
+
+# Force cleanup of pending files older than N hours (default: 24)
+shq clean --max-age 12
+
+# Also prune old archive data
+shq clean --prune --older-than 90d
+```
+
+**Clean Operation:**
+
+1. **Scan pending files** in `$BIRD_ROOT/db/pending/`
+2. **Check PID liveness** for each pending invocation
+3. **For dead processes**:
+   - Read partial output if available
+   - Write invocation record to `status=orphaned/date=.../`
+   - Delete JSON pending file and parquet from `status=pending/`
+4. **For stale files** (older than `--max-age`):
+   - Assume process is dead (PID may have been recycled)
+   - Same handling as dead processes
+
+**Prune Operation (--prune):**
+
+Removes old data from the archive tier:
+
+| Data Type | Default Retention | Flag |
+|-----------|-------------------|------|
+| Invocations | 365 days | `--older-than` |
+| Outputs | 90 days | `--outputs-older-than` |
+| Events | 365 days | `--events-older-than` |
+| Orphaned blobs | 30 days | `--blobs-older-than` |
+
+```rust
+pub struct CleanOptions {
+    pub dry_run: bool,
+    pub max_age_hours: u32,      // For pending files (default: 24)
+    pub prune: bool,             // Enable archive pruning
+    pub older_than_days: u32,    // For archive data (default: 365)
+}
+
+pub struct CleanStats {
+    pub pending_checked: usize,
+    pub still_running: usize,
+    pub orphaned: usize,
+    pub pruned_files: usize,
+    pub bytes_freed: u64,
+}
+```
+
+**Safety:**
+
+- `--dry-run` always shows what would be done without making changes
+- Blobs are only deleted if no invocations reference them (ref_count = 0)
+- Archive pruning requires explicit `--prune` flag
 
 ## Error Handling
 

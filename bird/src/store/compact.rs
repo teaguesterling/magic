@@ -163,6 +163,45 @@ impl Default for AutoCompactOptions {
     }
 }
 
+/// Options for clean/prune operations.
+#[derive(Debug, Clone)]
+pub struct CleanOptions {
+    /// If true, don't actually make changes.
+    pub dry_run: bool,
+    /// Maximum age in hours for pending files before they're considered stale.
+    pub max_age_hours: u32,
+    /// If true, also prune old archive data.
+    pub prune: bool,
+    /// Delete archive data older than this many days (when prune=true).
+    pub older_than_days: u32,
+}
+
+impl Default for CleanOptions {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            max_age_hours: 24,
+            prune: false,
+            older_than_days: 365,
+        }
+    }
+}
+
+/// Statistics from a clean operation.
+#[derive(Debug, Default)]
+pub struct CleanStats {
+    /// Number of pending files checked.
+    pub pending_checked: usize,
+    /// Number of invocations still running.
+    pub still_running: usize,
+    /// Number of invocations marked as orphaned.
+    pub orphaned: usize,
+    /// Number of archive files pruned.
+    pub pruned_files: usize,
+    /// Bytes freed from pruning.
+    pub bytes_freed: u64,
+}
+
 impl Store {
     /// Compact files for a specific session in a partition.
     ///
@@ -491,7 +530,7 @@ impl Store {
             return Ok(total_stats);
         }
 
-        // Iterate over date partitions
+        // Iterate over partitions (may have status= level for invocations)
         for entry in fs::read_dir(data_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -500,8 +539,20 @@ impl Store {
                 continue;
             }
 
-            let stats = self.compact_partition(&path, file_threshold, session_filter, dry_run)?;
-            total_stats.add(&stats);
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+
+            // Check if this is a status= partition (for invocations)
+            if dir_name.starts_with("status=") {
+                // Recurse into status partition to find date partitions
+                let stats =
+                    self.compact_data_type(&path, file_threshold, session_filter, dry_run)?;
+                total_stats.add(&stats);
+            } else {
+                // This is a date= partition or other partition
+                let stats =
+                    self.compact_partition(&path, file_threshold, session_filter, dry_run)?;
+                total_stats.add(&stats);
+            }
         }
 
         Ok(total_stats)
@@ -610,7 +661,20 @@ impl Store {
             // Use <= so that "older_than_days=0" archives everything including today
             // Skip seed partitions (date=1970-01-01) which contain schema-only files
             let seed_date = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-            let partitions_to_archive: Vec<(NaiveDate, PathBuf, String)> = fs::read_dir(&recent_data_dir)?
+
+            // For invocations, we need to look inside status=completed/ for date partitions
+            // Other data types have date partitions directly
+            let date_partition_parent = if *data_type == "invocations" {
+                recent_data_dir.join("status=completed")
+            } else {
+                recent_data_dir.clone()
+            };
+
+            if !date_partition_parent.exists() {
+                continue;
+            }
+
+            let partitions_to_archive: Vec<(NaiveDate, PathBuf, String)> = fs::read_dir(&date_partition_parent)?
                 .filter_map(|e| e.ok())
                 .filter_map(|e| {
                     let path = e.path();
@@ -784,8 +848,18 @@ impl Store {
                 continue;
             }
 
-            let stats = self.compact_partition_with_opts(&path, opts)?;
-            total_stats.add(&stats);
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+
+            // Check if this is a status= partition (for invocations)
+            if dir_name.starts_with("status=") {
+                // Recurse into status partition to find date partitions
+                let stats = self.compact_data_type_with_opts(&path, opts)?;
+                total_stats.add(&stats);
+            } else {
+                // This is a date= partition or other partition
+                let stats = self.compact_partition_with_opts(&path, opts)?;
+                total_stats.add(&stats);
+            }
         }
 
         Ok(total_stats)
@@ -812,6 +886,133 @@ impl Store {
         }
 
         Ok(total_stats)
+    }
+
+    /// Clean operation: recover orphaned invocations and optionally prune archive.
+    ///
+    /// This:
+    /// 1. Scans pending files for crashed/dead invocations
+    /// 2. Marks them as orphaned in status=orphaned partition
+    /// 3. Optionally prunes old archive data
+    pub fn clean(&self, opts: &CleanOptions) -> Result<CleanStats> {
+        let mut stats = CleanStats::default();
+
+        // Recover orphaned invocations
+        let recovery_stats =
+            self.recover_orphaned_invocations(opts.max_age_hours, opts.dry_run)?;
+
+        stats.pending_checked = recovery_stats.pending_checked;
+        stats.still_running = recovery_stats.still_running;
+        stats.orphaned = recovery_stats.orphaned;
+
+        // Prune old archive data if requested
+        if opts.prune {
+            let prune_stats = self.prune_archive(opts.older_than_days, opts.dry_run)?;
+            stats.pruned_files = prune_stats.files_pruned;
+            stats.bytes_freed = prune_stats.bytes_freed;
+        }
+
+        Ok(stats)
+    }
+
+    /// Prune old archive data.
+    ///
+    /// Deletes data from the archive tier older than the specified number of days.
+    pub fn prune_archive(&self, older_than_days: u32, dry_run: bool) -> Result<PruneStats> {
+        let mut stats = PruneStats::default();
+        let cutoff_date = Utc::now().date_naive() - chrono::Duration::days(older_than_days as i64);
+        let archive_dir = self.config().archive_dir();
+
+        for data_type in &["invocations", "outputs", "sessions", "events"] {
+            let data_dir = archive_dir.join(data_type);
+            if !data_dir.exists() {
+                continue;
+            }
+
+            // Archive doesn't have status partitioning - just date= partitions directly
+            let partition_stats =
+                self.prune_date_partitions(&data_dir, cutoff_date, dry_run)?;
+            stats.add(&partition_stats);
+        }
+
+        Ok(stats)
+    }
+
+    /// Prune date partitions older than cutoff.
+    fn prune_date_partitions(
+        &self,
+        parent_dir: &Path,
+        cutoff_date: NaiveDate,
+        dry_run: bool,
+    ) -> Result<PruneStats> {
+        let mut stats = PruneStats::default();
+        let seed_date = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+
+        for entry in fs::read_dir(parent_dir)?.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            let date_str = match dir_name.strip_prefix("date=") {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let date = match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            // Skip seed partition
+            if date == seed_date {
+                continue;
+            }
+
+            // Skip if not old enough
+            if date > cutoff_date {
+                continue;
+            }
+
+            // Count files and bytes
+            for file_entry in fs::read_dir(&path)?.flatten() {
+                let file_path = file_entry.path();
+                if file_path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                    if let Ok(metadata) = fs::metadata(&file_path) {
+                        stats.files_pruned += 1;
+                        stats.bytes_freed += metadata.len();
+                    }
+
+                    if !dry_run {
+                        let _ = fs::remove_file(&file_path);
+                    }
+                }
+            }
+
+            // Remove the partition directory if empty (and not dry run)
+            if !dry_run {
+                let _ = fs::remove_dir(&path);
+            }
+        }
+
+        Ok(stats)
+    }
+}
+
+/// Statistics from a prune operation.
+#[derive(Debug, Default)]
+pub struct PruneStats {
+    /// Number of files pruned.
+    pub files_pruned: usize,
+    /// Bytes freed.
+    pub bytes_freed: u64,
+}
+
+impl PruneStats {
+    fn add(&mut self, other: &PruneStats) {
+        self.files_pruned += other.files_pruned;
+        self.bytes_freed += other.bytes_freed;
     }
 }
 
@@ -1478,5 +1679,150 @@ mod tests {
         let mut expected = commands.clone();
         expected.sort();
         assert_eq!(found_cmds, expected, "All commands should be preserved");
+    }
+
+    // ===== Clean/Prune Tests =====
+
+    #[test]
+    fn test_clean_recovers_orphaned() {
+        let (tmp, store) = setup_store();
+
+        // Create a pending invocation with a dead PID
+        let record = InvocationRecord::new_pending_local(
+            "test-session",
+            "crashed-command",
+            "/home/user",
+            999999999, // PID that doesn't exist
+            "test@client",
+        );
+
+        // Write pending file manually (simulating a crash scenario)
+        let pending =
+            super::super::pending::PendingInvocation::from_record(&record).unwrap();
+        let pending_dir = tmp.path().join("db/pending");
+        super::super::pending::write_pending_file(&pending_dir, &pending).unwrap();
+
+        // Write to status=pending partition
+        store.write_invocation(&record).unwrap();
+
+        // Run clean
+        let opts = CleanOptions::default();
+        let stats = store.clean(&opts).unwrap();
+
+        assert_eq!(stats.pending_checked, 1);
+        assert_eq!(stats.orphaned, 1);
+        assert_eq!(stats.still_running, 0);
+    }
+
+    #[test]
+    fn test_clean_dry_run() {
+        let (tmp, store) = setup_store();
+
+        // Create a pending invocation with a dead PID
+        let record = InvocationRecord::new_pending_local(
+            "test-session",
+            "crashed-command",
+            "/home/user",
+            999999999, // PID that doesn't exist
+            "test@client",
+        );
+
+        // Write pending file
+        let pending =
+            super::super::pending::PendingInvocation::from_record(&record).unwrap();
+        let pending_dir = tmp.path().join("db/pending");
+        super::super::pending::write_pending_file(&pending_dir, &pending).unwrap();
+
+        // Write to status=pending partition
+        store.write_invocation(&record).unwrap();
+
+        // Run clean in dry-run mode
+        let opts = CleanOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        let stats = store.clean(&opts).unwrap();
+
+        // Stats should report the orphan
+        assert_eq!(stats.pending_checked, 1);
+        assert_eq!(stats.orphaned, 1);
+
+        // But pending file should still exist
+        let pending_path = pending.path(&pending_dir);
+        assert!(pending_path.exists(), "Pending file should still exist after dry run");
+    }
+
+    #[test]
+    fn test_prune_archive() {
+        let (tmp, store) = setup_store();
+
+        // Write some data
+        for i in 0..3 {
+            let record = InvocationRecord::new(
+                "test-session",
+                format!("command-{}", i),
+                "/home/user",
+                0,
+                "test@client",
+            );
+            store.write_invocation(&record).unwrap();
+        }
+
+        // Archive everything (0 days = archive all)
+        let archive_stats = store.archive_old_data(0, false).unwrap();
+        assert!(archive_stats.partitions_archived > 0, "Should archive data");
+
+        // Verify archive exists
+        let archive_invocations = tmp.path().join("db/data/archive/invocations");
+        assert!(archive_invocations.exists(), "Archive should exist");
+
+        // Prune with 0 days (prune everything)
+        let prune_stats = store.prune_archive(0, false).unwrap();
+        assert!(prune_stats.files_pruned > 0, "Should prune files");
+        assert!(prune_stats.bytes_freed > 0, "Should free bytes");
+    }
+
+    #[test]
+    fn test_clean_with_prune() {
+        let (tmp, store) = setup_store();
+
+        // Create orphaned pending file
+        let record = InvocationRecord::new_pending_local(
+            "test-session",
+            "crashed-command",
+            "/home/user",
+            999999999,
+            "test@client",
+        );
+        let pending =
+            super::super::pending::PendingInvocation::from_record(&record).unwrap();
+        let pending_dir = tmp.path().join("db/pending");
+        super::super::pending::write_pending_file(&pending_dir, &pending).unwrap();
+        store.write_invocation(&record).unwrap();
+
+        // Write and archive some data
+        for i in 0..3 {
+            let record = InvocationRecord::new(
+                "another-session",
+                format!("command-{}", i),
+                "/home/user",
+                0,
+                "test@client",
+            );
+            store.write_invocation(&record).unwrap();
+        }
+        store.archive_old_data(0, false).unwrap();
+
+        // Run clean with prune
+        let opts = CleanOptions {
+            prune: true,
+            older_than_days: 0, // Prune everything
+            ..Default::default()
+        };
+        let stats = store.clean(&opts).unwrap();
+
+        // Should both recover orphaned and prune archive
+        assert_eq!(stats.orphaned, 1, "Should recover 1 orphaned");
+        assert!(stats.pruned_files > 0, "Should prune archive files");
     }
 }

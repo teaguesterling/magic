@@ -172,9 +172,9 @@ fn create_placeholder_schemas(conn: &duckdb::Connection) -> Result<()> {
         );
         CREATE TABLE cached_placeholder.invocations (
             id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
-            cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
-            format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR,
-            tag VARCHAR, date DATE, _source VARCHAR
+            cwd VARCHAR, cmd VARCHAR, executable VARCHAR, runner_id VARCHAR, exit_code INTEGER,
+            status VARCHAR, format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR,
+            username VARCHAR, tag VARCHAR, date DATE, _source VARCHAR
         );
         CREATE TABLE cached_placeholder.outputs (
             id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
@@ -200,9 +200,9 @@ fn create_placeholder_schemas(conn: &duckdb::Connection) -> Result<()> {
         );
         CREATE TABLE remote_placeholder.invocations (
             id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
-            cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
-            format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR,
-            tag VARCHAR, date DATE, _source VARCHAR
+            cwd VARCHAR, cmd VARCHAR, executable VARCHAR, runner_id VARCHAR, exit_code INTEGER,
+            status VARCHAR, format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR,
+            username VARCHAR, tag VARCHAR, date DATE, _source VARCHAR
         );
         CREATE TABLE remote_placeholder.outputs (
             id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
@@ -389,7 +389,9 @@ fn create_local_tables(conn: &duckdb::Connection) -> Result<()> {
             cwd VARCHAR,
             cmd VARCHAR,
             executable VARCHAR,
+            runner_id VARCHAR,
             exit_code INTEGER,
+            status VARCHAR DEFAULT 'completed',
             format_hint VARCHAR,
             client_id VARCHAR,
             hostname VARCHAR,
@@ -593,10 +595,11 @@ fn create_blob_registry(conn: &duckdb::Connection) -> Result<()> {
 
 /// Create seed parquet files with correct schema but no rows.
 fn create_seed_files(conn: &duckdb::Connection, config: &Config) -> Result<()> {
-    // Create invocations seed
+    // Create invocations seed (in status=completed partition)
     let invocations_seed_dir = config
         .recent_dir()
         .join("invocations")
+        .join("status=completed")
         .join("date=1970-01-01");
     fs::create_dir_all(&invocations_seed_dir)?;
 
@@ -612,7 +615,9 @@ fn create_seed_files(conn: &duckdb::Connection, config: &Config) -> Result<()> {
                 NULL::VARCHAR as cwd,
                 NULL::VARCHAR as cmd,
                 NULL::VARCHAR as executable,
+                NULL::VARCHAR as runner_id,
                 NULL::INTEGER as exit_code,
+                NULL::VARCHAR as status,
                 NULL::VARCHAR as format_hint,
                 NULL::VARCHAR as client_id,
                 NULL::VARCHAR as hostname,

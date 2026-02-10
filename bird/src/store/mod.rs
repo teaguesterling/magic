@@ -7,6 +7,7 @@ mod compact;
 mod events;
 mod invocations;
 mod outputs;
+mod pending;
 mod remote;
 mod sessions;
 
@@ -95,10 +96,17 @@ fn format_value(value: &Value) -> String {
 }
 
 // Re-export types from submodules
-pub use compact::{ArchiveStats, AutoCompactOptions, CompactOptions, CompactStats};
+pub use compact::{
+    ArchiveStats, AutoCompactOptions, CleanOptions, CleanStats, CompactOptions, CompactStats,
+    PruneStats,
+};
 pub use events::{EventFilters, EventSummary, FormatConfig, FormatRule};
 pub use invocations::InvocationSummary;
 pub use outputs::OutputInfo;
+pub use pending::{
+    delete_pending_file, is_runner_alive, list_pending_files, write_pending_file,
+    PendingInvocation, RecoveryStats,
+};
 pub use remote::{parse_since, PullOptions, PullStats, PushOptions, PushStats};
 
 // Re-export format detection types (defined below)
@@ -556,8 +564,8 @@ impl Store {
             );
             CREATE TABLE IF NOT EXISTS cached_placeholder.invocations (
                 id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
-                cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
-                format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR, date DATE, _source VARCHAR
+                cwd VARCHAR, cmd VARCHAR, executable VARCHAR, runner_id VARCHAR, exit_code INTEGER,
+                status VARCHAR, format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR, tag VARCHAR, date DATE, _source VARCHAR
             );
             CREATE TABLE IF NOT EXISTS cached_placeholder.outputs (
                 id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
@@ -576,8 +584,8 @@ impl Store {
             );
             CREATE TABLE IF NOT EXISTS remote_placeholder.invocations (
                 id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
-                cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
-                format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR, date DATE, _source VARCHAR
+                cwd VARCHAR, cmd VARCHAR, executable VARCHAR, runner_id VARCHAR, exit_code INTEGER,
+                status VARCHAR, format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR, tag VARCHAR, date DATE, _source VARCHAR
             );
             CREATE TABLE IF NOT EXISTS remote_placeholder.outputs (
                 id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
@@ -1266,7 +1274,7 @@ impl Store {
 
         // Write invocation
         conn.execute(
-            r#"INSERT INTO local.invocations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            r#"INSERT INTO local.invocations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             params![
                 invocation.id.to_string(),
                 invocation.session_id,
@@ -1275,7 +1283,9 @@ impl Store {
                 invocation.cwd,
                 invocation.cmd,
                 invocation.executable,
+                invocation.runner_id,
                 invocation.exit_code,
+                invocation.status,
                 invocation.format_hint,
                 invocation.client_id,
                 invocation.hostname,

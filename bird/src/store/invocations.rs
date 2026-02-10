@@ -39,8 +39,8 @@ impl Store {
         let conn = self.connection_with_options(false)?;
         let date = record.date();
 
-        // Ensure the partition directory exists
-        let partition_dir = self.config.invocations_dir(&date);
+        // Ensure the partition directory exists (status-partitioned)
+        let partition_dir = self.config.invocations_dir_with_status(&record.status, &date);
         fs::create_dir_all(&partition_dir)?;
 
         // Generate filename: {session}--{executable}--{id}.parquet
@@ -64,7 +64,9 @@ impl Store {
                 cwd VARCHAR,
                 cmd VARCHAR,
                 executable VARCHAR,
+                runner_id VARCHAR,
                 exit_code INTEGER,
+                status VARCHAR,
                 format_hint VARCHAR,
                 client_id VARCHAR,
                 hostname VARCHAR,
@@ -78,7 +80,7 @@ impl Store {
         conn.execute(
             r#"
             INSERT INTO temp_invocation VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             "#,
             params![
@@ -89,7 +91,9 @@ impl Store {
                 record.cwd,
                 record.cmd,
                 record.executable,
+                record.runner_id,
                 record.exit_code,
+                record.status,
                 record.format_hint,
                 record.client_id,
                 record.hostname,
@@ -124,7 +128,7 @@ impl Store {
         conn.execute(
             r#"
             INSERT INTO local.invocations VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             "#,
             params![
@@ -135,7 +139,9 @@ impl Store {
                 record.cwd,
                 record.cmd,
                 record.executable,
+                record.runner_id,
                 record.exit_code,
+                record.status,
                 record.format_hint,
                 record.client_id,
                 record.hostname,
@@ -376,6 +382,169 @@ impl Store {
 
         Ok(())
     }
+
+    /// Start a pending invocation.
+    ///
+    /// This:
+    /// 1. Creates a JSON pending file for crash recovery
+    /// 2. Writes the invocation to the status=pending partition
+    ///
+    /// Returns the pending invocation for later completion.
+    pub fn start_pending_invocation(
+        &self,
+        record: &InvocationRecord,
+    ) -> Result<super::pending::PendingInvocation> {
+        use super::pending::{write_pending_file, PendingInvocation};
+
+        // Create pending invocation marker
+        let pending = PendingInvocation::from_record(record)
+            .ok_or_else(|| crate::error::Error::Storage("Missing runner_id".to_string()))?;
+
+        // Write pending file first (crash-safe marker)
+        let pending_dir = self.config.pending_dir();
+        write_pending_file(&pending_dir, &pending)?;
+
+        // Write to status=pending partition
+        self.write_invocation(record)?;
+
+        Ok(pending)
+    }
+
+    /// Complete a pending invocation.
+    ///
+    /// This:
+    /// 1. Writes the completed record to status=completed partition
+    /// 2. Deletes the pending parquet file from status=pending partition
+    /// 3. Deletes the JSON pending file
+    pub fn complete_pending_invocation(
+        &self,
+        record: &InvocationRecord,
+        pending: &super::pending::PendingInvocation,
+    ) -> Result<()> {
+        use super::pending::delete_pending_file;
+
+        // Write completed record
+        self.write_invocation(record)?;
+
+        // Delete pending parquet file
+        let pending_date = pending.timestamp.date_naive();
+        let pending_partition = self.config.invocations_dir_with_status("pending", &pending_date);
+        let executable = record.executable.as_deref().unwrap_or("unknown");
+        let pending_filename = format!(
+            "{}--{}--{}.parquet",
+            sanitize_filename(&pending.session_id),
+            sanitize_filename(executable),
+            pending.id
+        );
+        let pending_parquet = pending_partition.join(&pending_filename);
+        if pending_parquet.exists() {
+            let _ = fs::remove_file(&pending_parquet);
+        }
+
+        // Delete JSON pending file
+        let pending_dir = self.config.pending_dir();
+        delete_pending_file(&pending_dir, pending.id, &pending.session_id)?;
+
+        Ok(())
+    }
+
+    /// Recover orphaned invocations from pending files.
+    ///
+    /// This scans pending files and marks invocations as orphaned if:
+    /// - The runner is no longer alive
+    /// - The pending file is older than max_age_hours
+    pub fn recover_orphaned_invocations(
+        &self,
+        max_age_hours: u32,
+        dry_run: bool,
+    ) -> Result<super::pending::RecoveryStats> {
+        use super::pending::{
+            delete_pending_file, is_runner_alive, list_pending_files, RecoveryStats,
+        };
+
+        let pending_dir = self.config.pending_dir();
+        let pending_files = list_pending_files(&pending_dir)?;
+        let mut stats = RecoveryStats::default();
+
+        let now = chrono::Utc::now();
+        let max_age = chrono::Duration::hours(max_age_hours as i64);
+
+        for pending in pending_files {
+            stats.pending_checked += 1;
+
+            // Check if too old (runner ID might have been recycled)
+            let age = now.signed_duration_since(pending.timestamp);
+            let is_stale = age > max_age;
+
+            // Check if runner is still alive
+            let runner_alive = !is_stale && is_runner_alive(&pending.runner_id);
+
+            if runner_alive {
+                stats.still_running += 1;
+                continue;
+            }
+
+            if dry_run {
+                stats.orphaned += 1;
+                continue;
+            }
+
+            // Create orphaned record
+            let orphaned_record = InvocationRecord {
+                id: pending.id,
+                session_id: pending.session_id.clone(),
+                timestamp: pending.timestamp,
+                duration_ms: None, // Unknown
+                cwd: pending.cwd.clone(),
+                cmd: pending.cmd.clone(),
+                executable: extract_executable(&pending.cmd),
+                runner_id: Some(pending.runner_id.clone()),
+                exit_code: None, // Unknown/crashed
+                status: "orphaned".to_string(),
+                format_hint: None,
+                client_id: pending.client_id.clone(),
+                hostname: None, // Not available from pending file
+                username: None, // Not available from pending file
+                tag: None,
+            };
+
+            // Write to status=orphaned partition
+            match self.write_invocation(&orphaned_record) {
+                Ok(()) => {
+                    // Delete pending parquet file
+                    let pending_date = pending.timestamp.date_naive();
+                    let pending_partition =
+                        self.config.invocations_dir_with_status("pending", &pending_date);
+                    let executable = orphaned_record.executable.as_deref().unwrap_or("unknown");
+                    let pending_filename = format!(
+                        "{}--{}--{}.parquet",
+                        sanitize_filename(&pending.session_id),
+                        sanitize_filename(executable),
+                        pending.id
+                    );
+                    let pending_parquet = pending_partition.join(&pending_filename);
+                    let _ = fs::remove_file(&pending_parquet);
+
+                    // Delete JSON pending file
+                    let _ = delete_pending_file(&pending_dir, pending.id, &pending.session_id);
+
+                    stats.orphaned += 1;
+                }
+                Err(_) => {
+                    stats.errors += 1;
+                }
+            }
+        }
+
+        Ok(stats)
+    }
+}
+
+/// Extract executable name from command string.
+fn extract_executable(cmd: &str) -> Option<String> {
+    cmd.split_whitespace()
+        .next()
+        .map(|s| s.rsplit('/').next().unwrap_or(s).to_string())
 }
 
 #[cfg(test)]
@@ -595,5 +764,136 @@ mod tests {
                 "DuckDB mode should not create parquet files"
             );
         }
+    }
+
+    #[test]
+    fn test_pending_invocation_lifecycle() {
+        let (tmp, store) = setup_store();
+
+        // Create a pending invocation (using current process PID)
+        let record = InvocationRecord::new_pending_local(
+            "test-session",
+            "long-running-command",
+            "/home/user",
+            std::process::id() as i32,
+            "test@client",
+        );
+
+        // Start the pending invocation
+        let pending = store.start_pending_invocation(&record).unwrap();
+
+        // Verify pending file was created
+        let pending_dir = tmp.path().join("db/pending");
+        let pending_path = pending.path(&pending_dir);
+        assert!(pending_path.exists(), "Pending file should exist");
+
+        // Verify invocation was written to status=pending partition
+        let date = record.date();
+        let pending_partition = tmp
+            .path()
+            .join("db/data/recent/invocations")
+            .join("status=pending")
+            .join(format!("date={}", date));
+        assert!(pending_partition.exists(), "Pending partition should exist");
+
+        // Complete the invocation
+        let completed_record = record.complete(0, Some(100));
+        store
+            .complete_pending_invocation(&completed_record, &pending)
+            .unwrap();
+
+        // Verify pending file was deleted
+        assert!(!pending_path.exists(), "Pending file should be deleted");
+
+        // Verify completed record was written
+        let completed_partition = tmp
+            .path()
+            .join("db/data/recent/invocations")
+            .join("status=completed")
+            .join(format!("date={}", date));
+        assert!(
+            completed_partition.exists(),
+            "Completed partition should exist"
+        );
+    }
+
+    #[test]
+    fn test_recover_orphaned_invocations() {
+        let (tmp, store) = setup_store();
+
+        // Create a pending invocation with a dead PID
+        let record = InvocationRecord::new_pending_local(
+            "test-session",
+            "crashed-command",
+            "/home/user",
+            999999999, // PID that doesn't exist
+            "test@client",
+        );
+
+        // Write pending file manually (simulating a crash scenario)
+        let pending =
+            crate::store::pending::PendingInvocation::from_record(&record).unwrap();
+        let pending_dir = tmp.path().join("db/pending");
+        crate::store::pending::write_pending_file(&pending_dir, &pending).unwrap();
+
+        // Write to status=pending partition
+        store.write_invocation(&record).unwrap();
+
+        // Verify pending file exists
+        let pending_path = pending.path(&pending_dir);
+        assert!(pending_path.exists(), "Pending file should exist before recovery");
+
+        // Run recovery
+        let stats = store.recover_orphaned_invocations(24, false).unwrap();
+
+        assert_eq!(stats.pending_checked, 1);
+        assert_eq!(stats.orphaned, 1);
+        assert_eq!(stats.still_running, 0);
+
+        // Verify pending file was deleted
+        assert!(!pending_path.exists(), "Pending file should be deleted after recovery");
+
+        // Verify orphaned record was written
+        let date = record.date();
+        let orphaned_partition = tmp
+            .path()
+            .join("db/data/recent/invocations")
+            .join("status=orphaned")
+            .join(format!("date={}", date));
+        assert!(
+            orphaned_partition.exists(),
+            "Orphaned partition should exist"
+        );
+    }
+
+    #[test]
+    fn test_recover_skips_running_processes() {
+        let (tmp, store) = setup_store();
+
+        // Create a pending invocation with the current process PID (still alive)
+        let record = InvocationRecord::new_pending_local(
+            "test-session",
+            "running-command",
+            "/home/user",
+            std::process::id() as i32,
+            "test@client",
+        );
+
+        // Write pending file
+        let pending =
+            crate::store::pending::PendingInvocation::from_record(&record).unwrap();
+        let pending_dir = tmp.path().join("db/pending");
+        crate::store::pending::write_pending_file(&pending_dir, &pending).unwrap();
+
+        // Run recovery
+        let stats = store.recover_orphaned_invocations(24, false).unwrap();
+
+        assert_eq!(stats.pending_checked, 1);
+        assert_eq!(stats.still_running, 1);
+        assert_eq!(stats.orphaned, 0);
+
+        // Verify pending file was NOT deleted
+        let pending_path = pending.path(&pending_dir);
+        assert!(pending_path.exists(), "Pending file should still exist for running process");
     }
 }

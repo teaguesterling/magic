@@ -453,11 +453,26 @@ impl Config {
         self.data_dir().join("archive")
     }
 
-    /// Path to invocations parquet files for a given date.
-    pub fn invocations_dir(&self, date: &chrono::NaiveDate) -> PathBuf {
+    /// Path to invocations parquet files for a given date and status.
+    ///
+    /// Status partitioning: `recent/invocations/status=<status>/date=YYYY-MM-DD/`
+    pub fn invocations_dir_with_status(&self, status: &str, date: &chrono::NaiveDate) -> PathBuf {
         self.recent_dir()
             .join("invocations")
+            .join(format!("status={}", status))
             .join(format!("date={}", date))
+    }
+
+    /// Path to invocations parquet files for a given date (defaults to "completed" status).
+    ///
+    /// For backwards compatibility - use `invocations_dir_with_status` for explicit status.
+    pub fn invocations_dir(&self, date: &chrono::NaiveDate) -> PathBuf {
+        self.invocations_dir_with_status("completed", date)
+    }
+
+    /// Path to the pending invocations directory (JSON files for crash recovery).
+    pub fn pending_dir(&self) -> PathBuf {
+        self.bird_root.join("db/pending")
     }
 
     /// Path to outputs parquet files for a given date.

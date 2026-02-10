@@ -527,9 +527,9 @@ fn ensure_remote_schema(conn: &Connection, schema: &str) -> Result<()> {
         );
         CREATE TABLE IF NOT EXISTS {schema}.invocations (
             id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
-            cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
-            format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR,
-            tag VARCHAR, date DATE
+            cwd VARCHAR, cmd VARCHAR, executable VARCHAR, runner_id VARCHAR,
+            exit_code INTEGER, status VARCHAR, format_hint VARCHAR, client_id VARCHAR,
+            hostname VARCHAR, username VARCHAR, tag VARCHAR, date DATE
         );
         CREATE TABLE IF NOT EXISTS {schema}.outputs (
             id UUID, invocation_id UUID, stream VARCHAR, content_hash VARCHAR,
@@ -573,9 +573,9 @@ fn ensure_cached_schema(conn: &Connection, schema: &str, remote_name: &str) -> R
         );
         CREATE TABLE IF NOT EXISTS {schema}.invocations (
             id UUID, session_id VARCHAR, timestamp TIMESTAMP, duration_ms BIGINT,
-            cwd VARCHAR, cmd VARCHAR, executable VARCHAR, exit_code INTEGER,
-            format_hint VARCHAR, client_id VARCHAR, hostname VARCHAR, username VARCHAR,
-            tag VARCHAR, date DATE,
+            cwd VARCHAR, cmd VARCHAR, executable VARCHAR, runner_id VARCHAR,
+            exit_code INTEGER, status VARCHAR, format_hint VARCHAR, client_id VARCHAR,
+            hostname VARCHAR, username VARCHAR, tag VARCHAR, date DATE,
             _source VARCHAR DEFAULT '{remote_name}'
         );
         CREATE TABLE IF NOT EXISTS {schema}.outputs (
@@ -839,7 +839,7 @@ fn pull_table(
             let since_filter = since_clause(since, "r.timestamp");
             format!(
                 r#"
-                INSERT INTO {cached}.{table} (id, session_id, timestamp, duration_ms, cwd, cmd, executable, exit_code, format_hint, client_id, hostname, username, tag, date)
+                INSERT INTO {cached}.{table} (id, session_id, timestamp, duration_ms, cwd, cmd, executable, runner_id, exit_code, status, format_hint, client_id, hostname, username, tag, date)
                 SELECT r.*
                 FROM {remote}.{table} r
                 WHERE NOT EXISTS (
