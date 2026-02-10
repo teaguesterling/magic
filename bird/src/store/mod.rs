@@ -115,10 +115,7 @@ pub use compact::{
 pub use events::{EventFilters, EventSummary, FormatConfig, FormatRule};
 pub use invocations::InvocationSummary;
 pub use outputs::OutputInfo;
-pub use pending::{
-    delete_pending_file, is_runner_alive, list_pending_files, write_pending_file,
-    PendingInvocation, RecoveryStats,
-};
+pub use pending::{is_runner_alive, RecoveryStats};
 pub use remote::{parse_since, PullOptions, PullStats, PushOptions, PushStats};
 
 // Re-export format detection types (defined below)

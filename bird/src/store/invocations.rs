@@ -274,48 +274,6 @@ impl Store {
         Ok(())
     }
 
-    /// Start a pending invocation (v5 schema).
-    ///
-    /// V5: Writes an attempt record. No pending file needed - pending status
-    /// is derived from attempts without matching outcomes.
-    ///
-    /// Returns the pending invocation for backward compatibility.
-    #[deprecated(note = "V4 API. Use start_invocation() with AttemptRecord instead.")]
-    pub fn start_pending_invocation(
-        &self,
-        record: &InvocationRecord,
-    ) -> Result<super::pending::PendingInvocation> {
-        use super::pending::PendingInvocation;
-
-        // Create pending invocation marker for backward compatibility
-        let pending = PendingInvocation::from_record(record)
-            .ok_or_else(|| crate::error::Error::Storage("Missing runner_id".to_string()))?;
-
-        // V5: Write attempt record (no outcome yet = pending status)
-        let attempt = record.to_attempt();
-        self.write_attempt(&attempt)?;
-
-        Ok(pending)
-    }
-
-    /// Complete a pending invocation (v5 schema).
-    ///
-    /// V5: Writes an outcome record. The attempt was already written by
-    /// start_pending_invocation().
-    #[deprecated(note = "V4 API. Use complete_invocation() with OutcomeRecord instead.")]
-    pub fn complete_pending_invocation(
-        &self,
-        record: &InvocationRecord,
-        _pending: &super::pending::PendingInvocation,
-    ) -> Result<()> {
-        // V5: Write outcome record (the attempt already exists)
-        if let Some(outcome) = record.to_outcome() {
-            self.write_outcome(&outcome)?;
-        }
-
-        Ok(())
-    }
-
     /// Recover orphaned invocations (v5 schema).
     ///
     /// V5: Scans attempts without outcomes and checks if the runner is still alive.
