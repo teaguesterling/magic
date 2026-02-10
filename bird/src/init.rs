@@ -526,24 +526,35 @@ fn create_cwd_views(conn: &duckdb::Connection) -> Result<()> {
 /// 1. LOAD (extension might already be available)
 /// 2. INSTALL from default repository, then LOAD
 /// 3. INSTALL FROM community, then LOAD
+///
+/// Includes retry logic to handle race conditions when multiple processes
+/// try to install extensions concurrently.
 fn ensure_extension(conn: &duckdb::Connection, name: &str) -> Result<bool> {
-    // Try loading directly first (already installed/cached)
-    if conn.execute(&format!("LOAD {}", name), []).is_ok() {
-        return Ok(true);
-    }
+    // Retry up to 3 times to handle concurrent installation races
+    for attempt in 0..3 {
+        // Try loading directly first (already installed/cached)
+        if conn.execute(&format!("LOAD {}", name), []).is_ok() {
+            return Ok(true);
+        }
 
-    // Try installing from default repository
-    if conn.execute(&format!("INSTALL {}", name), []).is_ok()
-        && conn.execute(&format!("LOAD {}", name), []).is_ok()
-    {
-        return Ok(true);
-    }
+        // Try installing from default repository
+        if conn.execute(&format!("INSTALL {}", name), []).is_ok()
+            && conn.execute(&format!("LOAD {}", name), []).is_ok()
+        {
+            return Ok(true);
+        }
 
-    // Try installing from community repository
-    if conn.execute(&format!("INSTALL {} FROM community", name), []).is_ok()
-        && conn.execute(&format!("LOAD {}", name), []).is_ok()
-    {
-        return Ok(true);
+        // Try installing from community repository
+        if conn.execute(&format!("INSTALL {} FROM community", name), []).is_ok()
+            && conn.execute(&format!("LOAD {}", name), []).is_ok()
+        {
+            return Ok(true);
+        }
+
+        // If not the last attempt, wait a bit before retrying
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)));
+        }
     }
 
     Ok(false)
