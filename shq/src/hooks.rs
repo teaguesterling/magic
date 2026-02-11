@@ -179,7 +179,7 @@ __shq_precmd() {
         shq save -c "$cmd" -x "$exit_code" -d "$duration" \
             --session-id "$__shq_session_id" \
             --invoker-pid $$ --invoker zsh \
-            --extract --compact -q $buffer_flag </dev/null \
+            --compact -q $buffer_flag </dev/null \
             2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
     ) &!
 }
@@ -245,7 +245,7 @@ __shq_prompt_command() {
         shq save -c "$cmd" -x "$exit_code" -d "$duration" \
             --session-id "$__shq_session_id" \
             --invoker-pid $$ --invoker bash \
-            --extract --compact -q $buffer_flag </dev/null \
+            --compact -q $buffer_flag </dev/null \
             2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
     ) & disown
 }
@@ -297,7 +297,7 @@ shqr() {{
             --stdout "$stdout_file" --stderr "$stderr_file" \
             --session-id "$__shq_session_id" \
             --invoker-pid $$ --invoker {invoker} \
-            --extract --compact -q $buffer_flag \
+            --compact -q $buffer_flag \
             2>> "${{BIRD_ROOT:-$HOME/.local/share/bird}}/errors.log"
         rm -f "$stdout_file" "$stderr_file"
     {bg_syntax}

@@ -38,11 +38,11 @@ enum Commands {
         #[arg(short = 't', long = "tag")]
         tag: Option<String>,
 
-        /// Extract events from output after command completes (overrides config)
+        /// Force event extraction (extraction is enabled by default)
         #[arg(short = 'x', long = "extract", conflicts_with = "no_extract")]
         extract: bool,
 
-        /// Disable event extraction (overrides config)
+        /// Disable event extraction (extraction is enabled by default)
         #[arg(short = 'X', long = "no-extract", conflicts_with = "extract")]
         no_extract: bool,
 
@@ -109,9 +109,9 @@ enum Commands {
         #[arg(long = "invoker-type", default_value = "shell")]
         invoker_type: String,
 
-        /// Extract events after saving (uses config default if not specified)
-        #[arg(long = "extract")]
-        extract: bool,
+        /// Disable event extraction (extraction is enabled by default)
+        #[arg(short = 'X', long = "no-extract")]
+        no_extract: bool,
 
         /// Run compaction check after saving
         #[arg(long = "compact")]
@@ -655,11 +655,14 @@ fn main() {
             };
             commands::run(shell_cmd.as_deref(), &cmd, tag.as_deref(), extract_override, format.as_deref(), compact, no_pty)
         }
-        Commands::Save { file, command, exit_code, duration_ms, stream, stdout_file, stderr_file, session_id, invoker_pid, invoker, invoker_type, extract, compact, tag, quiet, to_buffer } => {
+        Commands::Save { file, command, exit_code, duration_ms, stream, stdout_file, stderr_file, session_id, invoker_pid, invoker, invoker_type, no_extract, compact, tag, quiet, to_buffer } => {
             // Check if this is a buffer reference (~N or just a number)
             let is_buffer_ref = file.as_ref().map(|f| {
                 f.starts_with('~') || f.chars().all(|c| c.is_ascii_digit())
             }).unwrap_or(false);
+
+            // Extract is enabled by default, --no-extract disables it
+            let extract = !no_extract;
 
             if is_buffer_ref && command.is_none() {
                 // Promote buffer entry to permanent storage

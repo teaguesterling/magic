@@ -316,8 +316,9 @@ fn test_hook_contains_privacy_escapes() {
     assert!(hook.contains("SHQ_IGNORE"), "Should support SHQ_IGNORE");
     assert!(hook.contains("__shq_should_ignore"), "Should have ignore function");
 
-    // Inline extraction (--extract flag)
-    assert!(hook.contains("--extract"), "Should use inline extraction");
+    // Extraction is enabled by default, so hooks don't need --extract flag
+    // They should NOT contain --extract since it's redundant (auto_extract: true in config)
+    // This is intentional - extraction happens automatically unless --no-extract is used
 }
 
 #[test]
@@ -346,7 +347,7 @@ fn test_run_nosave_marker_skips_recording() {
 }
 
 #[test]
-fn test_save_with_extract_flag() {
+fn test_save_default_extraction() {
     let tmp = TempDir::new().unwrap();
     init_bird(tmp.path());
 
@@ -354,13 +355,12 @@ fn test_save_with_extract_flag() {
     let output_file = tmp.path().join("test_output.txt");
     std::fs::write(&output_file, "error: something went wrong\n").unwrap();
 
-    // Save with --extract flag
+    // Save without --extract flag (extraction is enabled by default)
     let output = shq_cmd(tmp.path())
         .args([
             "save",
             "-c", "make build",
             "-x", "1",
-            "--extract",
             "-q",
         ])
         .arg(&output_file)
@@ -369,7 +369,7 @@ fn test_save_with_extract_flag() {
 
     assert!(output.status.success());
 
-    // Check that events were extracted
+    // Check that events were extracted (extraction happens by default)
     let events = shq_cmd(tmp.path())
         .args(["events", "1"])
         .output()
@@ -377,6 +377,42 @@ fn test_save_with_extract_flag() {
 
     // The output should contain events or indicate extraction happened
     assert!(events.status.success());
+}
+
+#[test]
+fn test_save_with_no_extract_flag() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Create a file with some error output
+    let output_file = tmp.path().join("test_output.txt");
+    std::fs::write(&output_file, "error: something went wrong\n").unwrap();
+
+    // Save with --no-extract flag to disable extraction
+    let output = shq_cmd(tmp.path())
+        .args([
+            "save",
+            "-c", "make build",
+            "-x", "1",
+            "--no-extract",
+            "-q",
+        ])
+        .arg(&output_file)
+        .output()
+        .expect("failed to save");
+
+    assert!(output.status.success());
+
+    // Events should not be extracted
+    let events = shq_cmd(tmp.path())
+        .args(["events", "1"])
+        .output()
+        .expect("failed to query events");
+
+    assert!(events.status.success());
+    let stdout = String::from_utf8_lossy(&events.stdout);
+    // With --no-extract, there should be no events
+    assert!(stdout.contains("No events found"), "No events should be extracted with --no-extract");
 }
 
 #[test]
@@ -848,13 +884,13 @@ fn test_extract_events_manual() {
     let tmp = TempDir::new().unwrap();
     init_bird(tmp.path());
 
-    // Run a command that produces gcc-like error output
+    // Run a command that produces gcc-like error output, with --no-extract to skip auto-extraction
     shq_cmd(tmp.path())
-        .args(["run", "-c", "echo 'test.c:10:5: error: undefined reference' >&2; exit 1"])
+        .args(["run", "--no-extract", "-c", "echo 'test.c:10:5: error: undefined reference' >&2; exit 1"])
         .output()
         .expect("failed to run");
 
-    // Manually extract events
+    // Manually extract events (should find them since we used --no-extract above)
     let output = shq_cmd(tmp.path())
         .args(["extract-events"])
         .output()
