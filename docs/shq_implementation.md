@@ -21,7 +21,7 @@ shq <command> [options]
 Commands (with aliases):
   init                     Initialize BIRD database
   run, r <cmd>             Run command with capture
-  save                     Save command (used by shell hooks)
+  save [~N]                Save command, or promote buffer entry ~N
   invocations, i [query]   Show recent invocations (command history)
   output, o [query]        Show output from a command
   info, I [query]          Show detailed invocation info

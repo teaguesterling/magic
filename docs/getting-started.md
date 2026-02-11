@@ -226,6 +226,10 @@ shq buffer list -n 20       # Show last 20 entries
 shq buffer show ~1          # Most recent
 shq buffer show ~3          # 3rd most recent
 
+# Promote buffer entry to permanent storage
+shq save ~1                 # Promote most recent
+shq save ~3                 # Promote 3rd most recent
+
 # Clear buffer
 shq buffer clear
 

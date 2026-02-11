@@ -468,8 +468,10 @@ shq buffer list
 shq buffer show ~1    # Most recent
 shq buffer show ~3    # 3rd most recent
 
-# Promote to permanent storage (not yet implemented)
-# shq save ~3
+# Promote to permanent storage
+shq save ~1           # Promote most recent buffer entry
+shq save ~3           # Promote 3rd most recent entry
+shq save 3            # Same as ~3
 
 # Clear all buffer entries
 shq buffer clear

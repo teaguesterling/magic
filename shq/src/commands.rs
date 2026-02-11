@@ -3276,6 +3276,114 @@ pub fn buffer_status() -> bird::Result<()> {
     Ok(())
 }
 
+/// Promote a buffer entry to permanent storage.
+///
+/// Takes a selector (e.g., "~1", "~3", "1", or a UUID) and saves the buffer entry
+/// to the permanent BIRD database, then removes it from the buffer.
+pub fn save_from_buffer(
+    selector: &str,
+    tag: Option<&str>,
+    extract: bool,
+    compact: bool,
+    quiet: bool,
+) -> bird::Result<()> {
+    let config = Config::load()?;
+    let buffer = Buffer::new(config.clone());
+    let store = Store::open(config.clone())?;
+
+    // Parse selector - handle ~N, N, or UUID
+    let entry = if let Ok(id) = uuid::Uuid::parse_str(selector) {
+        buffer.get_by_id(&id)?
+    } else {
+        // Strip ~ prefix if present, default to 1
+        let stripped = selector.strip_prefix('~').unwrap_or(selector);
+        let pos = if stripped.is_empty() {
+            1
+        } else {
+            stripped.parse::<usize>().unwrap_or(1)
+        };
+        buffer.get_by_position(pos)?
+    };
+
+    let entry = match entry {
+        Some(e) => e,
+        None => {
+            eprintln!("No buffer entry found for: {}", selector);
+            return Ok(());
+        }
+    };
+
+    let meta = &entry.meta;
+
+    // Read output from buffer
+    let output = buffer.read_output(&entry)?;
+
+    // Create invocation record from buffer metadata
+    let mut inv_record = InvocationRecord::new(
+        &meta.session_id,
+        &meta.cmd,
+        &meta.cwd,
+        meta.exit_code.unwrap_or(0),
+        &config.client_id,
+    );
+
+    // Use the original timestamp from the buffer entry
+    inv_record.timestamp = meta.started_at;
+
+    if let Some(ms) = meta.duration_ms {
+        inv_record = inv_record.with_duration(ms);
+    }
+    if let Some(t) = tag {
+        inv_record = inv_record.with_tag(t);
+    }
+
+    let inv_id = inv_record.id;
+
+    // Build batch with the output
+    let mut batch = InvocationBatch::new(inv_record);
+
+    if !output.is_empty() {
+        // Store as combined stdout (we don't have separate streams in buffer)
+        batch = batch.with_output("stdout", output);
+    }
+
+    // Write to permanent storage
+    store.write_batch(&batch)?;
+
+    // Extract events if requested
+    let should_extract = extract || config.auto_extract;
+    if should_extract {
+        let count = store.extract_events(&inv_id.to_string(), None)?;
+        if !quiet && count > 0 {
+            eprintln!("shq: extracted {} events", count);
+        }
+    }
+
+    // Spawn background compaction if requested
+    if compact {
+        let session_id = meta.session_id.clone();
+        let _ = Command::new(std::env::current_exe().unwrap_or_else(|_| "shq".into()))
+            .args(["compact", "-s", &session_id, "--today", "-q"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
+    // Remove from buffer after successful save
+    buffer.delete_entry(&meta.id)?;
+
+    if !quiet {
+        let cmd_preview = truncate_cmd(&meta.cmd, 50);
+        eprintln!(
+            "shq: promoted buffer entry to permanent storage ({})",
+            cmd_preview
+        );
+    }
+
+    Ok(())
+}
+
 /// Format file size for display.
 fn format_size(bytes: u64) -> String {
     if bytes < 1024 {

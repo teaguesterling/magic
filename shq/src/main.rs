@@ -66,12 +66,12 @@ enum Commands {
     /// Save output from stdin or file to BIRD
     #[command(visible_alias = "S")]
     Save {
-        /// File to read output from (reads stdin if not provided, unless --stdout/--stderr used)
+        /// File to read output from, or buffer reference (~N to promote buffer entry)
         file: Option<String>,
 
-        /// Command string (required for Phase A)
-        #[arg(short = 'c', long = "command", required = true)]
-        command: String,
+        /// Command string (required unless promoting from buffer)
+        #[arg(short = 'c', long = "command")]
+        command: Option<String>,
 
         /// Exit code of the command
         #[arg(short = 'x', long = "exit-code", default_value = "0")]
@@ -656,24 +656,40 @@ fn main() {
             commands::run(shell_cmd.as_deref(), &cmd, tag.as_deref(), extract_override, format.as_deref(), compact, no_pty)
         }
         Commands::Save { file, command, exit_code, duration_ms, stream, stdout_file, stderr_file, session_id, invoker_pid, invoker, invoker_type, extract, compact, tag, quiet, to_buffer } => {
-            commands::save(
-                file.as_deref(),
-                &command,
-                exit_code,
-                duration_ms,
-                &stream,
-                stdout_file.as_deref(),
-                stderr_file.as_deref(),
-                session_id.as_deref(),
-                invoker_pid,
-                invoker.as_deref(),
-                &invoker_type,
-                extract,
-                compact,
-                tag.as_deref(),
-                quiet,
-                to_buffer,
-            )
+            // Check if this is a buffer reference (~N or just a number)
+            let is_buffer_ref = file.as_ref().map(|f| {
+                f.starts_with('~') || f.chars().all(|c| c.is_ascii_digit())
+            }).unwrap_or(false);
+
+            if is_buffer_ref && command.is_none() {
+                // Promote buffer entry to permanent storage
+                let selector = file.as_deref().unwrap_or("~1");
+                commands::save_from_buffer(selector, tag.as_deref(), extract, compact, quiet)
+            } else if let Some(cmd) = command {
+                // Normal save with command
+                commands::save(
+                    file.as_deref(),
+                    &cmd,
+                    exit_code,
+                    duration_ms,
+                    &stream,
+                    stdout_file.as_deref(),
+                    stderr_file.as_deref(),
+                    session_id.as_deref(),
+                    invoker_pid,
+                    invoker.as_deref(),
+                    &invoker_type,
+                    extract,
+                    compact,
+                    tag.as_deref(),
+                    quiet,
+                    to_buffer,
+                )
+            } else {
+                // No buffer ref and no command - error
+                eprintln!("Error: Either provide a buffer reference (~N) or use -c to specify the command");
+                std::process::exit(1);
+            }
         }
         Commands::Output { query, stream, stdout_only, stderr_only, all_combined, pager, raw: _, strip, head, tail, lines, follow } => {
             // Resolve stream from flags or -s value

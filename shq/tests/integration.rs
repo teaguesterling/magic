@@ -2329,3 +2329,71 @@ fn test_buffer_config_defaults() {
     assert!(stdout.contains("Max age: 24 hours"), "Default max age: {}", stdout);
     assert!(stdout.contains("Exclude patterns"), "Should show exclude patterns: {}", stdout);
 }
+
+#[test]
+fn test_save_from_buffer_promotes_entry() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Enable buffer
+    let output = shq_cmd(tmp.path())
+        .args(["buffer", "enable", "--on"])
+        .output()
+        .expect("failed to enable buffer");
+    assert!(output.status.success());
+
+    // Save a command to buffer using --to-buffer
+    let output = shq_cmd(tmp.path())
+        .args(["save", "-c", "echo test-buffer-promote", "-x", "0", "-d", "100", "--to-buffer"])
+        .output()
+        .expect("failed to save to buffer");
+    assert!(output.status.success(), "save to buffer failed: {:?}", output);
+
+    // Verify it's in the buffer
+    let output = shq_cmd(tmp.path())
+        .args(["buffer", "list"])
+        .output()
+        .expect("failed to list buffer");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("test-buffer-promote"), "Command should be in buffer: {}", stdout);
+
+    // Promote to permanent storage using shq save ~1
+    let output = shq_cmd(tmp.path())
+        .args(["save", "~1"])
+        .output()
+        .expect("failed to promote from buffer");
+    assert!(output.status.success(), "promote failed: {:?}", output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("promoted"), "Should confirm promotion: {}", stderr);
+
+    // Verify it's now in permanent storage
+    let output = shq_cmd(tmp.path())
+        .args(["invocations", "-n", "1"])
+        .output()
+        .expect("failed to list invocations");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("test-buffer-promote"), "Command should be in permanent storage: {}", stdout);
+
+    // Verify it's removed from buffer
+    let output = shq_cmd(tmp.path())
+        .args(["buffer", "list"])
+        .output()
+        .expect("failed to list buffer after promote");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("test-buffer-promote"), "Command should be removed from buffer: {}", stdout);
+}
+
+#[test]
+fn test_save_requires_command_or_buffer_ref() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Save without -c and without buffer reference should fail
+    let output = shq_cmd(tmp.path())
+        .args(["save"])
+        .output()
+        .expect("failed to run save");
+
+    // Should exit with error
+    assert!(!output.status.success(), "save without args should fail");
+}

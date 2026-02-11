@@ -397,7 +397,9 @@ shq buffer show ~1          # Show output from most recent buffer entry
 shq buffer show ~3          # Show output from 3rd most recent
 
 # Promote buffer entries to permanent storage
-shq save ~3                 # Save buffer entry #3 to permanent storage
+shq save ~1                 # Promote most recent buffer entry
+shq save ~3                 # Promote 3rd most recent entry
+shq save 3                  # Same as ~3
 
 # Clear buffer
 shq buffer clear            # Clear all buffered entries
