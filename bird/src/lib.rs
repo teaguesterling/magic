@@ -2,6 +2,7 @@
 //!
 //! Storage layer for shell command history using DuckDB and Parquet.
 
+pub mod buffer;
 pub mod config;
 pub mod context;
 pub mod error;
@@ -12,7 +13,8 @@ pub mod query;
 pub mod schema;
 pub mod store;
 
-pub use config::{Config, RemoteConfig, RemoteMode, RemoteType, StorageMode, SyncConfig};
+pub use buffer::{Buffer, BufferEntry, BufferMeta};
+pub use config::{BufferConfig, Config, RemoteConfig, RemoteMode, RemoteType, StorageMode, SyncConfig};
 pub use error::{Error, Result};
 pub use format_hints::{FormatHint, FormatHints};
 pub use project::{find_current_project, find_project, is_in_project, ProjectInfo};

@@ -329,6 +329,12 @@ enum Commands {
         action: FormatHintsAction,
     },
 
+    /// Retrospective buffer for unsaved commands
+    Buffer {
+        #[command(subcommand)]
+        action: BufferAction,
+    },
+
     /// Manage remote storage connections
     Remote {
         #[command(subcommand)]
@@ -522,6 +528,48 @@ enum FormatHintsAction {
 }
 
 #[derive(Subcommand)]
+enum BufferAction {
+    /// List buffered commands
+    List {
+        /// Output format: compact (default), json
+        #[arg(short = 'f', long = "format", default_value = "compact")]
+        format: String,
+
+        /// Show last N entries
+        #[arg(short = 'n', long = "last")]
+        last: Option<usize>,
+    },
+
+    /// Show output from a buffered command
+    Show {
+        /// Position (1 = most recent) or ID
+        #[arg(default_value = "1")]
+        selector: String,
+    },
+
+    /// Clear all buffered entries
+    Clear {
+        /// Skip confirmation prompt
+        #[arg(short = 'f', long = "force")]
+        force: bool,
+    },
+
+    /// Enable/disable retrospective buffering
+    Enable {
+        /// Enable buffering
+        #[arg(long, conflicts_with = "off")]
+        on: bool,
+
+        /// Disable buffering
+        #[arg(long, conflicts_with = "on")]
+        off: bool,
+    },
+
+    /// Show buffer configuration and status
+    Status,
+}
+
+#[derive(Subcommand)]
 enum RemoteAction {
     /// Add a remote storage connection
     Add {
@@ -671,6 +719,13 @@ fn main() {
             FormatHintsAction::Remove { pattern } => commands::format_hints_remove(&pattern),
             FormatHintsAction::Check { command } => commands::format_hints_check(&command),
             FormatHintsAction::SetDefault { format } => commands::format_hints_set_default(&format),
+        },
+        Commands::Buffer { action } => match action {
+            BufferAction::List { format, last } => commands::buffer_list(&format, last),
+            BufferAction::Show { selector } => commands::buffer_show(&selector),
+            BufferAction::Clear { force } => commands::buffer_clear(force),
+            BufferAction::Enable { on, off } => commands::buffer_enable(on, off),
+            BufferAction::Status => commands::buffer_status(),
         },
         Commands::Remote { action } => match action {
             RemoteAction::Add { name, remote_type, uri, read_only, credential_provider, no_auto_attach } => {

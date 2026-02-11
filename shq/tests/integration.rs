@@ -2249,3 +2249,83 @@ fn test_follow_no_running_file() {
     assert!(stderr.contains("No running output file") || stderr.contains("completed"),
             "Should report no running file: {}", stderr);
 }
+
+// Buffer tests
+
+#[test]
+fn test_buffer_status_disabled_by_default() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    let output = shq_cmd(tmp.path())
+        .args(["buffer", "status"])
+        .output()
+        .expect("failed to run buffer status");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Enabled: no"), "Buffer should be disabled by default: {}", stdout);
+}
+
+#[test]
+fn test_buffer_enable_toggle() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Enable buffer
+    let output = shq_cmd(tmp.path())
+        .args(["buffer", "enable", "--on"])
+        .output()
+        .expect("failed to enable buffer");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Buffer enabled"), "Should confirm enabled: {}", stdout);
+
+    // Check status
+    let output = shq_cmd(tmp.path())
+        .args(["buffer", "status"])
+        .output()
+        .expect("failed to run buffer status");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Enabled: yes"), "Buffer should be enabled: {}", stdout);
+
+    // Disable buffer
+    let output = shq_cmd(tmp.path())
+        .args(["buffer", "enable", "--off"])
+        .output()
+        .expect("failed to disable buffer");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Buffer disabled"), "Should confirm disabled: {}", stdout);
+}
+
+#[test]
+fn test_buffer_list_when_disabled() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    let output = shq_cmd(tmp.path())
+        .args(["buffer", "list"])
+        .output()
+        .expect("failed to run buffer list");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not enabled"), "Should indicate buffer not enabled: {}", stderr);
+}
+
+#[test]
+fn test_buffer_config_defaults() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    let output = shq_cmd(tmp.path())
+        .args(["buffer", "status"])
+        .output()
+        .expect("failed to run buffer status");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Max entries: 100"), "Default max entries: {}", stdout);
+    assert!(stdout.contains("Max size: 100 MB"), "Default max size: {}", stdout);
+    assert!(stdout.contains("Max age: 24 hours"), "Default max age: {}", stdout);
+    assert!(stdout.contains("Exclude patterns"), "Should show exclude patterns: {}", stdout);
+}

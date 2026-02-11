@@ -8,7 +8,7 @@ use std::time::Instant;
 use std::fs::File;
 
 use bird::{
-    init, parse_query, CompactOptions, Config, ContextMetadata, EventFilters, InvocationBatch,
+    init, parse_query, Buffer, CompactOptions, Config, ContextMetadata, EventFilters, InvocationBatch,
     InvocationRecord, Query, SessionRecord, StorageMode, Store, BIRD_INVOCATION_UUID_VAR,
     BIRD_PARENT_CLIENT_VAR,
 };
@@ -3045,4 +3045,190 @@ pub fn pull(remote: Option<&str>, client: Option<&str>, since: Option<&str>, syn
     Ok(())
 }
 
+// =============================================================================
+// Buffer Commands
+// =============================================================================
+
+/// List buffered commands.
+pub fn buffer_list(format: &str, last: Option<usize>) -> bird::Result<()> {
+    let config = Config::load()?;
+    let buffer = Buffer::new(config);
+
+    if !buffer.is_enabled() {
+        eprintln!("Buffer is not enabled. Enable with: shq buffer enable --on");
+        return Ok(());
+    }
+
+    let entries = buffer.list_entries()?;
+
+    if entries.is_empty() {
+        println!("No buffered commands");
+        return Ok(());
+    }
+
+    let limit = last.unwrap_or(entries.len());
+    let entries: Vec<_> = entries.into_iter().take(limit).collect();
+
+    match format {
+        "json" => {
+            let json: Vec<_> = entries.iter().map(|e| &e.meta).collect();
+            println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+        }
+        _ => {
+            // Compact format
+            for (i, entry) in entries.iter().enumerate() {
+                let pos = i + 1;
+                let status = if entry.meta.exit_code.is_some() {
+                    if entry.meta.exit_code == Some(0) { "✓" } else { "✗" }
+                } else {
+                    "?"
+                };
+                let duration = entry.meta.duration_ms
+                    .map(|d| format!("{}ms", d))
+                    .unwrap_or_else(|| "-".to_string());
+                let size = format_size(entry.meta.output_size);
+                let time = entry.meta.started_at.format("%H:%M:%S");
+                let cmd = truncate_cmd(&entry.meta.cmd, 50);
+
+                println!("~{:<3} {} {:>8} {:>6}  {}  {}",
+                    pos, status, time, size, duration, cmd);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Show output from a buffered command.
+pub fn buffer_show(selector: &str) -> bird::Result<()> {
+    let config = Config::load()?;
+    let buffer = Buffer::new(config);
+
+    if !buffer.is_enabled() {
+        eprintln!("Buffer is not enabled. Enable with: shq buffer enable --on");
+        return Ok(());
+    }
+
+    // Try to parse as position number
+    let entry = if let Ok(pos) = selector.parse::<usize>() {
+        buffer.get_by_position(pos)?
+    } else if let Ok(id) = uuid::Uuid::parse_str(selector) {
+        buffer.get_by_id(&id)?
+    } else {
+        // Try stripping ~ prefix
+        let stripped = selector.strip_prefix('~').unwrap_or(selector);
+        if let Ok(pos) = stripped.parse::<usize>() {
+            buffer.get_by_position(pos)?
+        } else {
+            None
+        }
+    };
+
+    match entry {
+        Some(entry) => {
+            let output = buffer.read_output(&entry)?;
+            io::stdout().write_all(&output)?;
+        }
+        None => {
+            eprintln!("No buffer entry found for: {}", selector);
+        }
+    }
+
+    Ok(())
+}
+
+/// Clear all buffered entries.
+pub fn buffer_clear(force: bool) -> bird::Result<()> {
+    let config = Config::load()?;
+    let buffer = Buffer::new(config);
+
+    if !force {
+        eprint!("Clear all buffer entries? [y/N] ");
+        io::stderr().flush()?;
+        let mut response = String::new();
+        io::stdin().read_line(&mut response)?;
+        if !response.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled");
+            return Ok(());
+        }
+    }
+
+    let count = buffer.clear()?;
+    println!("Cleared {} buffer entries", count);
+
+    Ok(())
+}
+
+/// Enable or disable retrospective buffering.
+pub fn buffer_enable(on: bool, off: bool) -> bird::Result<()> {
+    let mut config = Config::load()?;
+
+    let new_state = if on {
+        true
+    } else if off {
+        false
+    } else {
+        // Toggle if neither specified
+        !config.buffer.enabled
+    };
+
+    config.buffer.enabled = new_state;
+    config.save()?;
+
+    if new_state {
+        println!("Buffer enabled");
+        println!("Shell commands will be captured for retrospective saving.");
+        println!("Use 'shq save ~N' to promote buffered commands to permanent storage.");
+    } else {
+        println!("Buffer disabled");
+    }
+
+    Ok(())
+}
+
+/// Show buffer configuration and status.
+pub fn buffer_status() -> bird::Result<()> {
+    let config = Config::load()?;
+    let buffer = Buffer::new(config.clone());
+
+    println!("Buffer Status");
+    println!("=============");
+    println!();
+    println!("Enabled: {}", if config.buffer.enabled { "yes" } else { "no" });
+    println!("Max entries: {}", config.buffer.max_entries);
+    println!("Max size: {} MB", config.buffer.max_size_mb);
+    println!("Max age: {} hours", config.buffer.max_age_hours);
+    println!();
+
+    if config.buffer.enabled {
+        let entries = buffer.list_entries()?;
+        let total_size: u64 = entries.iter().map(|e| e.meta.output_size).sum();
+        println!("Current entries: {}", entries.len());
+        println!("Current size: {}", format_size(total_size));
+    }
+
+    println!();
+    println!("Exclude patterns ({}):", config.buffer.exclude_patterns.len());
+    for pattern in config.buffer.exclude_patterns.iter().take(10) {
+        println!("  {}", pattern);
+    }
+    if config.buffer.exclude_patterns.len() > 10 {
+        println!("  ... and {} more", config.buffer.exclude_patterns.len() - 10);
+    }
+
+    Ok(())
+}
+
+/// Format file size for display.
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}K", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1}M", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
 

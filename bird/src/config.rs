@@ -303,6 +303,92 @@ fn default_ignore_patterns() -> Vec<String> {
     ]
 }
 
+/// Retrospective buffer configuration.
+///
+/// The buffer captures output from all shell commands, allowing users to
+/// retroactively save commands they didn't explicitly capture with `shq run`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferConfig {
+    /// Enable retrospective buffering. Disabled by default for security.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Maximum number of commands to keep in buffer.
+    #[serde(default = "default_buffer_max_entries")]
+    pub max_entries: usize,
+
+    /// Maximum total size of buffer in megabytes.
+    #[serde(default = "default_buffer_max_size_mb")]
+    pub max_size_mb: usize,
+
+    /// Maximum age of buffer entries in hours.
+    #[serde(default = "default_buffer_max_age_hours")]
+    pub max_age_hours: u32,
+
+    /// Additional command patterns to exclude from buffering.
+    /// These are checked in addition to hooks.ignore_patterns.
+    /// Commands matching these patterns may contain sensitive output.
+    #[serde(default = "default_buffer_exclude_patterns")]
+    pub exclude_patterns: Vec<String>,
+}
+
+impl Default for BufferConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_entries: default_buffer_max_entries(),
+            max_size_mb: default_buffer_max_size_mb(),
+            max_age_hours: default_buffer_max_age_hours(),
+            exclude_patterns: default_buffer_exclude_patterns(),
+        }
+    }
+}
+
+fn default_buffer_max_entries() -> usize {
+    100
+}
+
+fn default_buffer_max_size_mb() -> usize {
+    100
+}
+
+fn default_buffer_max_age_hours() -> u32 {
+    24
+}
+
+fn default_buffer_exclude_patterns() -> Vec<String> {
+    vec![
+        // Password/credential patterns
+        "*password*".to_string(),
+        "*passwd*".to_string(),
+        "*secret*".to_string(),
+        "*credential*".to_string(),
+        // Token/key patterns
+        "*token*".to_string(),
+        "*bearer*".to_string(),
+        "*api_key*".to_string(),
+        "*apikey*".to_string(),
+        "*api-key*".to_string(),
+        "*private_key*".to_string(),
+        "*privatekey*".to_string(),
+        // Security tool commands
+        "ssh *".to_string(),
+        "ssh-*".to_string(),
+        "gpg *".to_string(),
+        "pass *".to_string(),
+        "vault *".to_string(),
+        "aws sts *".to_string(),
+        "aws secretsmanager *".to_string(),
+        // Environment variable commands that might leak secrets
+        "export *SECRET*".to_string(),
+        "export *TOKEN*".to_string(),
+        "export *KEY*".to_string(),
+        "export *PASSWORD*".to_string(),
+        "printenv".to_string(),
+        "env".to_string(),
+    ]
+}
+
 /// BIRD configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -342,6 +428,10 @@ pub struct Config {
     /// Shell hook configuration.
     #[serde(default)]
     pub hooks: HooksConfig,
+
+    /// Retrospective buffer configuration.
+    #[serde(default)]
+    pub buffer: BufferConfig,
 }
 
 fn default_client_id() -> String {
@@ -376,6 +466,7 @@ impl Config {
             remotes: Vec::new(),
             sync: SyncConfig::default(),
             hooks: HooksConfig::default(),
+            buffer: BufferConfig::default(),
         }
     }
 
@@ -391,6 +482,7 @@ impl Config {
             remotes: Vec::new(),
             sync: SyncConfig::default(),
             hooks: HooksConfig::default(),
+            buffer: BufferConfig::default(),
         }
     }
 
@@ -555,6 +647,25 @@ impl Config {
     /// Path to a running output file for a specific invocation.
     pub fn running_path(&self, invocation_id: &uuid::Uuid) -> PathBuf {
         self.running_dir().join(format!("{}.out", invocation_id))
+    }
+
+    /// Path to the retrospective buffer directory.
+    ///
+    /// Contains output from recent shell commands that weren't explicitly captured.
+    /// Files: `<uuid>.out` (output) and `<uuid>.meta` (JSON metadata).
+    /// Protected with 700 permissions since buffer may contain sensitive output.
+    pub fn buffer_dir(&self) -> PathBuf {
+        self.bird_root.join("buffer")
+    }
+
+    /// Path to a buffer entry's output file.
+    pub fn buffer_output_path(&self, id: &uuid::Uuid) -> PathBuf {
+        self.buffer_dir().join(format!("{}.out", id))
+    }
+
+    /// Path to a buffer entry's metadata file.
+    pub fn buffer_meta_path(&self, id: &uuid::Uuid) -> PathBuf {
+        self.buffer_dir().join(format!("{}.meta", id))
     }
 
     /// Path to a specific blob file by hash and command.
