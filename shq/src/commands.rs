@@ -5,12 +5,55 @@ use std::os::fd::AsRawFd;
 use std::process::Command;
 use std::time::Instant;
 
+use std::fs::File;
+
 use bird::{
     init, parse_query, CompactOptions, Config, ContextMetadata, EventFilters, InvocationBatch,
     InvocationRecord, Query, SessionRecord, StorageMode, Store, BIRD_INVOCATION_UUID_VAR,
     BIRD_PARENT_CLIENT_VAR,
 };
 use pty_process::blocking::{Command as PtyCommand, open as pty_open};
+
+/// Streaming output writer that writes to both terminal and a temp file.
+///
+/// This enables `shq show --follow` to tail output while a command is running.
+/// The temp file lives at `~/.bird/running/<invocation_id>.out` during execution.
+struct StreamingOutput {
+    file: File,
+    path: std::path::PathBuf,
+}
+
+impl StreamingOutput {
+    /// Create a new streaming output file for the given invocation.
+    fn new(config: &Config, invocation_id: uuid::Uuid) -> io::Result<Self> {
+        let running_dir = config.running_dir();
+        std::fs::create_dir_all(&running_dir)?;
+        let path = config.running_path(&invocation_id);
+        let file = File::create(&path)?;
+        Ok(Self { file, path })
+    }
+
+    /// Write data to the streaming file.
+    fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        self.file.write_all(data)?;
+        self.file.flush()?; // Flush for real-time tailing
+        Ok(())
+    }
+
+    /// Read all content from the streaming file and delete it.
+    fn finish(self) -> io::Result<Vec<u8>> {
+        drop(self.file); // Close the file handle
+        let content = std::fs::read(&self.path)?;
+        let _ = std::fs::remove_file(&self.path); // Clean up
+        Ok(content)
+    }
+
+    /// Get the path for external access (e.g., for --follow).
+    #[allow(dead_code)]
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
 
 /// Generate a session ID for grouping related invocations.
 fn session_id() -> String {
@@ -179,8 +222,11 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
         }
     });
 
-    // Read output from PTY and pass through to our stdout while collecting it
-    let mut output_buffer = Vec::new();
+    // Create streaming output file for real-time tailing via `shq show --follow`
+    let mut streaming = StreamingOutput::new(&config, invocation_id)
+        .map_err(|e| bird::Error::Io(e))?;
+
+    // Read output from PTY and pass through to our stdout while streaming to file
     let mut buf = [0u8; 4096];
 
     // Set PTY to non-blocking for reading
@@ -194,7 +240,7 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
                 set_nonblocking(pty.as_raw_fd(), false);
                 while let Ok(n) = pty.read(&mut buf) {
                     if n == 0 { break; }
-                    output_buffer.extend_from_slice(&buf[..n]);
+                    let _ = streaming.write(&buf[..n]);
                     let _ = io::stdout().write_all(&buf[..n]);
                     let _ = io::stdout().flush();
                 }
@@ -208,7 +254,7 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
                         break;
                     }
                     Ok(n) => {
-                        output_buffer.extend_from_slice(&buf[..n]);
+                        let _ = streaming.write(&buf[..n]);
                         let _ = io::stdout().write_all(&buf[..n]);
                         let _ = io::stdout().flush();
                     }
@@ -239,6 +285,9 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
     let status = child.wait().map_err(|e| bird::Error::Io(io::Error::other(e)))?;
     let duration_ms = start.elapsed().as_millis() as i64;
     let exit_code = status.code().unwrap_or(-1);
+
+    // Finalize streaming output - read content and clean up temp file
+    let output_buffer = streaming.finish().unwrap_or_default();
 
     // Check for nosave marker
     if contains_nosave_marker(&output_buffer) {
@@ -330,8 +379,13 @@ fn run_no_pty(
     store: Store,
 ) -> bird::Result<()> {
     use std::io::{BufRead, BufReader};
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
+
+    // Create streaming output file for real-time tailing via `shq show --follow`
+    let streaming = StreamingOutput::new(&config, invocation_id)
+        .map_err(|e| bird::Error::Io(e))?;
+    let streaming = Arc::new(Mutex::new(streaming));
 
     // Build command with piped stdout/stderr
     let mut child = Command::new(shell)
@@ -353,6 +407,10 @@ fn run_no_pty(
     let (tx_stdout, rx) = mpsc::channel::<(bool, Vec<u8>)>(); // (is_stderr, data)
     let tx_stderr = tx_stdout.clone();
 
+    // Clone streaming for threads
+    let streaming_stdout = Arc::clone(&streaming);
+    let streaming_stderr = Arc::clone(&streaming);
+
     // Spawn thread to read stdout
     let stdout_handle = thread::spawn(move || {
         let reader = BufReader::new(stdout);
@@ -363,6 +421,10 @@ fn run_no_pty(
                 // Send to collector (with newline)
                 let mut data = line.into_bytes();
                 data.push(b'\n');
+                // Write to streaming file for --follow
+                if let Ok(mut s) = streaming_stdout.lock() {
+                    let _ = s.write(&data);
+                }
                 let _ = tx_stdout.send((false, data));
             }
         }
@@ -378,6 +440,10 @@ fn run_no_pty(
                 // Send to collector (with newline)
                 let mut data = line.into_bytes();
                 data.push(b'\n');
+                // Write to streaming file for --follow
+                if let Ok(mut s) = streaming_stderr.lock() {
+                    let _ = s.write(&data);
+                }
                 let _ = tx_stderr.send((true, data));
             }
         }
@@ -391,6 +457,11 @@ fn run_no_pty(
     // Wait for reader threads to finish
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
+
+    // Clean up streaming file (we keep separate stdout/stderr in buffers)
+    if let Ok(streaming) = Arc::try_unwrap(streaming) {
+        let _ = streaming.into_inner().map(|s| s.finish());
+    }
 
     // Collect all output
     let mut stdout_buffer = Vec::new();
@@ -686,6 +757,63 @@ pub fn save(
     Ok(())
 }
 
+/// Follow output from a running command in real-time (like tail -f).
+///
+/// Looks for the streaming output file at `~/.bird/running/<invocation_id>.out`
+/// and tails it until the file is deleted (command completed).
+fn follow_running_output(config: &Config, invocation_id: &str) -> bird::Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::thread;
+    use std::time::Duration;
+
+    // Parse UUID from string
+    let id = uuid::Uuid::parse_str(invocation_id)
+        .map_err(|e| bird::Error::Config(format!("Invalid invocation ID: {}", e)))?;
+
+    let running_path = config.running_path(&id);
+
+    if !running_path.exists() {
+        eprintln!("No running output file found for {}", invocation_id);
+        eprintln!("The command may have already completed. Try 'shq show {}' instead.", invocation_id);
+        return Ok(());
+    }
+
+    eprintln!("Following output for {}...", &invocation_id[..8]);
+    eprintln!("(Press Ctrl+C to stop)");
+
+    // Open file for reading
+    let file = std::fs::File::open(&running_path)?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+
+    loop {
+        // Try to read a line
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                // EOF reached, check if file still exists
+                if !running_path.exists() {
+                    eprintln!("\n[Command completed]");
+                    break;
+                }
+                // File exists but no new data - wait and retry
+                thread::sleep(Duration::from_millis(100));
+            }
+            Ok(_) => {
+                // Print the line (it includes newline)
+                print!("{}", line);
+                let _ = io::stdout().flush();
+                line.clear();
+            }
+            Err(e) => {
+                eprintln!("Error reading output: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Options for the output command.
 #[derive(Default)]
 pub struct OutputOptions {
@@ -693,6 +821,7 @@ pub struct OutputOptions {
     pub strip_ansi: bool,
     pub head: Option<usize>,
     pub tail: Option<usize>,
+    pub follow: bool,
 }
 
 /// Show captured output from invocation(s).
@@ -701,7 +830,7 @@ pub fn output(query_str: &str, stream_filter: Option<&str>, opts: &OutputOptions
     use std::process::{Command, Stdio};
 
     let config = Config::load()?;
-    let store = Store::open(config)?;
+    let store = Store::open(config.clone())?;
 
     // Parse query
     let query = parse_query(query_str);
@@ -728,6 +857,11 @@ pub fn output(query_str: &str, stream_filter: Option<&str>, opts: &OutputOptions
             Err(e) => return Err(e),
         }
     };
+
+    // Handle --follow mode: tail the running output file
+    if opts.follow {
+        return follow_running_output(&config, &invocation_id);
+    }
 
     // Get outputs for the invocation (optionally filtered by stream)
     let outputs = store.get_outputs(&invocation_id, db_filter)?;

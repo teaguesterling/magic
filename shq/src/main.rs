@@ -173,6 +173,10 @@ enum Commands {
         /// Limit output to N lines (same as --head)
         #[arg(short = 'n', long = "lines", value_name = "N", conflicts_with = "head")]
         lines: Option<usize>,
+
+        /// Follow output in real-time (like tail -f) for running commands
+        #[arg(short = 'f', long = "follow")]
+        follow: bool,
     },
 
     /// List invocation history
@@ -618,7 +622,7 @@ fn main() {
                 quiet,
             )
         }
-        Commands::Output { query, stream, stdout_only, stderr_only, all_combined, pager, raw: _, strip, head, tail, lines } => {
+        Commands::Output { query, stream, stdout_only, stderr_only, all_combined, pager, raw: _, strip, head, tail, lines, follow } => {
             // Resolve stream from flags or -s value
             let resolved_stream = if stdout_only {
                 Some("stdout")
@@ -634,6 +638,7 @@ fn main() {
                 strip_ansi: strip,
                 head: head.or(lines),
                 tail,
+                follow,
             };
             commands::output(&query, resolved_stream, &opts)
         }

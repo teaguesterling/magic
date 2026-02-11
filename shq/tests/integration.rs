@@ -2203,3 +2203,49 @@ fn test_pty_mode_stores_combined() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("combined"), "PTY mode should store as combined: {}", stdout);
 }
+
+// Streaming output tests
+
+#[test]
+fn test_streaming_output_cleaned_up_after_run() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command (which should create then clean up streaming file)
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "streaming_test"])
+        .output()
+        .expect("failed to run");
+
+    // Verify running directory is empty (streaming file cleaned up)
+    let running_dir = tmp.path().join("running");
+    if running_dir.exists() {
+        let entries: Vec<_> = std::fs::read_dir(&running_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(entries.is_empty(), "Running directory should be empty after command completes: {:?}", entries);
+    }
+}
+
+#[test]
+fn test_follow_no_running_file() {
+    let tmp = TempDir::new().unwrap();
+    init_bird(tmp.path());
+
+    // Run a command first
+    shq_cmd(tmp.path())
+        .args(["run", "echo", "test"])
+        .output()
+        .expect("failed to run");
+
+    // Try to follow (should report no running file)
+    let output = shq_cmd(tmp.path())
+        .args(["show", "--follow"])
+        .output()
+        .expect("failed to run show --follow");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("No running output file") || stderr.contains("completed"),
+            "Should report no running file: {}", stderr);
+}

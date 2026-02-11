@@ -541,6 +541,22 @@ impl Config {
         self.recent_dir().join("blobs/content")
     }
 
+    /// Path to the running directory for in-progress command output.
+    ///
+    /// Files here are temp files streamed during command execution:
+    /// `running/<invocation_id>.out`
+    ///
+    /// On completion, content is moved to blob storage. On crash, files survive
+    /// for recovery. Use `shq show --follow <id>` to tail while running.
+    pub fn running_dir(&self) -> PathBuf {
+        self.bird_root.join("running")
+    }
+
+    /// Path to a running output file for a specific invocation.
+    pub fn running_path(&self, invocation_id: &uuid::Uuid) -> PathBuf {
+        self.running_dir().join(format!("{}.out", invocation_id))
+    }
+
     /// Path to a specific blob file by hash and command.
     pub fn blob_path(&self, hash: &str, cmd_hint: &str) -> PathBuf {
         let prefix = &hash[..2.min(hash.len())];
@@ -704,6 +720,25 @@ mod tests {
         assert_eq!(
             config.outcomes_dir(&date),
             PathBuf::from("/tmp/test-bird/db/data/recent/outcomes/date=2024-01-15")
+        );
+    }
+
+    #[test]
+    fn test_running_dir() {
+        let config = Config::with_root("/tmp/test-bird");
+        assert_eq!(
+            config.running_dir(),
+            PathBuf::from("/tmp/test-bird/running")
+        );
+    }
+
+    #[test]
+    fn test_running_path() {
+        let config = Config::with_root("/tmp/test-bird");
+        let id = uuid::Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap();
+        assert_eq!(
+            config.running_path(&id),
+            PathBuf::from("/tmp/test-bird/running/01234567-89ab-cdef-0123-456789abcdef.out")
         );
     }
 }
