@@ -124,6 +124,10 @@ enum Commands {
         /// Suppress informational output
         #[arg(short = 'q', long = "quiet")]
         quiet: bool,
+
+        /// Save to buffer instead of permanent storage (for retrospective saving)
+        #[arg(long = "to-buffer")]
+        to_buffer: bool,
     },
 
     /// Show captured output from invocation(s)
@@ -651,7 +655,7 @@ fn main() {
             };
             commands::run(shell_cmd.as_deref(), &cmd, tag.as_deref(), extract_override, format.as_deref(), compact, no_pty)
         }
-        Commands::Save { file, command, exit_code, duration_ms, stream, stdout_file, stderr_file, session_id, invoker_pid, invoker, invoker_type, extract, compact, tag, quiet } => {
+        Commands::Save { file, command, exit_code, duration_ms, stream, stdout_file, stderr_file, session_id, invoker_pid, invoker, invoker_type, extract, compact, tag, quiet, to_buffer } => {
             commands::save(
                 file.as_deref(),
                 &command,
@@ -668,6 +672,7 @@ fn main() {
                 compact,
                 tag.as_deref(),
                 quiet,
+                to_buffer,
             )
         }
         Commands::Output { query, stream, stdout_only, stderr_only, all_combined, pager, raw: _, strip, head, tail, lines, follow } => {

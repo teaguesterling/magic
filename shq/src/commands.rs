@@ -643,6 +643,7 @@ pub fn save(
     compact: bool,
     tag: Option<&str>,
     quiet: bool,
+    to_buffer: bool,
 ) -> bird::Result<()> {
     use std::process::Command;
 
@@ -717,6 +718,62 @@ pub fn save(
         inv_record = inv_record.with_tag(t);
     }
     let inv_id = inv_record.id;
+
+    // Combine output for buffer storage
+    let combined_output: Option<Vec<u8>> = if to_buffer {
+        // For buffer, combine all output into one
+        let mut combined = Vec::new();
+        if let Some(ref content) = stdout_content {
+            combined.extend_from_slice(content);
+        }
+        if let Some(ref content) = stderr_content {
+            combined.extend_from_slice(content);
+        }
+        if let Some(ref content) = single_content {
+            combined.extend_from_slice(content);
+        }
+        if combined.is_empty() { None } else { Some(combined) }
+    } else {
+        None
+    };
+
+    if to_buffer {
+        // Write to buffer instead of permanent storage
+        let buffer = Buffer::new(config.clone());
+
+        if !buffer.is_enabled() {
+            if !quiet {
+                eprintln!("shq: buffer not enabled, saving to permanent storage");
+            }
+            // Fall through to normal save
+        } else {
+            match buffer.write_complete_entry(
+                command,
+                &cwd,
+                &sid,
+                exit_code,
+                duration_ms,
+                combined_output.as_deref(),
+            ) {
+                Ok(buffer_id) => {
+                    if !quiet {
+                        eprintln!("shq: saved to buffer ~1 ({})", &buffer_id.to_string()[..8]);
+                    }
+                    return Ok(());
+                }
+                Err(bird::Error::Config(msg)) if msg.contains("excluded") => {
+                    // Command excluded from buffering, skip silently
+                    return Ok(());
+                }
+                Err(e) => {
+                    if !quiet {
+                        eprintln!("shq: buffer write failed ({}), saving to permanent storage", e);
+                    }
+                    // Fall through to normal save
+                }
+            }
+        }
+    }
 
     // Build batch with all related records
     let mut batch = InvocationBatch::new(inv_record).with_session(session);

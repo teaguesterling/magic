@@ -137,7 +137,13 @@ fn hook_functions(shell: Shell) -> String {
 }
 
 fn zsh_hook_functions() -> String {
-    r#"# Capture command before execution
+    r#"# Check if buffer mode is enabled (cached at shell startup)
+__shq_buffer_enabled=""
+if shq buffer status 2>/dev/null | grep -q "Enabled: yes"; then
+    __shq_buffer_enabled=1
+fi
+
+# Capture command before execution
 __shq_preexec() {
     __shq_last_cmd="$1"
     __shq_start_time=$EPOCHREALTIME
@@ -164,12 +170,16 @@ __shq_precmd() {
     fi
     __shq_start_time=""
 
+    # Build save command - use buffer if enabled
+    local buffer_flag=""
+    [[ -n "$__shq_buffer_enabled" ]] && buffer_flag="--to-buffer"
+
     # Save to BIRD (async, non-blocking)
     (
         shq save -c "$cmd" -x "$exit_code" -d "$duration" \
             --session-id "$__shq_session_id" \
             --invoker-pid $$ --invoker zsh \
-            --extract --compact -q </dev/null \
+            --extract --compact -q $buffer_flag </dev/null \
             2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
     ) &!
 }
@@ -179,7 +189,13 @@ __shq_precmd() {
 }
 
 fn bash_hook_functions() -> String {
-    r#"# Millisecond timer (with fallback for older bash)
+    r#"# Check if buffer mode is enabled (cached at shell startup)
+__shq_buffer_enabled=""
+if shq buffer status 2>/dev/null | grep -q "Enabled: yes"; then
+    __shq_buffer_enabled=1
+fi
+
+# Millisecond timer (with fallback for older bash)
 __shq_now_ms() {
     if [[ -n "$EPOCHREALTIME" ]]; then
         local sec=${EPOCHREALTIME%.*}
@@ -220,12 +236,16 @@ __shq_prompt_command() {
     __shq_cmd=1
     __shq_start_ms=""
 
+    # Build save command - use buffer if enabled
+    local buffer_flag=""
+    [[ -n "$__shq_buffer_enabled" ]] && buffer_flag="--to-buffer"
+
     # Save to BIRD (background, non-blocking)
     (
         shq save -c "$cmd" -x "$exit_code" -d "$duration" \
             --session-id "$__shq_session_id" \
             --invoker-pid $$ --invoker bash \
-            --extract --compact -q </dev/null \
+            --extract --compact -q $buffer_flag </dev/null \
             2>> "${BIRD_ROOT:-$HOME/.local/share/bird}/errors.log"
     ) & disown
 }
@@ -267,13 +287,17 @@ shqr() {{
     local end_ms=$(__shq_now_ms 2>/dev/null || echo 0)
     local duration=$(( end_ms - start_ms ))
 
+    # Use buffer if enabled
+    local buffer_flag=""
+    [[ -n "$__shq_buffer_enabled" ]] && buffer_flag="--to-buffer"
+
     # Save with captured output (background)
     (
         shq save -c "$cmd" -x "$exit_code" -d "$duration" \
             --stdout "$stdout_file" --stderr "$stderr_file" \
             --session-id "$__shq_session_id" \
             --invoker-pid $$ --invoker {invoker} \
-            --extract --compact -q \
+            --extract --compact -q $buffer_flag \
             2>> "${{BIRD_ROOT:-$HOME/.local/share/bird}}/errors.log"
         rm -f "$stdout_file" "$stderr_file"
     {bg_syntax}

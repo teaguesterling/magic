@@ -185,6 +185,70 @@ impl Buffer {
         Ok(())
     }
 
+    /// Write a complete buffer entry at once (for `shq save --to-buffer`).
+    ///
+    /// This is used when all data is available at once (command already completed).
+    pub fn write_complete_entry(
+        &self,
+        cmd: &str,
+        cwd: &str,
+        session_id: &str,
+        exit_code: i32,
+        duration_ms: Option<i64>,
+        output: Option<&[u8]>,
+    ) -> Result<Uuid> {
+        if !self.is_enabled() {
+            return Err(Error::Config("Buffer is not enabled".to_string()));
+        }
+
+        if self.should_exclude(cmd) {
+            return Err(Error::Config("Command is excluded from buffering".to_string()));
+        }
+
+        self.init()?;
+
+        let id = Uuid::now_v7();
+        let mut meta = BufferMeta::new(id, cmd, cwd, session_id);
+
+        // Write output file
+        let output_path = self.config.buffer_output_path(&id);
+        let output_size = if let Some(data) = output {
+            fs::write(&output_path, data)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&output_path, fs::Permissions::from_mode(0o600))?;
+            }
+            data.len() as u64
+        } else {
+            File::create(&output_path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&output_path, fs::Permissions::from_mode(0o600))?;
+            }
+            0
+        };
+
+        // Complete the metadata
+        meta.complete(exit_code, duration_ms.unwrap_or(0), output_size);
+
+        // Write metadata file
+        let meta_path = self.config.buffer_meta_path(&id);
+        let file = File::create(&meta_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&meta_path, fs::Permissions::from_mode(0o600))?;
+        }
+        serde_json::to_writer(BufWriter::new(file), &meta)?;
+
+        // Rotate if needed
+        self.rotate()?;
+
+        Ok(id)
+    }
+
     /// List all buffer entries, sorted by start time (most recent first).
     pub fn list_entries(&self) -> Result<Vec<BufferEntry>> {
         let dir = self.config.buffer_dir();
