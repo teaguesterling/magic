@@ -34,6 +34,7 @@ Commands (with aliases):
   clean                    Recover orphaned invocations, prune old data
   extract-events           Extract events from outputs
   format-hints             Manage format detection hints
+  buffer                   Manage retrospective buffer
   remote                   Manage remote storage
   push                     Push data to remote
   pull                     Pull data from remote
@@ -570,6 +571,62 @@ shq format-hints list                  # Show configured hints
 shq format-hints add "make*" gcc       # Add hint for make commands
 shq format-hints remove "make*"        # Remove a hint
 shq format-hints set-default cargo     # Set default format
+```
+
+### `shq buffer <subcommand>`
+
+Manage the retrospective buffer for capturing commands that weren't explicitly saved.
+
+```
+shq buffer list [options]          # List buffered commands
+shq buffer show <selector>         # Show buffer entry output
+shq buffer clear [options]         # Clear all buffer entries
+shq buffer enable --on|--off       # Enable/disable buffer mode
+shq buffer status                  # Show buffer configuration
+
+Options for 'list':
+  -f, --format FMT     Output format: compact (default), json
+  -n, --last N         Show last N entries
+
+Options for 'show':
+  <selector>           Position (~1 = most recent) or entry ID
+
+Options for 'clear':
+  -f, --force          Skip confirmation prompt
+```
+
+**Buffer Mode:**
+
+When buffer mode is enabled, shell hooks automatically save commands to the buffer instead of permanent storage. This provides "retroactive capture" - you can view and optionally promote interesting commands later.
+
+**Security:**
+
+The buffer is security-focused:
+- Disabled by default
+- Extensive exclude patterns for sensitive commands
+- Secure file permissions (0600)
+- Automatic rotation based on age/size/entry limits
+
+**Exclude Patterns (default):**
+```
+*password*, *passwd*, *secret*, *credential*,
+*token*, *bearer*, *api_key*, *apikey*, *api-key*,
+*private_key*, *privatekey*,
+ssh *, ssh-*, gpg *, pass *, vault *,
+aws sts *, aws secretsmanager *,
+export *SECRET*, export *TOKEN*, export *KEY*, export *PASSWORD*,
+printenv, env
+```
+
+**Examples:**
+```bash
+shq buffer enable --on           # Enable buffer mode
+shq buffer list                  # List recent entries
+shq buffer show ~1               # View most recent entry
+shq buffer show ~3               # View 3rd most recent
+shq buffer status                # Check configuration
+shq buffer clear --force         # Clear all entries
+shq buffer enable --off          # Return to normal capture
 ```
 
 ### `shq remote <subcommand>`

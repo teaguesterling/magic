@@ -79,6 +79,13 @@ ORDER BY avg_duration DESC
 LIMIT 10;
 ```
 
+### Retrospective Buffer
+Capture commands you forgot to explicitly record:
+
+- **Automatic**: Shell hooks save every command to a rotating buffer
+- **Privacy-first**: Extensive exclude patterns for sensitive commands
+- **View and promote**: Review buffer entries and save interesting ones permanently
+
 ### Data Lifecycle Management
 Automatic tiering keeps your data organized:
 

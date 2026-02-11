@@ -85,6 +85,13 @@ Optional integration with [duck_hunt](https://github.com/teaguesterling/duck_hun
 - Indexed by hash for instant deduplication
 - Gzip-compressed blobs (DuckDB reads directly)
 
+### Retrospective Buffer
+Capture commands you forgot to explicitly record:
+- **Automatic**: Shell hooks save every command to a rotating buffer
+- **Privacy-first**: Extensive exclude patterns for sensitive commands
+- **Promote when needed**: `shq save ~3` promotes buffer entry to permanent storage
+- **Configurable**: Control buffer size, age, and exclude patterns
+
 ### Hot/Warm/Cold Tiering
 Automatic lifecycle management:
 - **Hot (0-14 days):** Recent commands, fast SSD
@@ -194,6 +201,9 @@ shq sql "
 │   │       └── date=YYYY-MM-DD/*.parquet
 │   └── archive/                  # Cold tier (>14 days)
 │       └── ...                   # Same structure (without status partitioning)
+├── buffer/                       # Retrospective buffer (rotating)
+│   ├── <uuid>.meta               # Buffer entry metadata (JSON)
+│   └── <uuid>.output             # Buffer entry output
 ├── blobs/
 │   └── content/                  # Content-addressed pool
 │       ├── ab/
@@ -256,6 +266,9 @@ shq archive           # Move old data to archive tier
 shq compact           # Compact parquet files for better performance
 shq clean             # Recover orphaned commands and clean stale data
 shq hook init         # Generate shell integration code
+shq buffer list       # List buffered commands
+shq buffer show ~1    # Show output from buffer entry
+shq buffer enable --on  # Enable retrospective buffering
 ```
 
 **Shell Functions (provided by hook init):**
@@ -369,7 +382,30 @@ shq run make test || {
 }
 ```
 
-### 5. Data Lifecycle Management
+### 5. Retrospective Buffer
+
+```bash
+# Enable buffer mode (captures all commands to a rotating buffer)
+shq buffer enable --on      # Enable buffering
+shq buffer enable --off     # Disable buffering
+shq buffer status           # Check buffer configuration
+
+# View buffered commands
+shq buffer list             # List recent buffered commands
+shq buffer list -n 20       # Show last 20 entries
+shq buffer show ~1          # Show output from most recent buffer entry
+shq buffer show ~3          # Show output from 3rd most recent
+
+# Promote buffer entries to permanent storage
+shq save ~3                 # Save buffer entry #3 to permanent storage
+
+# Clear buffer
+shq buffer clear            # Clear all buffered entries
+```
+
+The buffer automatically excludes sensitive commands (passwords, tokens, SSH, etc.) and rotates based on configurable limits.
+
+### 6. Data Lifecycle Management
 
 ```bash
 # Archive old data (moves from recent/ to archive/)
@@ -392,7 +428,7 @@ shq clean --dry-run          # Preview what would be cleaned
 
 Note: Shell hooks automatically run `shq compact -s $session --today -q` in the background after each command to keep file counts manageable.
 
-### 6. Storage Management
+### 7. Storage Management
 
 ```bash
 # Check storage savings
@@ -436,6 +472,19 @@ exclude_patterns = [
   "^cd ",
   "^ls ",
   "^pwd$"
+]
+
+[buffer]
+enabled = false               # Enable retrospective buffer
+max_entries = 100             # Max buffer entries
+max_size_mb = 50              # Max total buffer size
+max_age_hours = 24            # Auto-delete entries older than this
+exclude_patterns = [          # Sensitive commands excluded from buffer
+  "*password*",
+  "*secret*",
+  "*token*",
+  "ssh *",
+  "gpg *",
 ]
 
 [parsing]

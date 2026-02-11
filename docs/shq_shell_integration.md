@@ -396,6 +396,93 @@ precmd_functions=(my_precmd __shq_precmd)
 # No issues, shq is per-shell
 ```
 
+## Buffer Mode
+
+When buffer mode is enabled, shell hooks automatically save commands to a rotating buffer instead of permanent storage. This provides "retroactive capture" - you can promote interesting commands to permanent storage after the fact.
+
+### Enabling Buffer Mode
+
+```bash
+# Enable buffer mode
+shq buffer enable --on
+
+# Disable buffer mode (return to normal capture)
+shq buffer enable --off
+
+# Check status
+shq buffer status
+```
+
+### How Buffer Mode Works
+
+1. At shell startup, hooks check buffer status and cache it in `$__shq_buffer_enabled`
+2. When buffer mode is enabled, `shq save --to-buffer` is used instead of `shq save`
+3. Commands are saved to `$BIRD_ROOT/buffer/` as metadata + output files
+4. Buffer automatically rotates based on configured limits
+
+### Buffer Configuration
+
+The buffer uses these settings (in `config.toml`):
+
+```toml
+[buffer]
+enabled = false           # Toggled with shq buffer enable
+max_entries = 100         # Maximum buffer entries
+max_size_mb = 50          # Maximum total buffer size
+max_age_hours = 24        # Auto-delete entries older than this
+exclude_patterns = [      # Commands never saved to buffer
+  "*password*",
+  "*passwd*",
+  "*secret*",
+  "*credential*",
+  "*token*",
+  "*bearer*",
+  "*api_key*",
+  "*apikey*",
+  "*api-key*",
+  "*private_key*",
+  "*privatekey*",
+  "ssh *",
+  "ssh-*",
+  "gpg *",
+  "pass *",
+  "vault *",
+  "aws sts *",
+  "aws secretsmanager *",
+  "export *SECRET*",
+  "export *TOKEN*",
+  "export *KEY*",
+  "export *PASSWORD*",
+  "printenv",
+  "env",
+]
+```
+
+### Viewing and Promoting Buffer Entries
+
+```bash
+# List buffered commands
+shq buffer list
+
+# Show output from buffer entry
+shq buffer show ~1    # Most recent
+shq buffer show ~3    # 3rd most recent
+
+# Promote to permanent storage (not yet implemented)
+# shq save ~3
+
+# Clear all buffer entries
+shq buffer clear
+```
+
+### Security Notes
+
+Buffer mode is designed with security in mind:
+- **Disabled by default**: Must be explicitly enabled
+- **Extensive exclude patterns**: Sensitive commands (passwords, tokens, SSH, etc.) are never buffered
+- **Secure permissions**: Buffer files use 0600 permissions (owner-only)
+- **Automatic rotation**: Old entries are deleted based on age/size limits
+
 ## Security Considerations
 
 ### Sensitive Commands
@@ -404,6 +491,7 @@ Best practices:
 - Use leading space for passwords: ` export API_KEY=secret`
 - Use backslash for API calls: `\curl -H "Authorization: $TOKEN" api.example.com`
 - Or disable temporarily: `shq hook disable`
+- Enable buffer mode with exclude patterns for sensitive commands
 
 ### Multi-User Systems
 

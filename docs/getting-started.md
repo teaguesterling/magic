@@ -207,6 +207,38 @@ shq format-hints remove "make*"    # Remove a hint
 shq format-hints set-default cargo # Set default format for unknown commands
 ```
 
+### Retrospective Buffer
+
+The buffer provides "retroactive capture" - capture commands you didn't explicitly save:
+
+```bash
+# Enable buffer mode (captures all commands to rotating buffer)
+shq buffer enable --on
+
+# Check status
+shq buffer status
+
+# List buffered commands
+shq buffer list
+shq buffer list -n 20       # Show last 20 entries
+
+# View buffer entry output
+shq buffer show ~1          # Most recent
+shq buffer show ~3          # 3rd most recent
+
+# Clear buffer
+shq buffer clear
+
+# Disable buffer mode
+shq buffer enable --off
+```
+
+Buffer mode is security-focused:
+- Disabled by default
+- Extensive exclude patterns for sensitive commands (passwords, tokens, SSH, etc.)
+- Secure file permissions (0600)
+- Automatic rotation based on age/size limits
+
 ## Data Lifecycle
 
 ### Archive Old Data
