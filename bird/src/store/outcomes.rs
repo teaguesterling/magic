@@ -214,6 +214,82 @@ impl Store {
             }
         }
     }
+
+    /// Recover orphaned invocations (v5 schema).
+    ///
+    /// Finds attempts without outcomes where the runner is no longer alive,
+    /// and marks them as orphaned. Returns statistics about the operation.
+    ///
+    /// This is safe to run periodically (e.g., during compaction) and is
+    /// idempotent - it won't create duplicate outcomes.
+    pub fn recover_orphans(&self) -> Result<super::pending::RecoveryStats> {
+        use super::pending::{is_runner_alive, RecoveryStats};
+        use chrono::NaiveDate;
+
+        let conn = self.connection()?;
+        let mut stats = RecoveryStats::default();
+
+        // Find pending attempts (attempts without matching outcomes)
+        // machine_id stores the runner_id in v5 schema
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT a.id, a.timestamp::DATE as date, a.machine_id as runner_id
+            FROM attempts a
+            LEFT JOIN outcomes o ON a.id = o.attempt_id
+            WHERE o.attempt_id IS NULL
+            "#,
+        )?;
+
+        let pending: Vec<(String, String, Option<String>)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        stats.pending_checked = pending.len();
+
+        for (id_str, date_str, runner_id) in pending {
+            // Check if runner is still alive
+            let alive = runner_id
+                .as_ref()
+                .map(|r| is_runner_alive(r))
+                .unwrap_or(false);
+
+            if alive {
+                stats.still_running += 1;
+                continue;
+            }
+
+            // Runner is dead - mark as orphaned
+            let attempt_id = match uuid::Uuid::parse_str(&id_str) {
+                Ok(id) => id,
+                Err(_) => {
+                    stats.errors += 1;
+                    continue;
+                }
+            };
+
+            let date = match NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
+                Ok(d) => d,
+                Err(_) => {
+                    stats.errors += 1;
+                    continue;
+                }
+            };
+
+            match self.orphan_invocation(attempt_id, date) {
+                Ok(()) => stats.orphaned += 1,
+                Err(_) => stats.errors += 1,
+            }
+        }
+
+        Ok(stats)
+    }
 }
 
 #[cfg(test)]
