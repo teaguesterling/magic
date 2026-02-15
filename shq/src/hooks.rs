@@ -113,8 +113,11 @@ fn should_ignore_fn(shell: Shell) -> String {
 
     format!(
         r#"# Check if command should be ignored (matches SHQ_IGNORE or SHQ_EXCLUDE)
+# Commands starting with "shq -X" or "shq --force-capture" bypass ignore patterns
 __shq_should_ignore() {{
     local cmd="$1"
+    # Force capture flag bypasses all ignore patterns
+    [[ "$cmd" == "shq -X "* || "$cmd" == "shq --force-capture "* ]] && return 1
     local IFS=':'
     for pattern in $SHQ_IGNORE; do
         [[ "$cmd" == {pattern_match} ]] && return 0

@@ -4,12 +4,17 @@ use clap::{Parser, Subcommand};
 
 mod commands;
 mod hooks;
+mod tutorial;
 
 #[derive(Parser)]
 #[command(name = "shq")]
 #[command(about = "Shell Query - capture and query shell command history")]
 #[command(version)]
 struct Cli {
+    /// Force shell hooks to capture this command (bypass ignore patterns)
+    #[arg(short = 'X', long = "force-capture", global = true)]
+    force_capture: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -456,6 +461,17 @@ enum Commands {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
+
+    /// Interactive tutorial to learn shq features
+    Tutorial {
+        /// Jump to a specific lesson (number or name)
+        #[arg(short = 'l', long = "lesson")]
+        lesson: Option<String>,
+
+        /// List available lessons
+        #[arg(long = "list")]
+        list: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -775,6 +791,14 @@ fn main() {
         Commands::UpdateExtensions { dry_run } => commands::update_extensions(dry_run),
         Commands::ExtractEvents { selector, format, quiet, force, all, since, limit, dry_run } => {
             commands::extract_events(&selector, format.as_deref(), quiet, force, all, since.as_deref(), limit, dry_run)
+        }
+        Commands::Tutorial { lesson, list } => {
+            if list {
+                tutorial::list_lessons();
+                Ok(())
+            } else {
+                tutorial::run_tutorial(lesson.as_deref())
+            }
         }
     };
 
