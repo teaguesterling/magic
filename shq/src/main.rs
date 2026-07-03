@@ -48,7 +48,7 @@ enum Commands {
         extract: bool,
 
         /// Disable event extraction (extraction is enabled by default)
-        #[arg(short = 'X', long = "no-extract", conflicts_with = "extract")]
+        #[arg(long = "no-extract", conflicts_with = "extract")]
         no_extract: bool,
 
         /// Override format detection for event extraction (e.g., gcc, pytest, cargo)
@@ -115,7 +115,7 @@ enum Commands {
         invoker_type: String,
 
         /// Disable event extraction (extraction is enabled by default)
-        #[arg(short = 'X', long = "no-extract")]
+        #[arg(long = "no-extract")]
         no_extract: bool,
 
         /// Run compaction check after saving
