@@ -246,8 +246,15 @@ fn test_to_buffer_with_buffer_disabled_discards_output() {
         .expect("failed to run shq sql");
     assert!(sql.status.success(), "shq sql failed: {:?}", sql);
     let stdout = String::from_utf8_lossy(&sql.stdout);
+    // Compare the count cell line-wise: the "(1 rows)" footer also contains
+    // a digit, so a substring check would false-positive.
+    let count_is_zero = stdout.lines().any(|l| l.trim() == "0");
+    let count_is_nonzero = stdout.lines().any(|l| {
+        let t = l.trim();
+        !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) && t != "0"
+    });
     assert!(
-        !stdout.contains('1'),
+        count_is_zero && !count_is_nonzero,
         "buffer-destined output silently fell through to permanent storage:\n{}",
         stdout
     );
