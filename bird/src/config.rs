@@ -303,6 +303,33 @@ fn default_ignore_patterns() -> Vec<String> {
     ]
 }
 
+/// Privacy configuration applied to ALL capture paths.
+///
+/// Unlike `BufferConfig::exclude_patterns` (which only guards the opt-in
+/// retrospective buffer), these settings apply to the default, always-on
+/// save path as well.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyConfig {
+    /// Command patterns that are never persisted (any capture path).
+    #[serde(default = "default_sensitive_exclude_patterns")]
+    pub exclude_patterns: Vec<String>,
+
+    /// Redact recognizable secret values (env assignments to secret-named
+    /// vars, `--password`/`-p<pw>`, `Bearer` tokens, `token=` params) from
+    /// stored command lines. Best-effort, on by default.
+    #[serde(default = "default_true")]
+    pub redact_commands: bool,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            exclude_patterns: default_sensitive_exclude_patterns(),
+            redact_commands: true,
+        }
+    }
+}
+
 /// Retrospective buffer configuration.
 ///
 /// The buffer captures output from all shell commands, allowing users to
@@ -357,6 +384,10 @@ fn default_buffer_max_age_hours() -> u32 {
 }
 
 fn default_buffer_exclude_patterns() -> Vec<String> {
+    default_sensitive_exclude_patterns()
+}
+
+fn default_sensitive_exclude_patterns() -> Vec<String> {
     vec![
         // Password/credential patterns
         "*password*".to_string(),
@@ -432,6 +463,10 @@ pub struct Config {
     /// Retrospective buffer configuration.
     #[serde(default)]
     pub buffer: BufferConfig,
+
+    /// Privacy configuration (applies to all capture paths).
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
 }
 
 fn default_client_id() -> String {
@@ -467,6 +502,7 @@ impl Config {
             sync: SyncConfig::default(),
             hooks: HooksConfig::default(),
             buffer: BufferConfig::default(),
+            privacy: PrivacyConfig::default(),
         }
     }
 
@@ -483,6 +519,7 @@ impl Config {
             sync: SyncConfig::default(),
             hooks: HooksConfig::default(),
             buffer: BufferConfig::default(),
+            privacy: PrivacyConfig::default(),
         }
     }
 
@@ -519,7 +556,9 @@ impl Config {
         let config_path = self.bird_root.join("config.toml");
         let contents = toml::to_string_pretty(self)
             .map_err(|e| Error::Config(format!("Failed to serialize config: {}", e)))?;
-        std::fs::write(config_path, contents)?;
+        std::fs::write(&config_path, contents)?;
+        // Config may name remotes/credentials providers; keep it owner-only.
+        crate::perms::harden_file(&config_path);
         Ok(())
     }
 

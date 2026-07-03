@@ -178,10 +178,12 @@ pub fn parse_query(input: &str) -> Query {
             continue;
         }
 
-        // Unknown content, skip a character
-        if !remaining.is_empty() {
-            remaining = &remaining[1..];
-        }
+        // Unknown content, skip one character.
+        // Advance on a char boundary: `&remaining[1..]` byte-slices and
+        // panics on multibyte UTF-8 input.
+        let mut chars = remaining.chars();
+        chars.next();
+        remaining = chars.as_str();
     }
 
     query

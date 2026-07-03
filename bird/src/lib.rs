@@ -8,13 +8,15 @@ pub mod context;
 pub mod error;
 pub mod format_hints;
 pub mod init;
+pub mod perms;
+pub mod privacy;
 pub mod project;
 pub mod query;
 pub mod schema;
 pub mod store;
 
 pub use buffer::{Buffer, BufferEntry, BufferMeta};
-pub use config::{BufferConfig, Config, RemoteConfig, RemoteMode, RemoteType, StorageMode, SyncConfig};
+pub use config::{BufferConfig, Config, PrivacyConfig, RemoteConfig, RemoteMode, RemoteType, StorageMode, SyncConfig};
 pub use error::{Error, Result};
 pub use format_hints::{FormatHint, FormatHints};
 pub use project::{find_current_project, find_project, is_in_project, ProjectInfo};

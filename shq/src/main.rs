@@ -11,7 +11,7 @@ mod tutorial;
 #[command(about = "Shell Query - capture and query shell command history")]
 #[command(version)]
 struct Cli {
-    /// Force shell hooks to capture this command (bypass ignore patterns)
+    /// Force capture: bypass ignore/exclude patterns and secret redaction
     #[arg(short = 'X', long = "force-capture", global = true)]
     force_capture: bool,
 
@@ -657,6 +657,7 @@ fn parse_lines_arg(s: &str) -> (usize, commands::LimitOrder) {
 
 fn main() {
     let cli = Cli::parse();
+    let force_capture = cli.force_capture;
 
     let result = match cli.command {
         Commands::Init { mode, force } => commands::init(&mode, force),
@@ -669,7 +670,7 @@ fn main() {
             } else {
                 None
             };
-            commands::run(shell_cmd.as_deref(), &cmd, tag.as_deref(), extract_override, format.as_deref(), compact, no_pty)
+            commands::run(shell_cmd.as_deref(), &cmd, tag.as_deref(), extract_override, format.as_deref(), compact, no_pty, force_capture)
         }
         Commands::Save { file, command, exit_code, duration_ms, stream, stdout_file, stderr_file, session_id, invoker_pid, invoker, invoker_type, no_extract, compact, tag, quiet, to_buffer } => {
             // Check if this is a buffer reference (~N or just a number)
@@ -703,6 +704,7 @@ fn main() {
                     tag.as_deref(),
                     quiet,
                     to_buffer,
+                    force_capture,
                 )
             } else {
                 // No buffer ref and no command - error

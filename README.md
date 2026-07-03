@@ -85,10 +85,27 @@ Optional integration with [duck_hunt](https://github.com/teaguesterling/duck_hun
 - Indexed by hash for instant deduplication
 - Gzip-compressed blobs (DuckDB reads directly)
 
+### Privacy
+Command lines routinely contain secrets, so privacy protections apply to the
+**default, always-on capture path** (not just the opt-in buffer):
+- **Exclusion**: commands matching sensitive patterns (`*password*`, `*token*`,
+  `ssh *`, `export *SECRET*`, …) are never persisted; configurable via
+  `privacy.exclude_patterns`
+- **Redaction**: recognizable secret values (`NAME_WITH_SECRET=…`,
+  `--password …`, `mysql -p<pw>`, `Bearer …`, `?api_token=…`, `ghp_…`/`AKIA…`
+  credentials) are replaced with `[REDACTED]` before storage. This is
+  best-effort pattern matching, **not a guarantee** — unusual secret shapes
+  are stored verbatim, so extend the exclude patterns for anything critical
+- **Owner-only storage**: the data root is `0700` and stored files are `0600`
+  (at least as strict as the `~/.bash_history` baseline)
+- **Escapes**: prefix a command with a space (bash users: also set
+  `HISTCONTROL=ignorespace`), set `SHQ_DISABLED=1`, or add `SHQ_EXCLUDE`
+  patterns; `shq -X …` force-captures verbatim when you really want it
+
 ### Retrospective Buffer
 Capture commands you forgot to explicitly record:
 - **Automatic**: Shell hooks save every command to a rotating buffer
-- **Privacy-first**: Extensive exclude patterns for sensitive commands
+- **Opt-in**: disabled by default; enable with `shq buffer enable`
 - **Promote when needed**: `shq save ~3` promotes buffer entry to permanent storage
 - **Configurable**: Control buffer size, age, and exclude patterns
 

@@ -102,7 +102,8 @@ impl Buffer {
 
     /// Check if a command should be excluded from buffering.
     ///
-    /// Combines hooks.ignore_patterns and buffer.exclude_patterns.
+    /// Combines hooks.ignore_patterns, privacy.exclude_patterns (which apply
+    /// to every capture path) and buffer.exclude_patterns.
     pub fn should_exclude(&self, cmd: &str) -> bool {
         let cmd_lower = cmd.to_lowercase();
 
@@ -111,6 +112,11 @@ impl Buffer {
             if matches_glob_pattern(pattern, cmd) {
                 return true;
             }
+        }
+
+        // Global privacy exclusions
+        if crate::privacy::should_exclude(&self.config, cmd) {
+            return true;
         }
 
         // Check buffer-specific exclude patterns
@@ -377,57 +383,9 @@ impl Buffer {
     }
 }
 
-/// Simple glob pattern matching.
-///
-/// Supports:
-/// - `*` matches any sequence of characters
-/// - Case-insensitive matching for patterns with `*`
-fn matches_glob_pattern(pattern: &str, text: &str) -> bool {
-    if !pattern.contains('*') {
-        return pattern.eq_ignore_ascii_case(text);
-    }
-
-    let pattern_lower = pattern.to_lowercase();
-    let text_lower = text.to_lowercase();
-
-    let parts: Vec<&str> = pattern_lower.split('*').collect();
-
-    if parts.is_empty() {
-        return true;
-    }
-
-    let mut pos = 0;
-
-    // First part must match at start (unless pattern starts with *)
-    if !pattern_lower.starts_with('*') {
-        if !text_lower.starts_with(parts[0]) {
-            return false;
-        }
-        pos = parts[0].len();
-    }
-
-    // Middle parts must appear in order
-    for part in parts.iter().skip(if pattern_lower.starts_with('*') { 0 } else { 1 }) {
-        if part.is_empty() {
-            continue;
-        }
-        if let Some(found) = text_lower[pos..].find(part) {
-            pos += found + part.len();
-        } else {
-            return false;
-        }
-    }
-
-    // Last part must match at end (unless pattern ends with *)
-    if !pattern_lower.ends_with('*') && !parts.is_empty() {
-        let last = parts.last().unwrap();
-        if !last.is_empty() && !text_lower.ends_with(last) {
-            return false;
-        }
-    }
-
-    true
-}
+// Glob matching lives in `crate::privacy` so the buffer and the default
+// save path share one implementation.
+use crate::privacy::matches_glob_pattern;
 
 #[cfg(test)]
 mod tests {

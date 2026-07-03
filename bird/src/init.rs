@@ -43,17 +43,30 @@ pub fn initialize(config: &Config) -> Result<()> {
         return Err(Error::AlreadyInitialized(bird_root.clone()));
     }
 
+    // Create the data root owner-only (0700) BEFORE anything lands in it.
+    // Captured shell history is sensitive; this must be at least as strict
+    // as the ~/.bash_history 0600 baseline.
+    crate::perms::ensure_secure_root(config)?;
+
     // Create directory structure
     create_directories(config)?;
 
     // Initialize DuckDB with schemas
     init_database(config)?;
 
+    // DuckDB creates the database file at the process umask; harden it.
+    crate::perms::harden_file(&config.db_path());
+
     // Save config
     config.save()?;
 
     // Create default event-formats.toml
     create_event_formats_config(config)?;
+
+    // Files created directly by DuckDB (database, seed parquet files) are
+    // written at the process umask; harden the whole fresh tree to
+    // owner-only (dirs 0700, files 0600).
+    crate::perms::harden_tree(&config.bird_root);
 
     Ok(())
 }

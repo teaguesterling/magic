@@ -80,10 +80,14 @@ fn header(shell: Shell, mode: Mode, prompt_indicator: bool) -> String {
 {setup_hint}#
 # Privacy escapes (command not recorded):
 #   - Start command with a space: " ls -la"
+#     (bash: also add ignorespace to HISTCONTROL to keep it out of shell
+#     history itself, e.g. export HISTCONTROL=ignorespace)
 #   - Start command with backslash: "\ls -la"
 #
 # Temporary disable: export SHQ_DISABLED=1
 # Exclude patterns: export SHQ_EXCLUDE="*password*:*secret*"
+# (sensitive commands are also excluded/redacted server-side by shq save;
+#  see privacy.exclude_patterns in config.toml)
 
 "#
     )
@@ -215,11 +219,31 @@ __shq_ps0_hook() {
 }
 PS0='${__shq_cmd:+$(__shq_ps0_hook)}'
 
+# Track the last-saved history number so empty-Enter (and commands kept out
+# of history, e.g. via HISTCONTROL=ignorespace) don't re-save the previous
+# command. Initialized to the current position so shell startup saves nothing.
+__shq_last_histnum=$(HISTTIMEFORMAT='' history 1 | sed 's/^[[:space:]]*\([0-9]\{1,\}\).*/\1/')
+
 # PROMPT_COMMAND hook: fires after command completes
 __shq_prompt_command() {
     local exit_code=$?
-    local cmd
-    cmd=$(HISTTIMEFORMAT='' history 1 | sed 's/^[ ]*[0-9]*[ ]*//')
+    local histline histnum cmd
+    histline=$(HISTTIMEFORMAT='' history 1)
+
+    # Parse "  <num><*| > <cmd>" precisely, keeping the command's own leading
+    # whitespace intact so the space-prefix privacy escape below works.
+    local re='^[[:space:]]*([0-9]+)[* ] (.*)$'
+    if [[ "$histline" =~ $re ]]; then
+        histnum="${BASH_REMATCH[1]}"
+        cmd="${BASH_REMATCH[2]}"
+    else
+        return
+    fi
+
+    # Dedup: unchanged history number means no new command was entered
+    # (empty Enter, Ctrl-C at the prompt, or a history-excluded command).
+    [[ "$histnum" == "$__shq_last_histnum" ]] && { __shq_cmd=""; return; }
+    __shq_last_histnum="$histnum"
 
     # Skip if disabled, empty, or privacy escape
     [[ -n "$SHQ_DISABLED" ]] && { __shq_cmd=""; return; }
