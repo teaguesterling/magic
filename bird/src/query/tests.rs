@@ -388,3 +388,26 @@ fn test_compare_op_display() {
     assert_eq!(format!("{}", CompareOp::Gte), ">=");
     assert_eq!(format!("{}", CompareOp::Lte), "<=");
 }
+
+// Multibyte / UTF-8 safety tests (regression for a byte-slice panic in the
+// "skip a character" fallback of parse_query).
+
+#[test]
+fn test_multibyte_unknown_char_does_not_panic() {
+    // '★' is 3 bytes and not alphanumeric, so it falls through every
+    // component parser into the skip-a-character branch.
+    let q = parse_query("★");
+    assert!(q.is_match_all());
+}
+
+#[test]
+fn test_multibyte_mixed_query_does_not_panic() {
+    // Multibyte garbage followed by a valid range must still parse the range.
+    let q = parse_query("→→ ~2");
+    assert_eq!(q.range, Some(RangeSelector { start: 2, end: None }));
+
+    // Emoji (4-byte) and punctuation variants
+    let _ = parse_query("💥");
+    let _ = parse_query("¡hola");
+    let _ = parse_query("★%failed");
+}

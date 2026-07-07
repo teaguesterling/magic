@@ -21,7 +21,12 @@ pub fn temp_path(final_path: &Path) -> std::path::PathBuf {
 
 /// Atomically rename temp file to final path.
 /// Returns Ok(true) if renamed, Ok(false) if file already existed (dedup hit).
+///
+/// All persisted data files (parquet, blobs) funnel through here, so this is
+/// also where storage permissions are hardened to owner-only (0600) before
+/// the file becomes visible at its final path.
 pub fn rename_into_place(temp_path: &Path, final_path: &Path) -> io::Result<bool> {
+    crate::perms::set_mode(temp_path, crate::perms::FILE_MODE)?;
     match fs::rename(temp_path, final_path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {

@@ -750,7 +750,8 @@ impl Store {
                     [],
                 )?;
 
-                // Atomic rename
+                // Atomic rename (hardened to owner-only first)
+                crate::perms::set_mode(&temp_file, crate::perms::FILE_MODE)?;
                 fs::rename(&temp_file, &dest_file)?;
 
                 // Get consolidated size

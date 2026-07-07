@@ -278,6 +278,10 @@ impl Store {
         if !config.db_path().exists() {
             return Err(Error::NotInitialized(config.bird_root.clone()));
         }
+        // Best-effort repair: installations created before storage hardening
+        // (or files created by shell redirection / DuckDB at a loose umask)
+        // are re-chmodded to owner-only on every open.
+        crate::perms::repair_permissions(&config);
         Ok(Self { config })
     }
 

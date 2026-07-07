@@ -28,8 +28,11 @@ impl StreamingOutput {
     fn new(config: &Config, invocation_id: uuid::Uuid) -> io::Result<Self> {
         let running_dir = config.running_dir();
         std::fs::create_dir_all(&running_dir)?;
+        bird::perms::harden_dir(&running_dir);
         let path = config.running_path(&invocation_id);
         let file = File::create(&path)?;
+        // Live command output is as sensitive as stored output: owner-only.
+        bird::perms::set_mode(&path, bird::perms::FILE_MODE)?;
         Ok(Self { file, path })
     }
 
@@ -109,7 +112,7 @@ fn contains_nosave_marker(data: &[u8]) -> bool {
 /// `format_override`: Override format detection for event extraction.
 /// `auto_compact`: If true, spawn background compaction after saving.
 /// `no_pty`: If true, use pipes instead of PTY for separate stdout/stderr capture.
-pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extract_override: Option<bool>, format_override: Option<&str>, auto_compact: bool, no_pty: bool) -> bird::Result<()> {
+pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extract_override: Option<bool>, format_override: Option<&str>, auto_compact: bool, no_pty: bool, force_capture: bool) -> bird::Result<()> {
     // Determine command string and build PTY command
     let (cmd_str, shell, args): (String, String, Vec<String>) = match shell_cmd {
         Some(cmd) => {
@@ -146,7 +149,7 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
         return run_no_pty(
             &cmd_str, &shell, &args, &cwd, invocation_id,
             tag, extract_override, format_override, auto_compact,
-            config, store,
+            config, store, force_capture,
         );
     }
 
@@ -310,10 +313,18 @@ pub fn run(shell_cmd: Option<&str>, cmd_args: &[String], tag: Option<&str>, extr
     // Collect context metadata (VCS, CI)
     let context = ContextMetadata::collect(Some(std::path::Path::new(&cwd)));
 
+    // Privacy: redact recognizable secret values from the stored command
+    // line (the command itself already ran with its real arguments).
+    let stored_cmd = if !force_capture && config.privacy.redact_commands {
+        bird::privacy::redact_command(&cmd_str)
+    } else {
+        cmd_str.clone()
+    };
+
     let mut record = InvocationRecord::with_id(
         invocation_id,
         &sid,
-        &cmd_str,
+        &stored_cmd,
         &cwd,
         exit_code,
         &config.client_id,
@@ -377,6 +388,7 @@ fn run_no_pty(
     auto_compact: bool,
     config: Config,
     store: Store,
+    force_capture: bool,
 ) -> bird::Result<()> {
     use std::io::{BufRead, BufReader};
     use std::sync::{mpsc, Arc, Mutex};
@@ -496,10 +508,17 @@ fn run_no_pty(
     // Collect context metadata (VCS, CI)
     let context = ContextMetadata::collect(Some(std::path::Path::new(cwd)));
 
+    // Privacy: redact recognizable secret values from the stored command line.
+    let stored_cmd = if !force_capture && config.privacy.redact_commands {
+        bird::privacy::redact_command(cmd_str)
+    } else {
+        cmd_str.to_string()
+    };
+
     let mut record = InvocationRecord::with_id(
         invocation_id,
         &sid,
-        cmd_str,
+        &stored_cmd,
         cwd,
         exit_code,
         &config.client_id,
@@ -644,11 +663,12 @@ pub fn save(
     tag: Option<&str>,
     quiet: bool,
     to_buffer: bool,
+    force_capture: bool,
 ) -> bird::Result<()> {
     use std::process::Command;
 
     // Read content first so we can check for nosave marker
-    let (stdout_content, stderr_content, single_content) = if stdout_file.is_some() || stderr_file.is_some() {
+    let (mut stdout_content, mut stderr_content, mut single_content) = if stdout_file.is_some() || stderr_file.is_some() {
         let stdout = stdout_file.map(std::fs::read).transpose()?;
         let stderr = stderr_file.map(std::fs::read).transpose()?;
         (stdout, stderr, None)
@@ -674,6 +694,13 @@ pub fn save(
     }
 
     let config = Config::load()?;
+
+    // Privacy: exclusion patterns apply to EVERY capture path, not just the
+    // opt-in buffer. `shq -X` (force-capture) bypasses this deliberately.
+    if !force_capture && bird::privacy::should_exclude(&config, command) {
+        return Ok(());
+    }
+
     let store = Store::open(config.clone())?;
 
     // Get current working directory
@@ -690,63 +717,24 @@ pub fn save(
         .map(|s| s.to_string())
         .unwrap_or_else(invoker_name);
 
-    // Create session and invocation records
-    let session = SessionRecord::new(
-        &sid,
-        &config.client_id,
-        &inv_name,
-        inv_pid,
-        explicit_invoker_type,
-    );
-
-    // Collect context metadata (VCS, CI)
-    let context = ContextMetadata::collect(Some(std::path::Path::new(&cwd)));
-
-    let mut inv_record = InvocationRecord::new(
-        &sid,
-        command,
-        &cwd,
-        exit_code,
-        &config.client_id,
-    )
-    .with_metadata(context.into_map());
-
-    if let Some(ms) = duration_ms {
-        inv_record = inv_record.with_duration(ms);
-    }
-    if let Some(t) = tag {
-        inv_record = inv_record.with_tag(t);
-    }
-    let inv_id = inv_record.id;
-
-    // Combine output for buffer storage
-    let combined_output: Option<Vec<u8>> = if to_buffer {
-        // For buffer, combine all output into one
-        let mut combined = Vec::new();
-        if let Some(ref content) = stdout_content {
-            combined.extend_from_slice(content);
-        }
-        if let Some(ref content) = stderr_content {
-            combined.extend_from_slice(content);
-        }
-        if let Some(ref content) = single_content {
-            combined.extend_from_slice(content);
-        }
-        if combined.is_empty() { None } else { Some(combined) }
-    } else {
-        None
-    };
-
     if to_buffer {
         // Write to buffer instead of permanent storage
         let buffer = Buffer::new(config.clone());
 
-        if !buffer.is_enabled() {
-            if !quiet {
-                eprintln!("shq: buffer not enabled, saving to permanent storage");
+        if buffer.is_enabled() {
+            // Combine all output into one stream for the buffer
+            let mut combined = Vec::new();
+            if let Some(ref content) = stdout_content {
+                combined.extend_from_slice(content);
             }
-            // Fall through to normal save
-        } else {
+            if let Some(ref content) = stderr_content {
+                combined.extend_from_slice(content);
+            }
+            if let Some(ref content) = single_content {
+                combined.extend_from_slice(content);
+            }
+            let combined_output = if combined.is_empty() { None } else { Some(combined) };
+
             match buffer.write_complete_entry(
                 command,
                 &cwd,
@@ -765,15 +753,61 @@ pub fn save(
                     // Command excluded from buffering, skip silently
                     return Ok(());
                 }
-                Err(e) => {
-                    if !quiet {
-                        eprintln!("shq: buffer write failed ({}), saving to permanent storage", e);
-                    }
-                    // Fall through to normal save
-                }
+                // Do NOT silently fall through to permanent storage: the
+                // caller asked for the buffer (with its exclusion rules and
+                // retention limits), so surface the failure instead.
+                Err(e) => return Err(e),
             }
         }
+
+        // Buffer requested but disabled (e.g. the shell hook cached buffer
+        // state at startup and the buffer was disabled afterwards). Output
+        // captured for the buffer must NOT leak into permanent storage:
+        // discard it and record metadata only.
+        if !quiet {
+            eprintln!("shq: buffer not enabled; recording command metadata only (output discarded)");
+        }
+        stdout_content = None;
+        stderr_content = None;
+        single_content = None;
     }
+
+    // Privacy: best-effort redaction of recognizable secret values on the
+    // default (permanent) save path.
+    let stored_cmd = if !force_capture && config.privacy.redact_commands {
+        bird::privacy::redact_command(command)
+    } else {
+        command.to_string()
+    };
+
+    // Create session and invocation records
+    let session = SessionRecord::new(
+        &sid,
+        &config.client_id,
+        &inv_name,
+        inv_pid,
+        explicit_invoker_type,
+    );
+
+    // Collect context metadata (VCS, CI)
+    let context = ContextMetadata::collect(Some(std::path::Path::new(&cwd)));
+
+    let mut inv_record = InvocationRecord::new(
+        &sid,
+        &stored_cmd,
+        &cwd,
+        exit_code,
+        &config.client_id,
+    )
+    .with_metadata(context.into_map());
+
+    if let Some(ms) = duration_ms {
+        inv_record = inv_record.with_duration(ms);
+    }
+    if let Some(t) = tag {
+        inv_record = inv_record.with_tag(t);
+    }
+    let inv_id = inv_record.id;
 
     // Build batch with all related records
     let mut batch = InvocationBatch::new(inv_record).with_session(session);
@@ -3318,10 +3352,19 @@ pub fn save_from_buffer(
     // Read output from buffer
     let output = buffer.read_output(&entry)?;
 
+    // Privacy: the buffer keeps the original command line (it is opt-in and
+    // owner-only); apply the same redaction as the default save path when
+    // promoting to permanent storage.
+    let stored_cmd = if config.privacy.redact_commands {
+        bird::privacy::redact_command(&meta.cmd)
+    } else {
+        meta.cmd.clone()
+    };
+
     // Create invocation record from buffer metadata
     let mut inv_record = InvocationRecord::new(
         &meta.session_id,
-        &meta.cmd,
+        &stored_cmd,
         &meta.cwd,
         meta.exit_code.unwrap_or(0),
         &config.client_id,
